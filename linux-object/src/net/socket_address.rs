@@ -225,13 +225,6 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
                 ));
                 Ok(Endpoint::Ip((addr, port).into()))
             }
-            AddressFamily::Packet => Ok(Endpoint::LinkLevel(LinkLevelEndpoint::new(
-                addr.addr_ll.sll_ifindex as usize,
-            ))),
-            AddressFamily::Netlink => Ok(Endpoint::Netlink(NetlinkEndpoint::new(
-                addr.addr_nl.nl_pid,
-                addr.addr_nl.nl_groups,
-            ))),
             AddressFamily::Unix => {
                 let path = {
                     let max_path_len = if len > 2 { len - 2 } else { 0 };
