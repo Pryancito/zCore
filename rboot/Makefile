@@ -12,10 +12,10 @@ endif
 .PHONY: build run header asm doc
 
 build:
-	cargo build $(BUILD_ARGS) --ignore-rust-version
+	cargo build $(BUILD_ARGS) --target x86_64-unknown-uefi -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem --ignore-rust-version
 
 clippy:
-	cargo clippy $(BUILD_ARGS)
+	cargo clippy $(BUILD_ARGS) --target x86_64-unknown-uefi -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
 
 doc:
 	cargo doc

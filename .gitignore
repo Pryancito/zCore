@@ -13,3 +13,5 @@
 .DS_Store
 __pycache__
 Cargo.lock
+!Cargo.lock
+!rboot/Cargo.lock

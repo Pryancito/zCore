@@ -29,8 +29,15 @@ if get_option('crypto_backend') == 'openssl'
 elif get_option('crypto_backend') == 'mbedtls'
 	# Keep crypto_dep as a single dependency object: some subdirs call
 	# crypto_dep.partial_dependency(...).
-	crypto_dep = dependency('mbedtls')
-	crypto_extra_deps = [ dependency('mbedcrypto') ]
+	cc = meson.get_compiler('c')
+	crypto_dep = dependency('mbedtls', required: false)
+	if not crypto_dep.found()
+		crypto_dep = cc.find_library('mbedtls', required: true)
+	endif
+	crypto_extra_deps = [ dependency('mbedcrypto', required: false) ]
+	if not crypto_extra_deps[0].found()
+		crypto_extra_deps = [ cc.find_library('mbedcrypto', required: true) ]
+	endif
 endif
 
 apk_deps = [ crypto_dep, zlib_dep, libzstd_dep ]
