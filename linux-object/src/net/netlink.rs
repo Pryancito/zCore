@@ -37,11 +37,28 @@ impl Default for NetlinkSocketState {
 }
 impl NetlinkSocketState {}
 
+// Linux ARPHRD_* hardware type constants
+const ARPHRD_ETHER: u16 = 1;
+
+// Linux IFF_* interface flag constants
+const IFF_UP: u32 = 0x1;
+const IFF_BROADCAST: u32 = 0x2;
+const IFF_RUNNING: u32 = 0x40;
+const IFF_LOWER_UP: u32 = 0x1_0000;
+// Mask meaning "all flags may change" used in ifi_change responses
+const IFF_CHANGE_ALL: u32 = 0xFFFF_FFFF;
+
 #[async_trait]
 impl Socket for NetlinkSocketState {
     /// missing documentation
     async fn read(&self, data: &mut [u8]) -> (LxResult<usize>, Endpoint) {
         let mut buffer = self.data.lock();
+        if buffer.is_empty() {
+            return (
+                Err(LxError::EAGAIN),
+                Endpoint::Netlink(NetlinkEndpoint::new(0, 0)),
+            );
+        }
         let msg = buffer.remove(0);
         let len = msg.len();
         if !msg.is_empty() {
@@ -86,16 +103,16 @@ impl Socket for NetlinkSocketState {
                         nlmsg_type: NetlinkMessageType::NewLink.into(),
                         nlmsg_flags: NetlinkMessageFlags::MULTI,
                         nlmsg_seq: header.nlmsg_seq,
-                        nlmsg_pid: header.nlmsg_pid,
+                        nlmsg_pid: 0, // kernel responses use pid 0
                     };
                     msg.push_ext(new_header);
 
                     let if_info = IfaceInfoMsg {
                         ifi_family: AddressFamily::Unspecified.into(),
-                        ifi_type: 0,
-                        ifi_index: i as u32,
-                        ifi_flags: 0,
-                        ifi_change: 0,
+                        ifi_type: ARPHRD_ETHER,
+                        ifi_index: (i + 1) as u32, // Linux interface indices start at 1
+                        ifi_flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_LOWER_UP,
+                        ifi_change: IFF_CHANGE_ALL, // all flags changeable (kernel convention)
                     };
                     msg.align4();
                     msg.push_ext(if_info);
@@ -114,8 +131,9 @@ impl Socket for NetlinkSocketState {
                     }
 
                     let ifname = iface.get_ifname();
+                    // IFLA_IFNAME includes a null terminator (Linux kernel convention)
                     let attr = RouteAttr {
-                        rta_len: (ifname.as_bytes().len() + size_of::<RouteAttr>()) as u16,
+                        rta_len: (ifname.as_bytes().len() + 1 + size_of::<RouteAttr>()) as u16,
                         rta_type: RouteAttrTypes::Ifname.into(),
                     };
                     attrs.align4();
@@ -123,6 +141,7 @@ impl Socket for NetlinkSocketState {
                     for byte in ifname.as_bytes() {
                         attrs.push(*byte);
                     }
+                    attrs.push(0u8); // null terminator
 
                     msg.align4();
                     msg.append(&mut attrs);
@@ -146,7 +165,7 @@ impl Socket for NetlinkSocketState {
                             nlmsg_type: NetlinkMessageType::NewAddr.into(),
                             nlmsg_flags: NetlinkMessageFlags::MULTI,
                             nlmsg_seq: header.nlmsg_seq,
-                            nlmsg_pid: header.nlmsg_pid,
+                            nlmsg_pid: 0, // kernel responses use pid 0
                         };
                         msg.push_ext(new_header);
 
@@ -156,7 +175,7 @@ impl Socket for NetlinkSocketState {
                             ifa_prefixlen: ip.prefix_len(),
                             ifa_flags: 0,
                             ifa_scope: 0,
-                            ifa_index: i as u32,
+                            ifa_index: (i + 1) as u32, // must match GetLink ifi_index (1-based)
                         };
                         msg.align4();
                         msg.push_ext(if_addr);
@@ -192,7 +211,7 @@ impl Socket for NetlinkSocketState {
             nlmsg_type: NetlinkMessageType::Done.into(),
             nlmsg_flags: NetlinkMessageFlags::MULTI,
             nlmsg_seq: header.nlmsg_seq,
-            nlmsg_pid: header.nlmsg_pid,
+            nlmsg_pid: 0, // kernel responses use pid 0
         };
         msg.push_ext(new_header);
         msg.align4();
