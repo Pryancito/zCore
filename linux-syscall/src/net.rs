@@ -344,33 +344,39 @@ impl Syscall<'_> {
         debug!("sys_bind: fd:{} bind to {:?}", sockfd, endpoint);
 
         let proc = self.linux_process();
+        let file_like = proc.get_file_like(sockfd.into())?;
         if let Endpoint::Unix(path) = &endpoint {
             if !path.is_empty() {
                 let (dir_path, file_name) = split_path(path);
-                if let Ok(dir_inode) = proc.lookup_inode_at(FileDesc::CWD, dir_path, true) {
-                    if dir_inode.find(file_name).is_err() {
-                        dir_inode.create(
-                            file_name,
-                            linux_object::fs::vfs::FileType::Socket,
-                            0o666,
-                        ).map_err(|e| {
-                            warn!("sys_bind: failed to create socket node {:?}: {:?}", file_name, e);
-                            e
-                        })?;
+                match proc.lookup_inode_at(FileDesc::CWD, dir_path, true) {
+                    Ok(dir_inode) => {
+                        if dir_inode.find(file_name).is_err() {
+                            if let Err(err) = dir_inode.create(
+                                file_name,
+                                linux_object::fs::vfs::FileType::Socket,
+                                0o666,
+                            ) {
+                                warn!(
+                                    "sys_bind: unable to create unix socket node {:?}: {:?}; continuing with in-kernel registration only",
+                                    path, err
+                                );
+                            }
+                        }
                     }
-                } else {
-                    warn!("sys_bind: failed to lookup directory: {:?} (original path: {:?})", dir_path, path);
-                    return Err(LxError::ENOENT);
+                    Err(err) => {
+                        warn!(
+                            "sys_bind: unable to lookup unix socket directory {:?}: {:?}; continuing with in-kernel registration only",
+                            dir_path, err
+                        );
+                    }
                 }
 
-                let file_like = proc.get_file_like(sockfd.into())?;
                 if let Ok(unix) = file_like.clone().downcast_arc::<UnixSocketState>() {
                     UnixSocketState::register(path.clone(), unix)?;
                 }
             }
         }
 
-        let file_like = proc.get_file_like(sockfd.into())?;
         file_like.clone().as_socket()?.bind(endpoint)
     }
 
