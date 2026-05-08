@@ -27,6 +27,8 @@ pub use packet::*;
 /// missing documentation
 pub mod netlink;
 pub use netlink::*;
+pub mod unix;
+pub use unix::*;
 
 /// missing documentation
 // pub mod icmp;
@@ -187,6 +189,10 @@ numeric_enum! {
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
     /// Generic musl socket optname.
     pub enum SolOptname {
+        /// reuseaddr
+        REUSEADDR = 2,
+        /// error
+        ERROR = 4,
         /// sndbuf
         SNDBUF = 7,  // 获取发送缓冲区长度
         /// rcvbuf
@@ -314,7 +320,7 @@ use async_trait::async_trait;
 // use core::ops::{Deref, DerefMut};
 /// Common methods that a socket must have
 #[async_trait]
-pub trait Socket: Send + Sync + Debug {
+pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// missing documentation
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint);
     /// missing documentation
@@ -368,6 +374,8 @@ pub trait Socket: Send + Sync + Debug {
         None
     }
 }
+
+downcast_rs::impl_downcast!(sync Socket);
 
 /*
 bitflags::bitflags! {

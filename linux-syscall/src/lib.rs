@@ -149,6 +149,7 @@ impl Syscall<'_> {
                 self.sys_copy_file_range(a0.into(), a1.into(), a2.into(), a3.into(), a4, a5)
                     .await
             }
+            Sys::CLOSE_RANGE => self.sys_close_range(a0, a1, a2),
 
             // io multiplexing
             Sys::PSELECT6 => {
@@ -156,12 +157,12 @@ impl Syscall<'_> {
                     .await
             }
             Sys::PPOLL => self.sys_ppoll(a0.into(), a1, a2.into()).await, // ignore sigmask
-            //            Sys::EPOLL_CREATE1 => self.sys_epoll_create1(a0),
-            //            Sys::EPOLL_CTL => self.sys_epoll_ctl(a0, a1, a2, a3.into()),
-            //            Sys::EPOLL_PWAIT => self.sys_epoll_pwait(a0, a1.into(), a2, a3, a4),
-            //            Sys::EVENTFD2 => self.unimplemented("eventfd2", Err(LxError::EACCES)),
+            Sys::EPOLL_CREATE1 => self.sys_epoll_create1(a0),
+            Sys::EPOLL_CTL => self.sys_epoll_ctl(a0.into(), a1 as i32, a2.into(), a3.into()),
+            Sys::EPOLL_PWAIT => self.sys_epoll_pwait(a0.into(), a1.into(), a2, a3 as isize, a4).await,
+            Sys::EVENTFD2 => self.sys_eventfd2(a0 as u32, a1),
 
-            //            Sys::SOCKETPAIR => self.unimplemented("socketpair", Err(LxError::EACCES)),
+            Sys::SOCKETPAIR => self.sys_socketpair(a0, a1, a2, a3.into()),
             // file system
             Sys::STATFS => self.sys_statfs(a0.into(), a1.into()),
             Sys::FSTATFS => self.sys_fstatfs(a0.into(), a1.into()),
@@ -202,7 +203,7 @@ impl Syscall<'_> {
                 self.sys_recvfrom(a0, a1.into(), a2, a3, a4.into(), a5.into())
                     .await
             }
-            Sys::SENDMSG => self.unimplemented("sys_sendmsg(),", Ok(0)),
+            Sys::SENDMSG => self.sys_sendmsg(a0, a1.into(), a2),
             Sys::RECVMSG => self.sys_recvmsg(a0, a1.into(), a2).await,
             Sys::SHUTDOWN => self.sys_shutdown(a0, a1),
             Sys::BIND => self.sys_bind(a0, a1.into(), a2),
@@ -342,8 +343,8 @@ impl Syscall<'_> {
             Sys::ARCH_PRCTL => self.sys_arch_prctl(a0 as _, a1),
             Sys::TIME => self.sys_time(a0.into()),
             Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a4, a3.into()),
-            //            Sys::EPOLL_CREATE => self.sys_epoll_create(a0),
-            //            Sys::EPOLL_WAIT => self.sys_epoll_wait(a0, a1.into(), a2, a3),
+            Sys::EPOLL_CREATE => self.sys_epoll_create(a0),
+            Sys::EPOLL_WAIT => self.sys_epoll_wait(a0.into(), a1.into(), a2, a3 as isize).await,
             _ => self.unknown_syscall(sys_type),
         }
     }
@@ -360,9 +361,7 @@ impl Syscall<'_> {
 
     /// unkown syscalls, currently is similar to unimplemented syscalls but emit an error
     fn unknown_syscall(&mut self, sys_type: Sys) -> SysResult {
-        error!("unknown syscall: {:?}. exit...", sys_type);
-        let proc = self.zircon_process();
-        proc.exit(-1);
+        error!("unknown syscall: {:?}.", sys_type);
         Err(LxError::ENOSYS)
     }
 

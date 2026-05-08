@@ -351,6 +351,20 @@ impl LinuxProcess {
         inner.files.remove(&fd).map(|_| ()).ok_or(LxError::EBADF)
     }
 
+    /// Close all file descriptors between `first` and `last`.
+    pub fn close_range(&self, first: FileDesc, last: FileDesc) {
+        let mut inner = self.inner.lock();
+        let fds: Vec<_> = inner
+            .files
+            .keys()
+            .filter(|&&fd| fd >= first && fd <= last)
+            .cloned()
+            .collect();
+        for fd in fds {
+            inner.files.remove(&fd);
+        }
+    }
+
     /// Get root INode of the process.
     pub fn root_inode(&self) -> &Arc<dyn INode> {
         &self.root_inode
@@ -426,12 +440,8 @@ impl LinuxProcess {
             .files
             .iter()
             .filter_map(|(fd, file_like)| {
-                if let Ok(file) = file_like.clone().downcast_arc::<File>() {
-                    if file.flags().close_on_exec() {
-                        Some(*fd)
-                    } else {
-                        None
-                    }
+                if file_like.flags().close_on_exec() {
+                    Some(*fd)
                 } else {
                     None
                 }

@@ -6,6 +6,8 @@ pub mod ioctl;
 mod pipe;
 mod procfs;
 mod pseudo;
+mod epoll;
+mod eventfd;
 pub mod rcore_fs_wrapper;
 pub mod stdio;
 
@@ -28,7 +30,6 @@ use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
 use core::convert::TryFrom;
 
 use async_trait::async_trait;
-use downcast_rs::impl_downcast;
 
 use kernel_hal::drivers;
 use rcore_fs::vfs::{FileSystem, FileType, INode, Result};
@@ -49,6 +50,8 @@ use pseudo::Pseudo;
 
 pub use file::{File, OpenFlags, PollEvents, SeekFrom};
 pub use pipe::Pipe;
+pub use epoll::{Epoll, EpollEvent};
+pub use eventfd::EventFd;
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use stdio::{STDIN, STDOUT};
 
@@ -58,7 +61,7 @@ pub use stdio::{STDIN, STDOUT};
 /// - Normal file, Directory
 /// - Socket
 /// - Epoll instance
-pub trait FileLike: KernelObject {
+pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     /// Returns open flags.
     fn flags(&self) -> OpenFlags;
     /// Set open flags.
@@ -95,7 +98,7 @@ pub trait FileLike: KernelObject {
     }
 }
 
-impl_downcast!(sync FileLike);
+downcast_rs::impl_downcast!(sync FileLike);
 
 /// file descriptor wrapper
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]

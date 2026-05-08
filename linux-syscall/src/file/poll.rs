@@ -290,6 +290,66 @@ impl Syscall<'_> {
         };
         future.await
     }
+
+    /// creates an epoll instance
+    pub fn sys_epoll_create1(&self, flags: usize) -> SysResult {
+        info!("epoll_create1: flags={:#x}", flags);
+        let proc = self.linux_process();
+        let epoll = Epoll::new(OpenFlags::from_bits_truncate(flags));
+        let fd = proc.add_file(epoll)?;
+        Ok(fd.into())
+    }
+
+    /// opens an epoll file descriptor
+    pub fn sys_epoll_create(&self, size: usize) -> SysResult {
+        info!("epoll_create: size={}", size);
+        self.sys_epoll_create1(0)
+    }
+
+    /// control interface for an epoll file descriptor
+    pub fn sys_epoll_ctl(&self, epfd: FileDesc, op: i32, fd: FileDesc, event: UserInPtr<EpollEvent>) -> SysResult {
+        info!("epoll_ctl: epfd={:?}, op={}, fd={:?}, event={:?}", epfd, op, fd, event);
+        let proc = self.linux_process();
+        let epoll_file = proc.get_file_like(epfd)?;
+        let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;
+        let event = if op == 2 { // EPOLL_CTL_DEL
+            EpollEvent { events: 0, data: 0 }
+        } else {
+            event.read()?
+        };
+        epoll.ctl(op, fd, event)
+    }
+
+    /// wait for an I/O event on an epoll file descriptor
+    pub async fn sys_epoll_pwait(
+        &self,
+        epfd: FileDesc,
+        mut events: UserOutPtr<EpollEvent>,
+        maxevents: usize,
+        timeout: isize,
+        _sigmask: usize,
+    ) -> SysResult {
+        info!("epoll_pwait: epfd={:?}, maxevents={}, timeout={}", epfd, maxevents, timeout);
+        let proc = self.linux_process();
+        let epoll_file = proc.get_file_like(epfd)?;
+        let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;
+        
+        // TODO: handle timeout
+        let res_events = epoll.wait(maxevents, proc).await?;
+        events.write_array(&res_events)?;
+        Ok(res_events.len())
+    }
+
+    /// wait for an I/O event on an epoll file descriptor
+    pub async fn sys_epoll_wait(
+        &self,
+        epfd: FileDesc,
+        events: UserOutPtr<EpollEvent>,
+        maxevents: usize,
+        timeout: isize,
+    ) -> SysResult {
+        self.sys_epoll_pwait(epfd, events, maxevents, timeout, 0).await
+    }
 }
 
 #[repr(C)]

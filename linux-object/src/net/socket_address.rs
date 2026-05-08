@@ -108,6 +108,8 @@ pub enum Endpoint {
     LinkLevel(LinkLevelEndpoint),
     /// missing documentation
     Netlink(NetlinkEndpoint),
+    /// missing documentation
+    Unix(alloc::string::String),
 }
 
 /// missing documentation
@@ -189,6 +191,15 @@ impl From<Endpoint> for SockAddr {
                     nl_groups: netlink.multicast_groups_mask,
                 },
             }
+        } else if let Endpoint::Unix(path) = endpoint {
+            let mut addr_un = SockAddrUn {
+                sun_family: AddressFamily::Unix.into(),
+                sun_path: [0; 108],
+            };
+            let bytes = path.as_bytes();
+            let len = min(bytes.len(), 107);
+            addr_un.sun_path[..len].copy_from_slice(&bytes[..len]);
+            SockAddr { addr_un }
         } else {
             unimplemented!("not match");
         }
@@ -214,14 +225,19 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
                 ));
                 Ok(Endpoint::Ip((addr, port).into()))
             }
-            AddressFamily::Unix => Err(LxError::EINVAL),
-            AddressFamily::Packet => Ok(Endpoint::LinkLevel(LinkLevelEndpoint::new(
-                addr.addr_ll.sll_ifindex as usize,
-            ))),
-            AddressFamily::Netlink => Ok(Endpoint::Netlink(NetlinkEndpoint::new(
-                addr.addr_nl.nl_pid,
-                addr.addr_nl.nl_groups,
-            ))),
+            AddressFamily::Unix => {
+                let path = {
+                    let max_path_len = if len > 2 { len - 2 } else { 0 };
+                    let path_slice =
+                        &addr.addr_un.sun_path[..core::cmp::min(max_path_len, 108)];
+                    let actual_len = path_slice
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(path_slice.len());
+                    alloc::string::String::from_utf8_lossy(&path_slice[..actual_len]).into_owned()
+                };
+                Ok(Endpoint::Unix(path))
+            }
             _ => Err(LxError::EINVAL),
         }
     }
@@ -234,7 +250,7 @@ impl SockAddr {
             AddressFamily::Internet => Ok(size_of::<SockAddrIn>()),
             AddressFamily::Packet => Ok(size_of::<SockAddrLl>()),
             AddressFamily::Netlink => Ok(size_of::<SockAddrNl>()),
-            AddressFamily::Unix => Err(LxError::EINVAL),
+            AddressFamily::Unix => Ok(2),
             _ => Err(LxError::EINVAL),
         }
     }

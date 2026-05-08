@@ -76,6 +76,34 @@ impl LinuxRootfs {
 
         // 拷贝 busybox
         fs::copy(busybox, bin.join("busybox")).unwrap();
+        // 拷贝 dhcpcd
+        let dhcpcd = self.dhcpcd(&musl);
+        if dhcpcd.is_file() {
+            fs::copy(&dhcpcd, bin.join("dhcpcd")).unwrap();
+            
+            // 拷贝 dhcpcd 配置和 hooks
+            let dhcpcd_dir = PROJECT_DIR.join("tools").join("dhcpcd");
+            let etc = dir.join("etc");
+            fs::copy(dhcpcd_dir.join("src/dhcpcd.conf"), etc.join("dhcpcd.conf")).unwrap();
+            
+            let lib_dhcpcd = dir.join("lib").join("dhcpcd");
+            let hooks_dir = lib_dhcpcd.join("dhcpcd-hooks");
+            fs::create_dir_all(&hooks_dir).unwrap();
+            fs::copy(dhcpcd_dir.join("hooks/dhcpcd-run-hooks"), lib_dhcpcd.join("dhcpcd-run-hooks")).unwrap();
+            for hook in ["01-test", "20-resolv.conf", "30-hostname"] {
+                let from = dhcpcd_dir.join("hooks").join(hook);
+                if from.is_file() {
+                    fs::copy(from, hooks_dir.join(hook)).unwrap();
+                }
+            }
+
+            // Create directories for dhcpcd runtime files
+            let var_run_dhcpcd = dir.join("var/run/dhcpcd");
+            fs::create_dir_all(&var_run_dhcpcd).unwrap();
+            let var_lib_dhcpcd = dir.join("var/lib/dhcpcd");
+            fs::create_dir_all(&var_lib_dhcpcd).unwrap();
+        }
+
         // 拷贝 libc.so
         let from = musl
             .join(format!("{}-linux-musl", self.0.name()))
@@ -95,6 +123,8 @@ impl LinuxRootfs {
         for sh in SH {
             unix::fs::symlink("busybox", bin.join(sh)).unwrap();
         }
+        // Create /run directory
+        let _ = fs::create_dir_all(dir.join("run"));
     }
 
     /// 将 musl 动态库放入 rootfs。
@@ -247,6 +277,50 @@ cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz'
         );
         fs::write(&path, content).unwrap();
         path
+    }
+
+    /// 编译 dhcpcd。
+    fn dhcpcd(&self, musl: &Path) -> PathBuf {
+        let dhcpcd_dir = PROJECT_DIR.join("tools").join("dhcpcd");
+        let executable = dhcpcd_dir.join("src/dhcpcd");
+
+        if executable.is_file() {
+            return executable;
+        }
+
+        println!("Compiling dhcpcd...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+
+        // 尝试编译
+        let mut res = Ext::new("./configure")
+            .current_dir(&dhcpcd_dir)
+            .env("CC", format!("{}/{}-linux-musl-gcc", bin.display(), arch))
+            .arg("--prefix=")
+            .arg("--sbindir=/bin")
+            .arg("--sysconfdir=/etc")
+            .arg("--dbdir=/var/lib/dhcpcd")
+            .arg("--libexecdir=/lib/dhcpcd")
+            .arg("--disable-privsep")
+            .arg("--without-dev")
+            .status();
+
+        if res.success() {
+            res = Make::new().current_dir(&dhcpcd_dir).status();
+        }
+
+        if !res.success() {
+            println!("Failed to compile dhcpcd");
+        } else {
+            // 裁剪
+            Ext::new(self.strip(&musl))
+                .arg("-s")
+                .arg(&executable)
+                .invoke();
+        }
+
+        executable
     }
 
     fn strip(&self, musl: impl AsRef<Path>) -> PathBuf {

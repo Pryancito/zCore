@@ -1,8 +1,8 @@
 use super::*;
 use core::mem::size_of;
-use kernel_hal::user::{IoVecs, UserInOutPtr};
+use kernel_hal::user::UserInOutPtr;
 use linux_object::{
-    fs::{FileLike, OpenFlags},
+    fs::{split_path, FileLike, OpenFlags},
     net::*,
 };
 
@@ -16,14 +16,15 @@ impl Syscall<'_> {
         let domain = match Domain::try_from(domain) {
             Ok(domain) => domain,
             Err(_) => {
-                warn!("invalid domain: {domain}");
+                warn!("sys_socket: invalid domain: {}", domain);
                 return Err(LxError::EAFNOSUPPORT);
             }
         };
-        let socket_type = match SocketType::try_from(_type & SOCKET_TYPE_MASK) {
+        let socket_type_val = _type & SOCKET_TYPE_MASK;
+        let socket_type = match SocketType::try_from(socket_type_val) {
             Ok(t) => t,
             Err(_) => {
-                warn!("invalid socket type: {_type}");
+                warn!("sys_socket: invalid socket type: {:#x} (masked: {:#x})", _type, socket_type_val);
                 return Err(LxError::EINVAL);
             }
         };
@@ -49,23 +50,18 @@ impl Syscall<'_> {
                 Arc::new(RawSocketState::new((protocol_num & 0xff) as u8))
             }
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
-            (Domain::AF_NETLINK, SocketType::SOCK_RAW, _) => {
+            (Domain::AF_NETLINK, SocketType::SOCK_RAW, _)
+            | (Domain::AF_NETLINK, SocketType::SOCK_DGRAM, _) => {
                 Arc::new(NetlinkSocketState::default())
             }
             // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
             (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
             | (Domain::AF_PACKET, SocketType::SOCK_DGRAM, _) => Arc::new(PacketSocketState::new()),
-            /*
-            (AF_INET, SOCK_RAW, _) => {
-                Arc::new(RawSocketState::new(protocol as u8))
-            }
-            // TODO, UnixSocket
-            (AF_UNIX, SOCK_STREAM, Protocol::IPPROTO_IP) => {}
-            (AF_PACKET, SOCK_RAW, _) => {}
-            */
+            // AF_UNIX sockets
+            (Domain::AF_UNIX, _, _) => UnixSocketState::new(),
             (_, _, _) => {
-                warn!(
-                    "unsupported socket type: domain={:?}, type={:?}, protocol={:?}",
+                info!(
+                    "sys_socket: unsupported socket type: domain={:?}, type={:?}, protocol={:?}",
                     domain, socket_type, protocol_num
                 );
                 return Err(LxError::ENOSYS);
@@ -88,7 +84,17 @@ impl Syscall<'_> {
             sockfd, addr, addrlen
         );
         let endpoint = sockaddr_to_endpoint(addr.read()?, addrlen)?;
-        let file_like = self.linux_process().get_file_like(sockfd.into())?;
+        let proc = self.linux_process();
+        let file_like = proc.get_file_like(sockfd.into())?;
+
+        if let Endpoint::Unix(path) = &endpoint {
+            if let Ok(unix) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                if let Some(server) = UnixSocketState::lookup(path) {
+                    server.push_accept(unix);
+                }
+            }
+        }
+
         file_like.clone().as_socket()?.connect(endpoint).await?;
         Ok(0)
     }
@@ -162,6 +168,16 @@ impl Syscall<'_> {
                     }
                     SolOptname::RCVBUF => {
                         optval.write(recv_buf_ca as u32)?;
+                        optlen.write(size_of::<u32>() as u32)?;
+                        Ok(0)
+                    }
+                    SolOptname::REUSEADDR => {
+                        optval.write(1)?;
+                        optlen.write(size_of::<u32>() as u32)?;
+                        Ok(0)
+                    }
+                    SolOptname::ERROR => {
+                        optval.write(0)?;
                         optlen.write(size_of::<u32>() as u32)?;
                         Ok(0)
                     }
@@ -250,6 +266,36 @@ impl Syscall<'_> {
         result
     }
 
+    /// transmit a message to another socket
+    #[allow(unsafe_code)]
+    pub fn sys_sendmsg(
+        &mut self,
+        sockfd: usize,
+        msg: UserInPtr<MsgHdr>,
+        flags: usize,
+    ) -> SysResult {
+        info!(
+            "sys_sendmsg: sockfd:{}, msg:{:?}, flags:{}",
+            sockfd, msg, flags
+        );
+        let hdr = msg.read()?;
+        let iov_ptr: UserInPtr<IoVecIn> = unsafe { core::mem::transmute(hdr.msg_iov) };
+        let iovlen = hdr.msg_iovlen;
+        let iovs = iov_ptr.read_iovecs(iovlen)?;
+        let data = iovs.read_to_vec()?;
+
+        let endpoint = if !hdr.msg_name.is_null() {
+            let endpoint = sockaddr_to_endpoint(hdr.msg_name.read()?, hdr.msg_namelen as usize)?;
+            Some(endpoint)
+        } else {
+            None
+        };
+
+        let file_like = self.linux_process().get_file_like(sockfd.into())?;
+        file_like.clone().as_socket()?.write(&data, endpoint)?;
+        Ok(data.len())
+    }
+
     /// receive messages from a socket
     pub async fn sys_recvmsg(
         &mut self,
@@ -261,21 +307,23 @@ impl Syscall<'_> {
             "sys_recvmsg: sockfd:{}, msg:{:?}, flags:{}",
             sockfd, msg, flags
         );
-        let hdr = msg.read().unwrap();
+        let hdr = msg.read()?;
 
         let iov_ptr = hdr.msg_iov;
         let iovlen = hdr.msg_iovlen;
-        let mut iovs = IoVecs::new(iov_ptr, iovlen);
-        let mut data = vec![0u8; 8192];
+        let mut iovs = iov_ptr.read_iovecs(iovlen)?;
+        let mut data = vec![0u8; iovs.total_len()];
 
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let (result, endpoint) = file_like.clone().as_socket()?.read(&mut data).await;
 
         let addr = hdr.msg_name;
-        if result.is_ok() && !addr.is_null() {
-            iovs.write_from_buf(&data).unwrap();
-            let sockaddr_in = SockAddr::from(endpoint);
-            sockaddr_in.write_to_msg(msg)?;
+        if let Ok(len) = result {
+            iovs.write_from_buf(&data[..len])?;
+            if !addr.is_null() {
+                let sockaddr_in = SockAddr::from(endpoint);
+                sockaddr_in.write_to_msg(msg)?;
+            }
         }
 
         result
@@ -294,7 +342,35 @@ impl Syscall<'_> {
         );
         let endpoint = sockaddr_to_endpoint(addr.read()?, addrlen)?;
         debug!("sys_bind: fd:{} bind to {:?}", sockfd, endpoint);
-        let file_like = self.linux_process().get_file_like(sockfd.into())?;
+
+        let proc = self.linux_process();
+        if let Endpoint::Unix(path) = &endpoint {
+            if !path.is_empty() {
+                let (dir_path, file_name) = split_path(path);
+                if let Ok(dir_inode) = proc.lookup_inode_at(FileDesc::CWD, dir_path, true) {
+                    if dir_inode.find(file_name).is_err() {
+                        dir_inode.create(
+                            file_name,
+                            linux_object::fs::vfs::FileType::Socket,
+                            0o666,
+                        ).map_err(|e| {
+                            warn!("sys_bind: failed to create socket node {:?}: {:?}", file_name, e);
+                            e
+                        })?;
+                    }
+                } else {
+                    warn!("sys_bind: failed to lookup directory: {:?} (original path: {:?})", dir_path, path);
+                    return Err(LxError::ENOENT);
+                }
+
+                let file_like = proc.get_file_like(sockfd.into())?;
+                if let Ok(unix) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                    UnixSocketState::register(path.clone(), unix)?;
+                }
+            }
+        }
+
+        let file_like = proc.get_file_like(sockfd.into())?;
         file_like.clone().as_socket()?.bind(endpoint)
     }
 
@@ -376,7 +452,7 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// returns  the  address  of the peer connected to the socket sockfd,
+    /// returns the address of the peer connected to the socket sockfd,
     /// in the buffer pointed to by addr.
     pub fn sys_getpeername(
         &mut self,
@@ -400,6 +476,32 @@ impl Syscall<'_> {
             .remote_endpoint()
             .ok_or(LxError::EINVAL)?;
         SockAddr::from(remote_endpoint).write_to(addr, addrlen)?;
+        Ok(0)
+    }
+
+    /// creates a pair of connected sockets in the specified domain, of the specified type, 
+    /// and using the optionally specified protocol.
+    pub fn sys_socketpair(
+        &mut self,
+        domain: usize,
+        _type: usize,
+        protocol: usize,
+        mut sv: UserOutPtr<i32>,
+    ) -> SysResult {
+        info!(
+            "sys_socketpair: domain:{}, type:{}, protocol:{}",
+            domain, _type, protocol
+        );
+        if domain != Domain::AF_UNIX as usize {
+            return Err(LxError::EAFNOSUPPORT);
+        }
+        let proc = self.linux_process();
+        let socket1 = Arc::new(UnixSocketState::default());
+        let socket2 = Arc::new(UnixSocketState::default());
+        UnixSocketState::connect_to(&socket1, &socket2);
+        let fd1 = proc.add_socket(socket1)?;
+        let fd2 = proc.add_socket(socket2)?;
+        sv.write_array(&[fd1.into(), fd2.into()])?;
         Ok(0)
     }
 }
