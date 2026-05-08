@@ -37,6 +37,17 @@ impl Default for NetlinkSocketState {
 }
 impl NetlinkSocketState {}
 
+// Linux ARPHRD_* hardware type constants
+const ARPHRD_ETHER: u16 = 1;
+
+// Linux IFF_* interface flag constants
+const IFF_UP: u32 = 0x1;
+const IFF_BROADCAST: u32 = 0x2;
+const IFF_RUNNING: u32 = 0x40;
+const IFF_LOWER_UP: u32 = 0x1_0000;
+// Mask meaning "all flags may change" used in ifi_change responses
+const IFF_CHANGE_ALL: u32 = 0xFFFF_FFFF;
+
 #[async_trait]
 impl Socket for NetlinkSocketState {
     /// missing documentation
@@ -99,19 +110,12 @@ impl Socket for NetlinkSocketState {
                     };
                     msg.push_ext(new_header);
 
-                    // Interface flags: UP | BROADCAST | RUNNING | LOWER_UP
-                    const IFF_UP: u32 = 0x1;
-                    const IFF_BROADCAST: u32 = 0x2;
-                    const IFF_RUNNING: u32 = 0x40;
-                    const IFF_LOWER_UP: u32 = 0x1_0000;
-                    // ARPHRD_ETHER (1) so if_check_arphrd accepts the interface
-                    const ARPHRD_ETHER: u16 = 1;
                     let if_info = IfaceInfoMsg {
                         ifi_family: AddressFamily::Unspecified.into(),
                         ifi_type: ARPHRD_ETHER,
                         ifi_index: (i + 1) as u32, // Linux interface indices start at 1
                         ifi_flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_LOWER_UP,
-                        ifi_change: 0xFFFF_FFFF, // all flags changeable (kernel convention)
+                        ifi_change: IFF_CHANGE_ALL, // all flags changeable (kernel convention)
                     };
                     msg.align4();
                     msg.push_ext(if_info);
