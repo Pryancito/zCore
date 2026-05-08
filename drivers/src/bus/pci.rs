@@ -246,8 +246,8 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
 pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
     let name = format!("enp{}s{}f{}", dev.loc.bus, dev.loc.device, dev.loc.function);
     match (dev.id.vendor_id, dev.id.device_id) {
-        // ---- e1000 (QEMU virtio-style emulation) ----
-        (0x8086, 0x100e) | (0x8086, 0x100f) | (0x8086, 0x10d3) => {
+        // ---- e1000 (QEMU virtio-style emulation: 82540EM) ----
+        (0x8086, 0x100e) | (0x8086, 0x100f) => {
             if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
                 #[cfg(target_arch = "riscv64")]
                 let addr = if addr == 0 { E1000_BASE as u64 } else { addr };
@@ -284,6 +284,8 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             0x153a | 0x153b |
             // I218
             0x155a | 0x1559 | 0x15a0 | 0x15a1 | 0x15a2 | 0x15a3 |
+            // 82574L
+            0x10d3 |
             // I219 (Skylake / Kaby Lake / Coffee Lake / Comet Lake / Ice Lake / Tiger Lake / Alder Lake / Raptor Lake)
             0x15b7 | 0x15b8 | 0x15b9 |
             0x15bc | 0x15bd | 0x15be |

@@ -67,9 +67,10 @@ const CTRL_ASDE: u32 = 1 << 5; // auto-speed detection enable
 // STATUS bits
 const STATUS_LU: u32 = 1 << 1; // link up
 
-// EERD bits (e1000e uses bit 4 for DONE, NOT bit 1 like the legacy e1000)
+// EERD bits (discrete e1000e like 82574L use bit 4 for DONE; PCH-integrated like I219 use bit 1)
 const EERD_START: u32 = 1 << 0;
-const EERD_DONE: u32 = 1 << 4; // bit 4 on e1000e / 82574L
+const EERD_DONE_BIT4: u32 = 1 << 4;
+const EERD_DONE_BIT1: u32 = 1 << 1;
 const EERD_ADDR_SHIFT: u32 = 2;
 const EERD_DATA_SHIFT: u32 = 16;
 
@@ -203,21 +204,54 @@ impl E1000eHw {
     // NVM word read via EERD (works on all e1000e silicon)
     // -----------------------------------------------------------------------
     unsafe fn nvm_read_word(&self, offset: u16) -> u16 {
-        let cmd = ((offset as u32) << EERD_ADDR_SHIFT) | EERD_START;
+        // Try Address Shift 2 first (82574L and most discrete e1000e)
+        let cmd = ((offset as u32) << 2) | EERD_START;
         mmio_write(self.base, E1000E_EERD, cmd);
-        // Poll DONE bit with a real timer so the timeout is correct on any CPU.
         let t0 = timer_now_as_micros();
-        loop {
+        while timer_now_as_micros().wrapping_sub(t0) < NVM_POLL_US {
             let v = mmio_read(self.base, E1000E_EERD);
-            if v & EERD_DONE != 0 {
+            if v & (EERD_DONE_BIT4 | EERD_DONE_BIT1) != 0 {
                 return (v >> EERD_DATA_SHIFT) as u16;
-            }
-            if timer_now_as_micros().wrapping_sub(t0) >= NVM_POLL_US {
-                warn!("[e1000e] NVM read timeout at offset {}", offset);
-                return 0;
             }
             core::hint::spin_loop();
         }
+
+        // Try Address Shift 3 (PCH-integrated NICs like I217/I218/I219)
+        let cmd = ((offset as u32) << 3) | EERD_START;
+        mmio_write(self.base, E1000E_EERD, cmd);
+        let t0 = timer_now_as_micros();
+        while timer_now_as_micros().wrapping_sub(t0) < NVM_POLL_US {
+            let v = mmio_read(self.base, E1000E_EERD);
+            if v & (EERD_DONE_BIT4 | EERD_DONE_BIT1) != 0 {
+                return (v >> EERD_DATA_SHIFT) as u16;
+            }
+            core::hint::spin_loop();
+        }
+        0
+    }
+
+    // -----------------------------------------------------------------------
+    // Read MAC address from RAL0/RAH0 registers (usually set by BIOS)
+    // -----------------------------------------------------------------------
+    unsafe fn read_mac_from_hw(&mut self) {
+        let ral = mmio_read(self.base, E1000E_RAL0);
+        let rah = mmio_read(self.base, E1000E_RAH0);
+        info!("[e1000e] hardware registers: RAL0={:#010x}, RAH0={:#010x}", ral, rah);
+        if ral == 0 && (rah & 0xFFFF) == 0 {
+            return;
+        }
+        self.mac[0] = (ral & 0xFF) as u8;
+        self.mac[1] = ((ral >> 8) & 0xFF) as u8;
+        self.mac[2] = ((ral >> 16) & 0xFF) as u8;
+        self.mac[3] = ((ral >> 24) & 0xFF) as u8;
+        self.mac[4] = (rah & 0xFF) as u8;
+        self.mac[5] = ((rah >> 8) & 0xFF) as u8;
+    }
+
+    fn is_valid_mac(&self) -> bool {
+        let all_zeros = self.mac.iter().all(|&b| b == 0);
+        let all_fs = self.mac.iter().all(|&b| b == 0xff);
+        !all_zeros && !all_fs
     }
 
     // -----------------------------------------------------------------------
@@ -247,6 +281,18 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
         // Flush with a read (device still alive here)
         let _ = mmio_read(self.base, E1000E_STATUS);
+
+        // 1b. Try reading MAC from hardware (BIOS initialized) before we reset it.
+        // On many modern Intel NICs (I217/I218/I219), the MAC is pre-loaded into
+        // RAL0/RAH0 by the BIOS/firmware and might not be easily readable via EERD.
+        self.read_mac_from_hw();
+        let mut mac_found = self.is_valid_mac();
+        if mac_found {
+            info!(
+                "[e1000e] found BIOS-initialized MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
+            );
+        }
 
         // 2. Issue global reset (RST bit in CTRL).
         //    CRITICAL: On e1000e (I217/I218/I219/82574) the datasheet (§4.6)
@@ -284,8 +330,40 @@ impl E1000eHw {
         // 4. Disable interrupts again (RST clears IMC)
         mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
 
-        // 5. Read MAC from NVM
-        self.read_mac_from_nvm();
+        // 5. If we don't have a valid MAC yet, try reading from NVM.
+        if !mac_found {
+            info!("[e1000e] attempting NVM MAC read...");
+            self.read_mac_from_nvm();
+            mac_found = self.is_valid_mac();
+            if mac_found {
+                info!(
+                    "[e1000e] MAC from NVM success: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
+                );
+            }
+        }
+
+        // 5b. If still no MAC, try RAL0/RAH0 again (some NICs auto-load after reset).
+        if !mac_found {
+            info!("[e1000e] attempting post-reset RAL/RAH MAC read...");
+            self.read_mac_from_hw();
+            mac_found = self.is_valid_mac();
+            if mac_found {
+                info!(
+                    "[e1000e] MAC from RAL0/RAH0 success: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
+                );
+            }
+        }
+
+        if !mac_found {
+            // Fallback to a distinct default MAC if all detection fails.
+            self.mac = [0x00, 0x0E, 0x10, 0x00, 0x0E, 0x00];
+            warn!(
+                "[e1000e] all detection failed; using fallback: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
+            );
+        }
 
         // 6. Set link-up + auto-speed detection
         let ctrl = mmio_read(self.base, E1000E_CTRL);
@@ -640,7 +718,7 @@ pub fn init(
 
     let mut hw = E1000eHw {
         base: vaddr,
-        mac: [0u8; 6],
+        mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], // Default early-init MAC (QEMU style)
         rx_ring_va,
         rx_ring_pa,
         rx_bufs_va,
@@ -660,6 +738,10 @@ pub fn init(
     }
 
     let mac_bytes = hw.mac;
+    info!(
+        "[e1000e] finalized MAC for smoltcp: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
+    );
     let hw = Arc::new(Mutex::new(hw));
     let driver = E1000eDriver(hw);
 

@@ -47,12 +47,19 @@ const SIOCGIFADDR: usize = 0x8915;
 const SIOCSIFADDR: usize = 0x8916;
 const SIOCGIFNETMASK: usize = 0x891b;
 const SIOCSIFNETMASK: usize = 0x891c;
+const SIOCGIFMETRIC: usize = 0x891d;
+const SIOCGIFMTU: usize = 0x8921;
+const SIOCGIFHWADDR: usize = 0x8927;
+const SIOCGIFINDEX: usize = 0x8933;
 const SIOCGARP: usize = 0x8954;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 union IfReqUnion {
     addr: SockAddrIn,
+    ifindex: i32,
+    ifmtu: i32,
+    ifmetric: i32,
     flags: i16,
 }
 
@@ -455,6 +462,67 @@ impl Socket for UdpSocketState {
                 iface
                     .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
                     .map_err(|_| LxError::EINVAL)?;
+                Ok(0)
+            }
+
+            // SIOCGIFHWADDR: get hardware address
+            SIOCGIFHWADDR => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+                let ifname = ifreq_name(&ifr.ifr_name)?;
+                let iface = iface_by_name(ifname)?;
+                let mac = iface.get_mac();
+                // Ethernet family is ARPHRD_ETHER (1)
+                ifr.ifr_ifru = IfReqUnion {
+                    addr: SockAddrIn {
+                        sin_family: 1,
+                        sin_port: 0,
+                        sin_addr: u32::from_ne_bytes([
+                            mac.as_bytes()[0],
+                            mac.as_bytes()[1],
+                            mac.as_bytes()[2],
+                            mac.as_bytes()[3],
+                        ]),
+                        sin_zero: [
+                            mac.as_bytes()[4],
+                            mac.as_bytes()[5],
+                            0, 0, 0, 0, 0, 0,
+                        ],
+                    },
+                };
+                Ok(0)
+            }
+
+            // SIOCGIFINDEX: get interface index
+            SIOCGIFINDEX => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+                let ifname = ifreq_name(&ifr.ifr_name)?;
+                let ifaces = get_net_device();
+                let index = ifaces.iter().position(|iface| iface.get_ifname() == ifname);
+                if let Some(idx) = index {
+                    ifr.ifr_ifru = IfReqUnion {
+                        ifindex: (idx + 1) as i32,
+                    };
+                    Ok(0)
+                } else {
+                    Err(LxError::ENODEV)
+                }
+            }
+
+            // SIOCGIFMTU: get MTU
+            SIOCGIFMTU => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+                ifr.ifr_ifru = IfReqUnion { ifmtu: 1500 };
+                Ok(0)
+            }
+
+            // SIOCGIFMETRIC: get metric
+            SIOCGIFMETRIC => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+                ifr.ifr_ifru = IfReqUnion { ifmetric: 0 };
                 Ok(0)
             }
 
