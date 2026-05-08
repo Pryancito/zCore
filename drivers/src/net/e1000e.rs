@@ -517,6 +517,8 @@ impl NetScheme for E1000eInterface {
                 .find(|addr| matches!(addr, IpCidr::Ipv4(_)))
             {
                 *addr = IpCidr::Ipv4(cidr);
+            } else if let Some(addr) = addrs.iter_mut().next() {
+                *addr = IpCidr::Ipv4(cidr);
             }
         });
         Ok(())
