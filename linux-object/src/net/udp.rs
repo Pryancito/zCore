@@ -95,7 +95,7 @@ fn ipv4_sockaddr(addr: Ipv4Address) -> SockAddrIn {
     SockAddrIn {
         sin_family: AddressFamily::Internet.into(),
         sin_port: 0,
-        sin_addr: u32::to_be(u32::from_be_bytes(addr.0)),
+        sin_addr: u32::from_ne_bytes(addr.0),
         sin_zero: [0; 8],
     }
 }
@@ -418,9 +418,7 @@ impl Socket for UdpSocketState {
                 let ifname = ifreq_name(&ifr.ifr_name)?;
                 let iface = iface_by_name(ifname)?;
                 #[allow(unsafe_code)]
-                let addr = unsafe {
-                    Ipv4Address::from_bytes(&u32::from_be(ifr.ifr_ifru.addr.sin_addr).to_be_bytes())
-                };
+                let addr = unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
                 let prefix_len = iface_ipv4_cidr(&*iface)
                     .map(|cidr| cidr.prefix_len())
                     .unwrap_or(32);
@@ -448,9 +446,8 @@ impl Socket for UdpSocketState {
                 let ifname = ifreq_name(&ifr.ifr_name)?;
                 let iface = iface_by_name(ifname)?;
                 #[allow(unsafe_code)]
-                let netmask = unsafe {
-                    Ipv4Address::from_bytes(&u32::from_be(ifr.ifr_ifru.addr.sin_addr).to_be_bytes())
-                };
+                let netmask =
+                    unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
                 let prefix_len = prefix_len_from_netmask(netmask)?;
                 let addr = iface_ipv4_cidr(&*iface)
                     .map(|cidr| cidr.address())
