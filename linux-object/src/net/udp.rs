@@ -9,6 +9,7 @@ use core::{mem::size_of, slice};
 use kernel_hal::net::get_net_device;
 use lock::Mutex;
 use smoltcp::socket::{UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
+use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 
 // third part
 #[allow(unused_imports)]
@@ -38,6 +39,88 @@ impl Default for UdpSocketState {
     fn default() -> Self {
         UdpSocketState::new()
     }
+}
+
+const SIOCGIFCONF: usize = 0x8912;
+const SIOCGIFFLAGS: usize = 0x8913;
+const SIOCGIFADDR: usize = 0x8915;
+const SIOCSIFADDR: usize = 0x8916;
+const SIOCGIFNETMASK: usize = 0x891b;
+const SIOCSIFNETMASK: usize = 0x891c;
+const SIOCGARP: usize = 0x8954;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union IfReqUnion {
+    addr: SockAddrIn,
+    flags: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IfReq {
+    ifr_name: [u8; 16],
+    ifr_ifru: IfReqUnion,
+}
+
+#[repr(C)]
+struct IfConf {
+    ifc_len: i32,
+    ifc_buf: usize,
+}
+
+fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
+    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    core::str::from_utf8(&raw[..len]).map_err(|_| LxError::EINVAL)
+}
+
+fn iface_by_name(ifname: &str) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+    get_net_device()
+        .into_iter()
+        .find(|iface| iface.get_ifname() == ifname)
+        .ok_or(LxError::ENODEV)
+}
+
+fn iface_ipv4_cidr(iface: &dyn zcore_drivers::scheme::NetScheme) -> Option<Ipv4Cidr> {
+    iface
+        .get_ip_address()
+        .into_iter()
+        .find_map(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => Some(cidr),
+            _ => None,
+        })
+}
+
+fn ipv4_sockaddr(addr: Ipv4Address) -> SockAddrIn {
+    SockAddrIn {
+        sin_family: AddressFamily::Internet.into(),
+        sin_port: 0,
+        sin_addr: u32::from_ne_bytes(addr.0),
+        sin_zero: [0; 8],
+    }
+}
+
+fn ipv4_netmask(prefix_len: u8) -> Ipv4Address {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len as u32)
+    };
+    Ipv4Address::from_bytes(&mask.to_be_bytes())
+}
+
+fn prefix_len_from_netmask(addr: Ipv4Address) -> LxResult<u8> {
+    let mask = u32::from_be_bytes(addr.0);
+    let prefix_len = mask.leading_ones() as u8;
+    let canonical = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len as u32)
+    };
+    if mask != canonical {
+        return Err(LxError::EINVAL);
+    }
+    Ok(prefix_len)
 }
 
 impl UdpSocketState {
@@ -251,27 +334,7 @@ impl Socket for UdpSocketState {
             //
             // BusyBox `ifconfig` uses this and may loop forever if `ifc_len`
             // is not updated to the number of bytes actually written.
-            0x8912 => {
-                #[repr(C)]
-                struct IfConf {
-                    ifc_len: i32,
-                    ifc_buf: usize,
-                }
-
-                #[repr(C)]
-                #[derive(Clone, Copy)]
-                union IfReqUnion {
-                    addr: SockAddrPlaceholder,
-                    flags: i16,
-                }
-
-                #[repr(C)]
-                #[derive(Clone, Copy)]
-                struct IfReq {
-                    ifr_name: [u8; 16],
-                    ifr_ifru: IfReqUnion,
-                }
-
+            SIOCGIFCONF => {
                 #[allow(unsafe_code)]
                 let ifc = unsafe { &mut *(arg1 as *mut IfConf) };
                 if ifc.ifc_len < 0 {
@@ -298,11 +361,9 @@ impl Socket for UdpSocketState {
                     let n = core::cmp::min(15, name.as_bytes().len());
                     ifr_name[..n].copy_from_slice(&name.as_bytes()[..n]);
 
-                    // Minimal placeholder address (0.0.0.0) with AF_INET.
-                    let addr = SockAddrPlaceholder {
-                        family: AddressFamily::Internet.into(),
-                        data: [0; 14],
-                    };
+                    let addr = iface_ipv4_cidr(&**iface)
+                        .map(|cidr| ipv4_sockaddr(cidr.address()))
+                        .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
                     let ifr = IfReq {
                         ifr_name,
                         ifr_ifru: IfReqUnion { addr },
@@ -327,17 +388,7 @@ impl Socket for UdpSocketState {
             }
 
             // SIOCGIFFLAGS: get interface flags
-            0x8913 => {
-                #[repr(C)]
-                union IfReqUnion {
-                    addr: SockAddrPlaceholder,
-                    flags: i16,
-                }
-                #[repr(C)]
-                struct IfReq {
-                    ifr_name: [u8; 16],
-                    ifr_ifru: IfReqUnion,
-                }
+            SIOCGIFFLAGS => {
                 const IFF_UP: i16 = 0x1;
                 const IFF_RUNNING: i16 = 0x40;
 
@@ -349,8 +400,66 @@ impl Socket for UdpSocketState {
                 Ok(0)
             }
 
+            SIOCGIFADDR => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+                let ifname = ifreq_name(&ifr.ifr_name)?;
+                let iface = iface_by_name(ifname)?;
+                let addr = iface_ipv4_cidr(&*iface)
+                    .map(|cidr| ipv4_sockaddr(cidr.address()))
+                    .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
+                ifr.ifr_ifru = IfReqUnion { addr };
+                Ok(0)
+            }
+
+            SIOCSIFADDR => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &*(arg1 as *const IfReq) };
+                let ifname = ifreq_name(&ifr.ifr_name)?;
+                let iface = iface_by_name(ifname)?;
+                #[allow(unsafe_code)]
+                let addr = unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
+                let prefix_len = iface_ipv4_cidr(&*iface)
+                    .map(|cidr| cidr.prefix_len())
+                    .unwrap_or(32);
+                iface
+                    .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
+                    .map_err(|_| LxError::EINVAL)?;
+                Ok(0)
+            }
+
+            SIOCGIFNETMASK => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+                let ifname = ifreq_name(&ifr.ifr_name)?;
+                let iface = iface_by_name(ifname)?;
+                let addr = iface_ipv4_cidr(&*iface)
+                    .map(|cidr| ipv4_sockaddr(ipv4_netmask(cidr.prefix_len())))
+                    .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
+                ifr.ifr_ifru = IfReqUnion { addr };
+                Ok(0)
+            }
+
+            SIOCSIFNETMASK => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &*(arg1 as *const IfReq) };
+                let ifname = ifreq_name(&ifr.ifr_name)?;
+                let iface = iface_by_name(ifname)?;
+                #[allow(unsafe_code)]
+                let netmask =
+                    unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
+                let prefix_len = prefix_len_from_netmask(netmask)?;
+                let addr = iface_ipv4_cidr(&*iface)
+                    .map(|cidr| cidr.address())
+                    .unwrap_or(Ipv4Address::UNSPECIFIED);
+                iface
+                    .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
+                    .map_err(|_| LxError::EINVAL)?;
+                Ok(0)
+            }
+
             // SIOCGARP
-            0x8954 => {
+            SIOCGARP => {
                 // TODO: check addr
                 #[allow(unsafe_code)]
                 let req = unsafe { &mut *(arg1 as *mut ArpReq) };

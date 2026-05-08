@@ -510,6 +510,19 @@ impl NetScheme for E1000eInterface {
     fn get_ip_address(&self) -> Vec<IpCidr> {
         Vec::from(self.iface.lock().ip_addrs())
     }
+    fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
+        self.iface.lock().update_ip_addrs(|addrs| {
+            if let Some(addr) = addrs
+                .iter_mut()
+                .find(|addr| matches!(addr, IpCidr::Ipv4(_)))
+            {
+                *addr = IpCidr::Ipv4(cidr);
+            } else if let Some(addr) = addrs.iter_mut().next() {
+                *addr = IpCidr::Ipv4(cidr);
+            }
+        });
+        Ok(())
+    }
     fn poll(&self) -> DeviceResult {
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
@@ -595,8 +608,8 @@ impl phy::TxToken for E1000eTxToken {
 pub fn init(
     name: String,
     irq: usize,
-    vaddr: usize, // MMIO virtual base
-    index: usize, // card index for IP suffix
+    vaddr: usize,  // MMIO virtual base
+    _index: usize, // card index for IP suffix
 ) -> DeviceResult<E1000eInterface> {
     info!(
         "[e1000e] probing {} at vaddr={:#x} irq={}",
@@ -651,11 +664,9 @@ pub fn init(
     let driver = E1000eDriver(hw);
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac_bytes);
-    let ip_addrs = [IpCidr::new(IpAddress::v4(10, 0, 2, (15 + index) as u8), 24)];
-    let default_gw = Ipv4Address::new(10, 0, 2, 2);
+    let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)];
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 1] = [None; 1];
-    let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
-    routes.add_default_ipv4_route(default_gw).unwrap();
+    let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
 
     let iface = InterfaceBuilder::new(driver.clone())
         .ethernet_addr(ethernet_addr)
@@ -665,7 +676,7 @@ pub fn init(
         .finalize();
 
     info!(
-        "[e1000e] interface {} up, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        "[e1000e] interface {} up, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, awaiting IPv4 configuration",
         name, mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
     );
 
