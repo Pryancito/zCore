@@ -56,10 +56,7 @@ impl Socket for NetlinkSocketState {
         if buffer.is_empty() {
             return (
                 Err(LxError::EAGAIN),
-                Endpoint::Netlink(NetlinkEndpoint {
-                    port_id: 0,
-                    multicast_groups_mask: 0,
-                }),
+                Endpoint::Netlink(NetlinkEndpoint::new(0, 0)),
             );
         }
         let msg = buffer.remove(0);
