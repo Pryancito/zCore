@@ -94,7 +94,7 @@ cfg_if! {
             const MACHINE_ALIGN: usize = core::mem::size_of::<usize>();
             const HEAP_BLOCK: usize = KERNEL_HEAP_SIZE / MACHINE_ALIGN;
             static mut HEAP: [usize; HEAP_BLOCK] = [0; HEAP_BLOCK];
-            let heap_start = unsafe { HEAP.as_ptr() as usize };
+            let heap_start = core::ptr::addr_of_mut!(HEAP).cast::<u8>() as usize;
             unsafe {
                 HEAP_ALLOCATOR
                     .lock()

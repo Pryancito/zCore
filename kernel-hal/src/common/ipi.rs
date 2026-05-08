@@ -17,14 +17,30 @@ type IRQueue = MpscQueue<'static, IpiEntry>;
 
 lazy_static::lazy_static! {
     static ref IPI_QUEUE: [IRQueue; MAX_CORE_NUM] = [
-        IRQueue::new(unsafe {&mut IPI_REASON0} ),
-        IRQueue::new(unsafe {&mut IPI_REASON1} ),
-        IRQueue::new(unsafe {&mut IPI_REASON2} ),
-        IRQueue::new(unsafe {&mut IPI_REASON3} ),
-        IRQueue::new(unsafe {&mut IPI_REASON4} ),
-        IRQueue::new(unsafe {&mut IPI_REASON5} ),
-        IRQueue::new(unsafe {&mut IPI_REASON6} ),
-        IRQueue::new(unsafe {&mut IPI_REASON7} ),
+        IRQueue::new(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(IPI_REASON0).cast(), REASON_SIZE)
+        }),
+        IRQueue::new(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(IPI_REASON1).cast(), REASON_SIZE)
+        }),
+        IRQueue::new(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(IPI_REASON2).cast(), REASON_SIZE)
+        }),
+        IRQueue::new(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(IPI_REASON3).cast(), REASON_SIZE)
+        }),
+        IRQueue::new(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(IPI_REASON4).cast(), REASON_SIZE)
+        }),
+        IRQueue::new(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(IPI_REASON5).cast(), REASON_SIZE)
+        }),
+        IRQueue::new(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(IPI_REASON6).cast(), REASON_SIZE)
+        }),
+        IRQueue::new(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(IPI_REASON7).cast(), REASON_SIZE)
+        }),
     ];
 }
 

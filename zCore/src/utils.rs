@@ -2,6 +2,7 @@ use alloc::{collections::BTreeMap, string::String, sync::Arc};
 use zircon_object::{object::KernelObject, task::Process};
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct BootOptions {
     pub cmdline: String,
     pub log_level: String,

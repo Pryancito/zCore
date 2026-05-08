@@ -13,6 +13,7 @@ use zircon_object::vm::{pages, MMUFlags, VmObject};
 
 /// A DRM Framebuffer object
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct DrmFramebuffer {
     pub id: u32,
     /// GEM handle that backs this framebuffer

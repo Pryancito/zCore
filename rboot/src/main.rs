@@ -70,6 +70,8 @@ fn has_cmdline_flag(cmdline: &str, key: &str) -> bool {
 
 #[entry]
 fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
+    // Asegura que `BootServices::image_handle()` sea correcto (lo usa ExitBootServices internamente).
+    unsafe { st.boot_services().set_image_handle(image) };
     uefi_services::init(&mut st).expect("failed to initialize utilities");
 
     //info!("bootloader is running");
@@ -142,12 +144,12 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     let max_mmap_size = st.boot_services().memory_map_size().map_size;
     let mmap_storage = Box::leak(vec![0u8; max_mmap_size * 2].into_boxed_slice());
     let max_phys_addr = {
-        let mmap_iter = st
+        let mmap = st
             .boot_services()
             .memory_map(mmap_storage)
             .expect("failed to get memory map")
-            .1;
-        mmap_iter
+            ;
+        mmap.entries()
             .map(|m| m.phys_start + m.page_count * 0x1000)
             .max()
             .unwrap()
@@ -176,8 +178,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         // immediately on real hardware.
         Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
+    debug!("mapping elf segments...");
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
         .expect("failed to map ELF");
+    debug!("mapping kernel stack...");
     page_table::map_stack(
         config.kernel_stack_address,
         config.kernel_stack_size,
@@ -185,6 +189,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         &mut UEFIFrameAllocator(bs),
     )
     .expect("failed to map stack");
+    debug!("mapping physical memory...");
     page_table::map_physical_memory(
         config.physical_memory_offset,
         max_phys_addr,
@@ -192,6 +197,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         &mut UEFIFrameAllocator(bs),
     );
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 40);
+    debug!("sanity checks before ExitBootServices...");
 
     // Sanity checks while Boot Services are still alive.
     // If these fault on real hardware, the firmware is much more likely to show a dump.
@@ -229,13 +235,23 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // On some real machines, ExitBootServices can be the point where things go wrong.
     // Update the bar just before attempting it so we can pinpoint the hang visually.
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 45);
-    let (_rt, mmap_iter) = st
-        .exit_boot_services(image, mmap_storage)
-        .expect("Failed to exit boot services");
+    debug!("calling ExitBootServices (raw)...");
+    let (map_size, desc_size) = exit_boot_services_raw(&mut st, image, mmap_storage);
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
+    debug!("ExitBootServices ok, collecting memory map...");
 
-    for desc in mmap_iter {
-        memory_map.push(desc);
+    // Reinterpret the raw memory map buffer as `MemoryDescriptor` entries.
+    // SAFETY: `mmap_storage` is leaked, and UEFI guarantees the memory map layout.
+    let entry_size = desc_size;
+    let len = map_size / entry_size;
+    for i in 0..len {
+        let p = unsafe { mmap_storage.as_ptr().add(i * entry_size) } as *const MemoryDescriptor;
+        // Some firmware leaves unused tail bytes; stop on obviously empty descriptors.
+        let d = unsafe { &*p };
+        if d.page_count == 0 {
+            break;
+        }
+        memory_map.push(d);
     }
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 49);
 
@@ -245,6 +261,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 50);
 
     unsafe {
+        debug!("jumping to kernel entry...");
         // If we see 51% but not the kernel marker (52%), the hang is inside the
         // handoff asm / very first instruction fetch.
         progress::bar(graphic_info.mode, graphic_info.fb_addr, 51);
@@ -252,12 +269,58 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     }
 }
 
+fn exit_boot_services_raw(
+    st: &mut SystemTable<Boot>,
+    image: Handle,
+    mmap_storage: &mut [u8],
+) -> (usize, usize) {
+    // Avoid `SystemTable::exit_boot_services` because it resets the machine on failure
+    // without printing the underlying Status.
+    //
+    // Instead, call `GetMemoryMap` and `ExitBootServices` via the raw table pointers
+    // and retry a couple of times.
+    let st_raw = st.as_ptr() as *mut uefi_raw::table::system::SystemTable;
+    let bs_raw = unsafe { &mut *(*st_raw).boot_services };
+
+    let mut last = Status::ABORTED;
+    for _ in 0..2 {
+        let mut map_size = mmap_storage.len();
+        let mut map_key: usize = 0;
+        let mut desc_size: usize = 0;
+        let mut desc_ver: u32 = 0;
+
+        let status = unsafe {
+            (bs_raw.get_memory_map)(
+                &mut map_size,
+                mmap_storage.as_mut_ptr().cast(),
+                &mut map_key,
+                &mut desc_size,
+                &mut desc_ver,
+            )
+        };
+        if status != Status::SUCCESS {
+            last = status;
+            continue;
+        }
+
+        let status = unsafe { (bs_raw.exit_boot_services)(image.as_ptr(), map_key) };
+        if status == Status::SUCCESS {
+            return (map_size, desc_size);
+        }
+        last = status;
+    }
+
+    panic!("ExitBootServices failed: {:?}", last);
+}
+
 fn open_file(bs: &BootServices, path: &str) -> RegularFile {
     //info!("opening file: {}", path);
-    let fs = bs
-        .locate_protocol::<SimpleFileSystem>()
-        .expect("failed to get FileSystem");
-    let fs = unsafe { &mut *fs.get() };
+    let fs_handle = bs
+        .get_handle_for_protocol::<SimpleFileSystem>()
+        .expect("failed to get FileSystem handle");
+    let mut fs = bs
+        .open_protocol_exclusive::<SimpleFileSystem>(fs_handle)
+        .expect("failed to open FileSystem protocol");
     let mut buf = [0u16; 256];
     let path = CStr16::from_str_with_buf(path, &mut buf).expect("failed to convert path to ucs-2");
     let mut root = fs.open_volume().expect("failed to open volume");
@@ -301,9 +364,8 @@ fn find_active_gop_handle(bs: &BootServices) -> Option<Handle> {
     let mut best: Option<Handle> = None;
     let mut best_size: usize = 0;
 
-    for &h in handles.handles().iter() {
-        if let Ok(cell) = bs.handle_protocol::<GraphicsOutput>(h) {
-            let gop = unsafe { &mut *cell.get() };
+    for &h in handles.iter() {
+        if let Ok(mut gop) = bs.open_protocol_exclusive::<GraphicsOutput>(h) {
             // BltOnly means there is no direct framebuffer.
             if gop.current_mode_info().pixel_format() == PixelFormat::BltOnly {
                 continue;
@@ -322,22 +384,16 @@ fn find_active_gop_handle(bs: &BootServices) -> Option<Handle> {
 }
 
 fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> GraphicInfo {
-    let gop = if let Some(handle) = find_active_gop_handle(bs) {
-        let cell = bs
-            .handle_protocol::<GraphicsOutput>(handle)
-            .expect("failed to open chosen GOP handle");
-        unsafe { &mut *cell.get() }
-    } else {
-        // Fallback for firmware that does not support locate_handle_buffer.
-        let cell = bs
-            .locate_protocol::<GraphicsOutput>()
-            .expect("failed to get GraphicsOutput");
-        unsafe { &mut *cell.get() }
-    };
+    let gop_handle = find_active_gop_handle(bs)
+        .or_else(|| bs.get_handle_for_protocol::<GraphicsOutput>().ok())
+        .expect("failed to find GraphicsOutput handle");
+    let mut gop = bs
+        .open_protocol_exclusive::<GraphicsOutput>(gop_handle)
+        .expect("failed to open GraphicsOutput protocol");
 
     if let Some(resolution) = resolution {
         let mode = gop
-            .modes()
+            .modes(bs)
             .find(|mode| {
                 let info = mode.info();
                 info.resolution() == resolution

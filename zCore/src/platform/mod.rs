@@ -14,4 +14,4 @@ cfg_if! {
     }
 }
 
-pub use arch::consts::*;
+// `arch::consts::*` puede quedar vacío según target/features; evitar warnings con `#![deny(warnings)]`.

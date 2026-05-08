@@ -78,9 +78,17 @@ fn map_segment(
         let offset = frame - start_frame;
         let page = start_page + offset;
         unsafe {
-            page_table
-                .map_to(page, frame, page_table_flags, frame_allocator)?
-                .flush();
+            match page_table.map_to(page, frame, page_table_flags, frame_allocator) {
+                Ok(flush) => flush.flush(),
+                Err(MapToError::PageAlreadyMapped(_)) => {
+                    // Si el firmware ya mapeó esta página, aceptarlo siempre que
+                    // apunte al mismo frame físico.
+                    if page_table.translate_page(page).ok() != Some(frame) {
+                        return Err(MapToError::PageAlreadyMapped(frame));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -167,8 +175,12 @@ pub fn map_physical_memory(
         unsafe {
             page_table
                 .map_to(page, frame, flags, frame_allocator)
-                .expect("failed to map physical memory")
-                .flush();
+                .map(|flush| flush.flush())
+                .or_else(|e| match e {
+                    MapToError::PageAlreadyMapped(_) if page_table.translate_page(page).ok() == Some(frame) => Ok(()),
+                    other => Err(other),
+                })
+                .expect("failed to map physical memory");
         }
     }
 }

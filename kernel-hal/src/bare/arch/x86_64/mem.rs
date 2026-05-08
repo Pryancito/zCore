@@ -37,7 +37,7 @@ pub fn free_pmem_regions() -> Vec<Range<PhysAddr>> {
 
 // Get cache line size in bytes.
 fn cacheline_size() -> usize {
-    let leaf = unsafe { __cpuid(1).ebx };
+    let leaf = __cpuid(1).ebx;
     (((leaf >> 8) & 0xff) << 3) as usize
 }
 

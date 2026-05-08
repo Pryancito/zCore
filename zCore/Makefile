@@ -141,7 +141,7 @@ endif
 build_args := --features "$(features)"
 
 ifneq ($(LIBOS), 1) # no_std
-  build_args += --no-default-features --target $(ARCH).json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
+  build_args += --no-default-features --target $(ARCH).json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem -Zjson-target-spec
 endif
 
 ifeq ($(MODE), release)

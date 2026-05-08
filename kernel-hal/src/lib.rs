@@ -3,7 +3,6 @@
 #![cfg_attr(not(feature = "libos"), no_std)]
 #![cfg_attr(feature = "libos", feature(thread_id_value))]
 #![feature(doc_cfg)]
-#![feature(if_let_guard)]
 // #![feature(core_intrinsics)]
 #![allow(clippy::uninit_vec)]
 #![deny(warnings)]
@@ -22,7 +21,7 @@ extern crate lazy_static;
 mod macros;
 
 mod common;
-mod config;
+pub mod config;
 mod hal_fn;
 mod kernel_handler;
 mod utils;
