@@ -125,6 +125,14 @@ pub(super) fn init() -> DeviceResult {
         // Otherwise create it here (fallback).
         if let Some(display) = crate::drivers::all_display().first() {
             crate::console::init_graphic_console(display.clone());
+            // VirtIO GPU (and similar) needs an explicit flush to push framebuffer
+            // contents to the screen.  Spawn a periodic flush task matching
+            // what the RISC-V init already does.
+            if display.need_flush() {
+                crate::thread::spawn(crate::common::future::DisplayFlushFuture::new(
+                    display, 30,
+                ));
+            }
         } else {
             use crate::KCONFIG;
             use zcore_drivers::display::UefiDisplay;
