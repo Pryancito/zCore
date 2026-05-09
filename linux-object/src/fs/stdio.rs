@@ -190,12 +190,21 @@ impl Stdin {
             ctrl_c_pending_set();
         }
         self.buf.lock().push_back(c);
-        // Signal availability.  If we can grab the eventbus cheaply,
-        // notify waiters immediately; otherwise leave the flag for later.
-        self.data_ready.store(true, Ordering::Release);
-        if let Some(mut eb) = self.eventbus.try_lock() {
+        #[cfg(not(target_os = "none"))]
+        {
             self.data_ready.store(false, Ordering::Relaxed);
-            eb.set(Event::READABLE);
+            self.eventbus.lock().set(Event::READABLE);
+            return;
+        }
+        // Signal availability. If we can grab the eventbus cheaply, notify
+        // waiters immediately; otherwise leave the flag for later.
+        #[cfg(target_os = "none")]
+        {
+            self.data_ready.store(true, Ordering::Release);
+            if let Some(mut eb) = self.eventbus.try_lock() {
+                self.data_ready.store(false, Ordering::Relaxed);
+                eb.set(Event::READABLE);
+            }
         }
     }
 
@@ -264,7 +273,11 @@ impl INode for Stdin {
                 // Propagate any IRQ-side pushes into the EventBus.
                 self.stdin.flush_ready_flag();
                 if self.stdin.can_read() {
-                    return Poll::Ready(self.stdin.poll());
+                    return Poll::Ready(Ok(PollStatus {
+                        read: true,
+                        write: false,
+                        error: false,
+                    }));
                 }
                 let waker = cx.waker().clone();
                 self.stdin.eventbus.lock().subscribe(Box::new({
@@ -273,7 +286,16 @@ impl INode for Stdin {
                         true
                     }
                 }));
-                Poll::Pending
+                self.stdin.flush_ready_flag();
+                if self.stdin.can_read() {
+                    Poll::Ready(Ok(PollStatus {
+                        read: true,
+                        write: false,
+                        error: false,
+                    }))
+                } else {
+                    Poll::Pending
+                }
             }
         }
 
