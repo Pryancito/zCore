@@ -150,24 +150,67 @@ fn input_event_to_char(code: u16) -> Option<char> {
     }
 }
 
-/// Stdin struct, for Stdin buffer
-#[derive(Default)]
+/// Stdin struct, for Stdin buffer.
+///
+/// Design: `push()` is called from IRQ-handler callbacks (UART / xHCI HID).
+/// To avoid deep nested spinlock chains from interrupt context (which caused
+/// deadlocks after ~20-30 keystrokes), `push()` only touches the buffer lock
+/// and sets an atomic flag — it does NOT touch the EventBus.  The EventBus
+/// notification happens lazily from the executor side (SerialFuture / pop).
+/// This is aligned with the Eclipse OS 1 pattern (usb_hid.rs → push_key),
+/// where the ISR only writes to a circular buffer with interrupts disabled.
 pub struct Stdin {
     buf: Mutex<VecDeque<char>>,
     eventbus: Mutex<EventBus>,
+    /// Atomic flag set by `push()` so `SerialFuture` can detect new data
+    /// without requiring `eventbus.lock()` from the IRQ path.
+    data_ready: core::sync::atomic::AtomicBool,
+}
+
+impl Default for Stdin {
+    fn default() -> Self {
+        Self {
+            buf: Mutex::new(VecDeque::new()),
+            eventbus: Mutex::new(EventBus::default()),
+            data_ready: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl Stdin {
-    /// push a char in Stdin buffer
+    /// Push a char into the Stdin buffer.
+    ///
+    /// Safe to call from IRQ context: acquires `buf` lock briefly (with
+    /// interrupts disabled by the spinlock), sets an atomic flag, and
+    /// *tries* to propagate to the EventBus via try_lock().  If the
+    /// EventBus is contended the flag is left set for the next
+    /// executor-side flush_ready_flag() call.
     pub fn push(&self, c: char) {
         if c == '\u{3}' {
             ctrl_c_pending_set();
         }
         self.buf.lock().push_back(c);
-        self.eventbus.lock().set(Event::READABLE);
+        // Signal availability.  If we can grab the eventbus cheaply,
+        // notify waiters immediately; otherwise leave the flag for later.
+        self.data_ready.store(true, Ordering::Release);
+        if let Some(mut eb) = self.eventbus.try_lock() {
+            self.data_ready.store(false, Ordering::Relaxed);
+            eb.set(Event::READABLE);
+        }
     }
-    /// pop a char in Stdin buffer
+
+    /// Drain the atomic flag and propagate to EventBus.
+    /// Called from executor context (SerialFuture::poll, pop, executor loop).
+    pub fn flush_ready_flag(&self) {
+        if self.data_ready.swap(false, Ordering::Acquire) {
+            self.eventbus.lock().set(Event::READABLE);
+        }
+    }
+
+    /// pop a char from the Stdin buffer
     pub fn pop(&self) -> char {
+        // Propagate any pending push signals first.
+        self.flush_ready_flag();
         let mut buf_lock = self.buf.lock();
         let c = buf_lock.pop_front().unwrap();
         if buf_lock.len() == 0 {
@@ -187,6 +230,7 @@ pub struct Stdout;
 
 impl INode for Stdin {
     fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
+        self.flush_ready_flag();
         if self.can_read() {
             buf[0] = self.pop() as u8;
             Ok(1)
@@ -198,6 +242,7 @@ impl INode for Stdin {
         unimplemented!()
     }
     fn poll(&self) -> Result<PollStatus> {
+        self.flush_ready_flag();
         Ok(PollStatus {
             read: self.can_read(),
             write: false,
@@ -216,6 +261,8 @@ impl INode for Stdin {
             type Output = Result<PollStatus>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                // Propagate any IRQ-side pushes into the EventBus.
+                self.stdin.flush_ready_flag();
                 if self.stdin.can_read() {
                     return Poll::Ready(self.stdin.poll());
                 }

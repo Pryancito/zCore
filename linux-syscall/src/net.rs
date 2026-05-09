@@ -88,9 +88,18 @@ impl Syscall<'_> {
         let file_like = proc.get_file_like(sockfd.into())?;
 
         if let Endpoint::Unix(path) = &endpoint {
-            if let Ok(unix) = file_like.clone().downcast_arc::<UnixSocketState>() {
-                if let Some(server) = UnixSocketState::lookup(path) {
-                    server.push_accept(unix);
+            if let Ok(client) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                match UnixSocketState::lookup(path) {
+                    None => return Err(LxError::ECONNREFUSED),
+                    Some(server) => {
+                        if !server.is_listening() {
+                            return Err(LxError::ECONNREFUSED);
+                        }
+                        // Wire client ↔ server's accept handler
+                        server.push_accept(client.clone());
+                        // Mark client as connected (server side completes in accept())
+                        client.mark_connected();
+                    }
                 }
             }
         }
@@ -135,8 +144,11 @@ impl Syscall<'_> {
         let level = match Level::try_from(level) {
             Ok(level) => level,
             Err(_) => {
-                error!("invalid level: {}", level);
-                return Err(LxError::ENOPROTOOPT);
+                // Unknown levels (e.g. SOL_PACKET=263) — return Ok(0) to be lenient.
+                warn!("getsockopt: unsupported level: {}", level);
+                optval.write(0)?;
+                optlen.write(size_of::<u32>() as u32)?;
+                return Ok(0);
             }
         };
         if optval.is_null() {
@@ -157,7 +169,7 @@ impl Syscall<'_> {
                     .clone()
                     .as_socket()?
                     .get_buffer_capacity()
-                    .unwrap();
+                    .unwrap_or((64 * 1024, 64 * 1024));
                 debug!("sys_getsockopt recv and send buffer capacity: {}, {}. optval: {:?}, optlen: {:?}", recv_buf_ca, send_buf_ca, optval.check(), optlen.check());
 
                 match optname {
@@ -181,7 +193,12 @@ impl Syscall<'_> {
                         optlen.write(size_of::<u32>() as u32)?;
                         Ok(0)
                     }
-                    _ => Err(LxError::ENOPROTOOPT),
+                    SolOptname::LINGER => {
+                        // Return zero-linger: l_onoff=0, l_linger=0
+                        optval.write(0)?;
+                        optlen.write(8)?; // sizeof(struct linger)
+                        Ok(0)
+                    }
                 }
             }
             Level::IPPROTO_TCP => {
@@ -205,7 +222,11 @@ impl Syscall<'_> {
                     }
                 };
                 match optname {
-                    IpOptname::HDRINCL => unimplemented!(),
+                    IpOptname::HDRINCL => {
+                        optval.write(0)?;
+                        optlen.write(size_of::<u32>() as u32)?;
+                        Ok(0)
+                    }
                 }
             }
         }
@@ -258,12 +279,16 @@ impl Syscall<'_> {
         debug!("FileLike {} flags: {:?}", sockfd, file_like.flags());
         let mut data = vec![0u8; len];
         let (result, endpoint) = file_like.clone().as_socket()?.read(&mut data).await;
-        if result.is_ok() && !src_addr.is_null() {
-            let sockaddr_in = SockAddr::from(endpoint);
-            sockaddr_in.write_to(src_addr, addrlen)?;
+        if let Ok(received) = result {
+            if !src_addr.is_null() {
+                let sockaddr_in = SockAddr::from(endpoint);
+                sockaddr_in.write_to(src_addr, addrlen)?;
+            }
+            buf.write_array(&data[..received])?;
+            Ok(received)
+        } else {
+            result
         }
-        buf.write_array(&data[..len])?;
-        result
     }
 
     /// transmit a message to another socket
@@ -505,7 +530,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let socket1 = Arc::new(UnixSocketState::default());
         let socket2 = Arc::new(UnixSocketState::default());
-        UnixSocketState::connect_to(&socket1, &socket2);
+        UnixSocketState::connect_pair(&socket1, &socket2);
         let fd1 = proc.add_socket(socket1)?;
         let fd2 = proc.add_socket(socket2)?;
         sv.write_array(&[fd1.into(), fd2.into()])?;

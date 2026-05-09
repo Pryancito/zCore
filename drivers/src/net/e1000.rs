@@ -2,6 +2,7 @@
 //! Datasheet: <https://www.intel.ca/content/dam/doc/datasheet/82574l-gbe-controller-datasheet.pdf>
 
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,7 +22,12 @@ use isomorphic_drivers::net::ethernet::structs::EthernetAddress as DriverEtherne
 use lock::Mutex;
 
 #[derive(Clone)]
-pub struct E1000Driver(Arc<Mutex<E1000<ProviderImpl>>>);
+pub struct E1000Driver {
+    hw: Arc<Mutex<E1000<ProviderImpl>>>,
+    /// Shared raw frame queue — frames are cloned here by RxToken::consume()
+    /// so AF_PACKET sockets can read them even after smoltcp has processed them.
+    raw_rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+}
 
 #[derive(Clone)]
 pub struct E1000Interface {
@@ -42,7 +48,7 @@ impl Scheme for E1000Interface {
             return;
         }
 
-        let data = self.driver.0.lock().handle_interrupt();
+        let data = self.driver.hw.lock().handle_interrupt();
 
         if data {
             let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
@@ -51,7 +57,7 @@ impl Scheme for E1000Interface {
             match self.iface.lock().poll(&mut sockets, timestamp) {
                 Ok(p) => {
                     //SOCKET_ACTIVITY.notify_all();
-                    info!("e1000 try_handle_interrupt poll: {:?}", p);
+                    trace!("e1000 try_handle_interrupt poll: {:?}", p);
                 }
                 Err(err) => {
                     warn!("poll got err {}", err);
@@ -93,17 +99,25 @@ impl NetScheme for E1000Interface {
     }
 
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
-        if let Some(vec_recv) = self.driver.0.lock().receive() {
-            buf.copy_from_slice(&vec_recv);
-            Ok(vec_recv.len())
+        // Check raw_rx_queue first (filled by RxToken::consume via smoltcp poll).
+        if let Some(pkt) = self.driver.raw_rx_queue.lock().pop_front() {
+            let n = pkt.len().min(buf.len());
+            buf[..n].copy_from_slice(&pkt[..n]);
+            return Ok(n);
+        }
+        // Fallback: try to read directly from hardware.
+        if let Some(vec_recv) = self.driver.hw.lock().receive() {
+            let n = vec_recv.len().min(buf.len());
+            buf[..n].copy_from_slice(&vec_recv[..n]);
+            Ok(n)
         } else {
             Err(DeviceError::NotReady)
         }
     }
 
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        if self.driver.0.lock().can_send() {
-            let mut driver = self.driver.0.lock();
+        if self.driver.hw.lock().can_send() {
+            let mut driver = self.driver.hw.lock();
             driver.send(data);
             Ok(data.len())
         } else {
@@ -112,11 +126,18 @@ impl NetScheme for E1000Interface {
     }
 
     fn can_recv(&self) -> bool {
-        self.driver.0.lock().receive().is_some()
+        // Check if we have buffered frames first.
+        if !self.driver.raw_rx_queue.lock().is_empty() {
+            return true;
+        }
+        // We cannot safely peek the DMA ring without consuming. Return true so
+        // callers always attempt recv(); the actual receive will return NotReady
+        // if there is nothing available.
+        true
     }
 
     fn can_send(&self) -> bool {
-        self.driver.0.lock().can_send()
+        self.driver.hw.lock().can_send()
     }
 
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
@@ -141,7 +162,11 @@ impl NetScheme for E1000Interface {
     }
 }
 
-pub struct E1000RxToken(Vec<u8>);
+pub struct E1000RxToken {
+    data: Vec<u8>,
+    raw_rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+}
+
 pub struct E1000TxToken(E1000Driver);
 
 impl phy::Device<'_> for E1000Driver {
@@ -149,14 +174,22 @@ impl phy::Device<'_> for E1000Driver {
     type TxToken = E1000TxToken;
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.0
+        self.hw
             .lock()
             .receive()
-            .map(|vec_recv| (E1000RxToken(vec_recv), E1000TxToken(self.clone())))
+            .map(|vec_recv| {
+                (
+                    E1000RxToken {
+                        data: vec_recv,
+                        raw_rx_queue: self.raw_rx_queue.clone(),
+                    },
+                    E1000TxToken(self.clone()),
+                )
+            })
     }
 
     fn transmit(&mut self) -> Option<Self::TxToken> {
-        if self.0.lock().can_send() {
+        if self.hw.lock().can_send() {
             Some(E1000TxToken(self.clone()))
         } else {
             None
@@ -176,7 +209,10 @@ impl phy::RxToken for E1000RxToken {
     where
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
-        f(&mut self.0)
+        // Clone the raw frame into the shared queue BEFORE smoltcp processes it.
+        // This ensures AF_PACKET sockets (udhcpc, dhcpcd) can see every frame.
+        self.raw_rx_queue.lock().push_back(self.data.clone());
+        f(&mut self.data)
     }
 }
 
@@ -188,7 +224,7 @@ impl phy::TxToken for E1000TxToken {
         let mut buffer = [0u8; 1536];
         let result = f(&mut buffer[..len]);
 
-        let mut driver = (self.0).0.lock();
+        let mut driver = (self.0).hw.lock();
         driver.send(&buffer[..len]);
 
         result
@@ -210,7 +246,11 @@ pub fn init(
 
     let e1000 = E1000::new(header, size, DriverEthernetAddress::from_bytes(&mac));
 
-    let net_driver = E1000Driver(Arc::new(Mutex::new(e1000)));
+    let raw_rx_queue = Arc::new(Mutex::new(VecDeque::new()));
+    let net_driver = E1000Driver {
+        hw: Arc::new(Mutex::new(e1000)),
+        raw_rx_queue: raw_rx_queue.clone(),
+    };
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac);
     let ip_addrs = [IpCidr::new(IpAddress::v4(10, 0, 2, (15 + index) as u8), 24)];

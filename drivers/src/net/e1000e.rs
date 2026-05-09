@@ -555,6 +555,9 @@ pub struct E1000eInterface {
     driver: E1000eDriver,
     name: String,
     irq: usize,
+    /// Raw frames received from the NIC before smoltcp can consume them.
+    /// AF_PACKET sockets read here; smoltcp uses the separate Device trait path.
+    raw_rx_queue: Arc<Mutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>>>,
 }
 
 impl Scheme for E1000eInterface {
@@ -568,6 +571,16 @@ impl Scheme for E1000eInterface {
         }
         let had_data = self.driver.0.lock().handle_interrupt();
         if had_data {
+            // Drain all pending frames into raw_rx_queue so AF_PACKET sockets
+            // can see them, regardless of smoltcp's poll timing.
+            loop {
+                let frame = self.driver.0.lock().receive();
+                match frame {
+                    Some(pkt) => self.raw_rx_queue.lock().push_back(pkt),
+                    None => break,
+                }
+            }
+            // Also let smoltcp poll for TX completion / ARP / TCP state.
             let ts = Instant::from_micros(timer_now_as_micros() as i64);
             let sockets = get_sockets();
             let mut sockets = sockets.lock();
@@ -612,6 +625,13 @@ impl NetScheme for E1000eInterface {
             .map_err(|_| DeviceError::IoError)
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
+        // Check raw_rx_queue first (filled by handle_irq before smoltcp poll).
+        if let Some(pkt) = self.raw_rx_queue.lock().pop_front() {
+            let n = pkt.len().min(buf.len());
+            buf[..n].copy_from_slice(&pkt[..n]);
+            return Ok(n);
+        }
+        // Fallback: try direct DMA ring read (for polling without IRQ).
         if let Some(pkt) = self.driver.0.lock().receive() {
             let n = pkt.len().min(buf.len());
             buf[..n].copy_from_slice(&pkt[..n]);
@@ -624,6 +644,26 @@ impl NetScheme for E1000eInterface {
         let mut hw = self.driver.0.lock();
         hw.send(data)?;
         Ok(data.len())
+    }
+
+    fn can_recv(&self) -> bool {
+        // Cannot peek without consuming; callers must attempt recv().
+        true
+    }
+
+    fn can_send(&self) -> bool {
+        self.driver.0.lock().can_send()
+    }
+
+    fn add_route(&self, _cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        if let Some(IpAddress::Ipv4(gw)) = gateway {
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(gw)
+                .map_err(|_| DeviceError::IoError)?;
+        }
+        Ok(())
     }
 }
 
@@ -767,5 +807,6 @@ pub fn init(
         driver,
         name,
         irq,
+        raw_rx_queue: Arc::new(Mutex::new(alloc::collections::VecDeque::new())),
     })
 }

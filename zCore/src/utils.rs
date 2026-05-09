@@ -124,6 +124,14 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
             proc.map(check_exit_code);
             kernel_hal::cpu::reset();
         }
+        // Flush any stdin data pushed from IRQ context whose EventBus
+        // notification was deferred (try_lock failed).  This ensures
+        // the waker fires before we halt waiting for the next interrupt.
+        #[cfg(feature = "linux")]
+        {
+            use linux_object::fs::stdio::STDIN;
+            STDIN.flush_ready_flag();
+        }
         kernel_hal::interrupt::wait_for_interrupt();
     }
 }

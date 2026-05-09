@@ -102,6 +102,31 @@ impl LinuxRootfs {
             fs::create_dir_all(&var_run_dhcpcd).unwrap();
             let var_lib_dhcpcd = dir.join("var/lib/dhcpcd");
             fs::create_dir_all(&var_lib_dhcpcd).unwrap();
+
+            // /run/dhcpcd — dhcpcd control socket lives here by default
+            let run_dhcpcd = dir.join("run/dhcpcd");
+            fs::create_dir_all(&run_dhcpcd).unwrap();
+
+            // Write a minimal dhcpcd.conf — always overwrite to ensure hooks are disabled.
+            // This lets us test if dhcpcd progresses past PREINIT without the hook layer.
+            let etc = dir.join("etc");
+            fs::create_dir_all(&etc).unwrap();
+            let dhcpcd_conf = etc.join("dhcpcd.conf");
+            fs::write(&dhcpcd_conf,
+                b"# Eclipse OS dhcpcd configuration\n\
+                  # Disable ALL hooks -- Eclipse OS does not support the full hook layer yet\n\
+                  nohook *\n\
+                  nodev\n\
+                  broadcast\n\
+                  timeout 30\n\
+                  reboot 5\n"
+            ).unwrap();
+        }
+
+        // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
+        let machine_id = dir.join("etc/machine-id");
+        if !machine_id.exists() {
+            fs::write(&machine_id, b"eclipseoseclipseoseclipseoseclip\n").unwrap();
         }
 
         // 拷贝 libc.so
@@ -114,7 +139,7 @@ impl LinuxRootfs {
         Ext::new(self.strip(&musl)).arg("-s").arg(to).invoke();
         // 为常用功能建立符号链接
         const SH: &[&str] = &[
-            "cat", "cp", "echo", "false", "grep", "gzip", "kill", "ln", "ls", "mkdir", "mv",
+            "cat", "cp", "echo", "false", "grep", "gzip", "ip", "kill", "ln", "ls", "mkdir", "mv",
             "pidof", "ping", "ping6", "printenv", "ps", "pwd", "rm", "rmdir", "sh", "sleep",
             "stat", "tar", "touch", "true", "uname", "usleep", "watch", "ifconfig", "route",
             "udhcpc",
@@ -123,8 +148,47 @@ impl LinuxRootfs {
         for sh in SH {
             unix::fs::symlink("busybox", bin.join(sh)).unwrap();
         }
-        // Create /run directory
+        // Create standard pseudo-filesystem mount points
         let _ = fs::create_dir_all(dir.join("run"));
+        let _ = fs::create_dir_all(dir.join("proc"));
+        let _ = fs::create_dir_all(dir.join("sys"));
+        let _ = fs::create_dir_all(dir.join("tmp"));
+        let _ = fs::create_dir_all(dir.join("dev"));
+
+        // udhcpc default script — applies the DHCP-acquired address
+        let udhcpc_dir = dir.join("usr/share/udhcpc");
+        fs::create_dir_all(&udhcpc_dir).unwrap();
+        let udhcpc_script = udhcpc_dir.join("default.script");
+        fs::write(&udhcpc_script,
+            b"#!/bin/sh\n\
+              # Minimal udhcpc script for Eclipse OS\n\
+              case \"$1\" in\n\
+                deconfig)\n\
+                  ip addr flush dev $interface 2>/dev/null\n\
+                  ifconfig $interface 0.0.0.0 up 2>/dev/null\n\
+                  ;;\n\
+                bound|renew)\n\
+                  ifconfig $interface $ip netmask ${subnet:-255.255.255.0} up 2>/dev/null\n\
+                  if [ -n \"$router\" ]; then\n\
+                    for r in $router; do\n\
+                      route add default gw $r dev $interface 2>/dev/null\n\
+                    done\n\
+                  fi\n\
+                  if [ -n \"$dns\" ]; then\n\
+                    echo -n > /etc/resolv.conf\n\
+                    for d in $dns; do\n\
+                      echo \"nameserver $d\" >> /etc/resolv.conf\n\
+                    done\n\
+                  fi\n\
+                  ;;\n\
+              esac\n"
+        ).unwrap();
+        // Make the script executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&udhcpc_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         // 拷贝 nl_dump (netlink dump helper).
         // Do this AFTER symlink creation to ensure it's a real binary, not a BusyBox link.

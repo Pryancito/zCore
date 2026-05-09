@@ -14,6 +14,7 @@ use core::{mem::size_of, slice};
 use kernel_hal::{net::get_net_device, user::*};
 use kernel_hal::thread;
 use lock::Mutex;
+use smoltcp::wire::IpCidr;
 
 // Needed by `impl_kobject!`
 #[allow(unused_imports)]
@@ -240,6 +241,123 @@ impl Socket for NetlinkSocketState {
                         buffer.push(msg);
                     }
                 }
+            }
+            NetlinkMessageType::NewAddr => {
+                // RTM_NEWADDR: configure an IP address on an interface.
+                // Payload: IfaceAddrMsg + IFA_* attributes.
+                use kernel_hal::net::get_net_device;
+                if data.len() < size_of::<NetlinkMessageHeader>() + size_of::<IfaceAddrMsg>() {
+                    return Err(LxError::EINVAL);
+                }
+                let ifa_off = size_of::<NetlinkMessageHeader>();
+                #[allow(unsafe_code)]
+                let ifa = unsafe { &*(data[ifa_off..].as_ptr() as *const IfaceAddrMsg) };
+
+                // Walk attributes to find IFA_LOCAL / IFA_ADDRESS
+                let attrs_off = ifa_off + size_of::<IfaceAddrMsg>();
+                let mut ip_bytes: Option<[u8; 4]> = None;
+                let mut ptr = attrs_off;
+                while ptr + size_of::<RouteAttr>() <= data.len() {
+                    #[allow(unsafe_code)]
+                    let rta = unsafe { &*(data[ptr..].as_ptr() as *const RouteAttr) };
+                    let rta_len = rta.rta_len as usize;
+                    if rta_len < size_of::<RouteAttr>() { break; }
+                    let payload = &data[ptr + size_of::<RouteAttr>()..ptr + rta_len];
+                    let t = IfAddrAttrTypes::from(rta.rta_type);
+                    if matches!(t, IfAddrAttrTypes::Local | IfAddrAttrTypes::Address) {
+                        if payload.len() == 4 {
+                            let mut arr = [0u8; 4];
+                            arr.copy_from_slice(payload);
+                            ip_bytes = Some(arr);
+                        }
+                    }
+                    // rtattr entries are aligned to 4 bytes
+                    ptr += (rta_len + 3) & !3;
+                }
+                if let Some(bytes) = ip_bytes {
+                    let cidr = smoltcp::wire::Ipv4Cidr::new(
+                        smoltcp::wire::Ipv4Address::from_bytes(&bytes),
+                        ifa.ifa_prefixlen,
+                    );
+                    let iface_idx = (ifa.ifa_index as usize).saturating_sub(1);
+                    let ifaces = get_net_device();
+                    if let Some(iface) = ifaces.get(iface_idx) {
+                        let _ = iface.set_ipv4_address(cidr);
+                        info!("[netlink] NewAddr: set {}.{}.{}.{}/{} on if{}", bytes[0], bytes[1], bytes[2], bytes[3], ifa.ifa_prefixlen, iface_idx);
+                    }
+                }
+                // ACK (error=0)
+                let ack = NetlinkMessageHeader {
+                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
+                    nlmsg_type: NetlinkMessageType::Error.into(),
+                    nlmsg_flags: NetlinkMessageFlags::empty(),
+                    nlmsg_seq: header.nlmsg_seq,
+                    nlmsg_pid: 0,
+                };
+                let mut msg = Vec::new();
+                msg.push_ext(ack);
+                msg.push_ext(0i32); // error = 0 means success
+                msg.align4();
+                msg.set_ext(0, msg.len() as u32);
+                buffer.push(msg);
+            }
+            NetlinkMessageType::NewRoute => {
+                // RTM_NEWROUTE: add a routing entry (default gateway etc.)
+                // Payload: rtmsg + RTA_GATEWAY attribute.
+                use kernel_hal::net::get_net_device;
+                use smoltcp::wire::IpAddress;
+                // RTA_GATEWAY = 5
+                const RTA_GATEWAY: u16 = 5;
+                let rtm_off = size_of::<NetlinkMessageHeader>();
+                // rtmsg is 12 bytes (af, dst_len, src_len, tos, table, proto, scope, type_, flags)
+                const RTM_SIZE: usize = 12;
+                if data.len() < rtm_off + RTM_SIZE {
+                    return Err(LxError::EINVAL);
+                }
+                let mut gw_bytes: Option<[u8; 4]> = None;
+                let mut ifindex: usize = 0;
+                let mut ptr = rtm_off + RTM_SIZE;
+                // RTA_OIF = 4
+                const RTA_OIF: u16 = 4;
+                while ptr + size_of::<RouteAttr>() <= data.len() {
+                    #[allow(unsafe_code)]
+                    let rta = unsafe { &*(data[ptr..].as_ptr() as *const RouteAttr) };
+                    let rta_len = rta.rta_len as usize;
+                    if rta_len < size_of::<RouteAttr>() { break; }
+                    let payload = &data[ptr + size_of::<RouteAttr>()..ptr + rta_len];
+                    if rta.rta_type == RTA_GATEWAY && payload.len() == 4 {
+                        let mut arr = [0u8; 4];
+                        arr.copy_from_slice(payload);
+                        gw_bytes = Some(arr);
+                    } else if rta.rta_type == RTA_OIF && payload.len() == 4 {
+                        #[allow(unsafe_code)]
+                        let idx = unsafe { *(payload.as_ptr() as *const u32) } as usize;
+                        ifindex = idx.saturating_sub(1);
+                    }
+                    ptr += (rta_len + 3) & !3;
+                }
+                if let Some(gw) = gw_bytes {
+                    let ifaces = get_net_device();
+                    if let Some(iface) = ifaces.get(ifindex) {
+                        let gw_addr = IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&gw));
+                        let _ = iface.add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), Some(gw_addr));
+                        info!("[netlink] NewRoute: default gw {}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]);
+                    }
+                }
+                // ACK
+                let ack = NetlinkMessageHeader {
+                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
+                    nlmsg_type: NetlinkMessageType::Error.into(),
+                    nlmsg_flags: NetlinkMessageFlags::empty(),
+                    nlmsg_seq: header.nlmsg_seq,
+                    nlmsg_pid: 0,
+                };
+                let mut msg = Vec::new();
+                msg.push_ext(ack);
+                msg.push_ext(0i32);
+                msg.align4();
+                msg.set_ext(0, msg.len() as u32);
+                buffer.push(msg);
             }
             _ => {
                 // Unknown/unimplemented request: return NLMSG_ERROR with -EOPNOTSUPP.

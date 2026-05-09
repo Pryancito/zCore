@@ -2,11 +2,10 @@
 
 use crate::drivers;
 use core::fmt::{Arguments, Result, Write};
-use lock::Mutex;
 
 struct SerialWriter;
 
-static SERIAL_WRITER: Mutex<SerialWriter> = Mutex::new(SerialWriter);
+static SERIAL_WRITER: spin::Mutex<SerialWriter> = spin::Mutex::new(SerialWriter);
 
 impl Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> Result {
@@ -25,7 +24,7 @@ impl Write for SerialWriter {
 
 struct DebugWriter;
 
-static DEBUG_WRITER: Mutex<DebugWriter> = Mutex::new(DebugWriter);
+static DEBUG_WRITER: spin::Mutex<DebugWriter> = spin::Mutex::new(DebugWriter);
 
 impl Write for DebugWriter {
     fn write_str(&mut self, s: &str) -> Result {
@@ -41,7 +40,7 @@ cfg_if! {
         use core::sync::atomic::{AtomicBool, Ordering};
         use zcore_drivers::{scheme::DisplayScheme, utils::GraphicConsole};
 
-        static GRAPHIC_CONSOLE: InitOnce<Mutex<GraphicConsole>> = InitOnce::new();
+        static GRAPHIC_CONSOLE: InitOnce<spin::Mutex<GraphicConsole>> = InitOnce::new();
         static CONSOLE_WIN_SIZE: InitOnce<ConsoleWinSize> = InitOnce::new();
         static GRAPHIC_DISPLAY: InitOnce<Arc<dyn DisplayScheme>> = InitOnce::new();
         static CLEAR_ON_NEXT_GRAPHIC_WRITE: AtomicBool = AtomicBool::new(false);
@@ -57,7 +56,7 @@ cfg_if! {
                 ws_ypixel: info.height as u16,
             };
             CONSOLE_WIN_SIZE.init_once_by(winsz);
-            GRAPHIC_CONSOLE.init_once_by(Mutex::new(cons));
+            GRAPHIC_CONSOLE.init_once_by(spin::Mutex::new(cons));
             // Make boot UX robust on real hardware: clear once on first graphic write
             // even if userspace/loader ordering differs.
             CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
@@ -82,7 +81,7 @@ cfg_if! {
                     &**display,
                     zcore_drivers::prelude::RgbColor::new(0, 0, 0),
                 );
-                *cons.lock() = GraphicConsole::new(display.clone());
+                *cons.lock() = GraphicConsole::new(display.clone());  // spin::Mutex — IRQs stay enabled
             }
         }
     }
@@ -129,7 +128,11 @@ pub fn graphic_console_write_str(s: &str) {
     #[cfg(feature = "graphic")]
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
         maybe_clear_graphic_before_write();
-        cons.lock().write_str(s).unwrap();
+        // GRAPHIC_CONSOLE uses spin::Mutex (NOT lock::Mutex) so IRQs remain
+        // enabled during the potentially slow framebuffer rendering.  This
+        // keeps xhci_hid::poll() alive on timer ticks.
+        let mut g = cons.lock();
+        let _ = g.write_str(s);
     }
 }
 
@@ -139,7 +142,8 @@ pub fn graphic_console_write_fmt(fmt: Arguments) {
     #[cfg(feature = "graphic")]
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
         maybe_clear_graphic_before_write();
-        cons.lock().write_fmt(fmt).unwrap();
+        let mut g = cons.lock();
+        let _ = g.write_fmt(fmt);
     }
 }
 

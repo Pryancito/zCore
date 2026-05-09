@@ -3,7 +3,7 @@
 ARCH ?= x86_64
 PLATFORM ?= qemu
 MODE ?= release
-LOG ?= info
+LOG ?= warn
 LINUX ?=
 MOCK ?=
 LIBOS ?=

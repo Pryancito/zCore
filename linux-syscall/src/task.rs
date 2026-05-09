@@ -120,7 +120,16 @@ impl Syscall<'_> {
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
             flags, newsp, parent_tid, child_tid, newtls
         );
-        if flags == 0x4111 || flags == 0x11 {
+        // Fork-like clones: if the THREAD bit is not set, treat as fork.
+        // This covers SIGCHLD (0x11), VFORK|SIGCHLD (0x4111), and other
+        // fork-like combinations used by musl/glibc posix_spawn/system().
+        let sigchld_bits = flags & 0xff;
+        let has_thread = flags & CloneFlags::THREAD.bits() != 0;
+        if !has_thread && (sigchld_bits == 0x11 || sigchld_bits == 0x00) && newsp == 0 {
+            warn!("sys_clone is calling sys_fork for flags {:#x}", flags);
+            return self.sys_fork();
+        }
+        if flags == 0x4111 {
             // VFORK | VM | SIGCHILD
             warn!("sys_clone is calling sys_fork instead, ignoring other args");
             return self.sys_fork();
@@ -128,8 +137,8 @@ impl Syscall<'_> {
         if flags != 0x7d_0f00 && flags != 0x5d_0f00 {
             // 0x5d0f00: gcc of alpine linux
             // 0x7d0f00: pthread_create of alpine linux
-            warn!("sys_clone: unsupported flags {:#x}", flags);
-            return Err(LxError::ENOSYS);
+            warn!("sys_clone: unsupported flags {:#x}, trying fork", flags);
+            return self.sys_fork();
         }
         let new_thread = Thread::create_linux(self.zircon_process())?;
         let mut new_ctx = self.thread.context_cloned()?;
