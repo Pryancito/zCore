@@ -190,19 +190,20 @@ impl Stdin {
             ctrl_c_pending_set();
         }
         self.buf.lock().push_back(c);
-        self.data_ready.store(true, Ordering::Release);
         #[cfg(not(target_os = "none"))]
         {
-            self.data_ready.store(false, Ordering::Relaxed);
             self.eventbus.lock().set(Event::READABLE);
             return;
         }
         // Signal availability. If we can grab the eventbus cheaply, notify
         // waiters immediately; otherwise leave the flag for later.
         #[cfg(target_os = "none")]
-        if let Some(mut eb) = self.eventbus.try_lock() {
-            self.data_ready.store(false, Ordering::Relaxed);
-            eb.set(Event::READABLE);
+        {
+            self.data_ready.store(true, Ordering::Release);
+            if let Some(mut eb) = self.eventbus.try_lock() {
+                self.data_ready.store(false, Ordering::Relaxed);
+                eb.set(Event::READABLE);
+            }
         }
     }
 
