@@ -134,13 +134,26 @@ impl INode for EventDev {
             type Output = Result<PollStatus>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                // Fast path: data already available.
                 if self.dev.can_read() {
                     return Poll::Ready(self.dev.poll());
                 }
+                // Register the waker BEFORE the second can_read() check to
+                // eliminate the TOCTOU race: if an event arrives between the
+                // first check (false) and subscribe(), it would not fire any
+                // waker and the task would sleep indefinitely until the next
+                // event.  By registering first, any event that arrives during
+                // or after subscribe() will call the waker and reschedule the
+                // task.
                 let waker = cx.waker().clone();
                 self.dev
                     .input
                     .subscribe(Box::new(move |_| waker.wake_by_ref()), true);
+                // Re-check after registering the waker in case an event
+                // arrived in the window between the first check and subscribe().
+                if self.dev.can_read() {
+                    return Poll::Ready(self.dev.poll());
+                }
                 Poll::Pending
             }
         }
