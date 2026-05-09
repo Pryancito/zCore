@@ -97,22 +97,30 @@ pub fn request_clear_graphic_on_next_write() {
 
 /// Writes a string slice into the serial.
 pub fn serial_write_str(s: &str) {
-    SERIAL_WRITER.lock().write_str(s).unwrap();
+    if let Some(mut w) = SERIAL_WRITER.try_lock() {
+        let _ = w.write_str(s);
+    }
 }
 
 /// Writes formatted data into the serial.
 pub fn serial_write_fmt(fmt: Arguments) {
-    SERIAL_WRITER.lock().write_fmt(fmt).unwrap();
+    if let Some(mut w) = SERIAL_WRITER.try_lock() {
+        let _ = w.write_fmt(fmt);
+    }
 }
 
 /// Writes a string slice into the serial through sbi call.
 pub fn debug_write_str(s: &str) {
-    DEBUG_WRITER.lock().write_str(s).unwrap();
+    if let Some(mut w) = DEBUG_WRITER.try_lock() {
+        let _ = w.write_str(s);
+    }
 }
 
 /// Writes formatted data into the serial through sbi call..
 pub fn debug_write_fmt(fmt: Arguments) {
-    DEBUG_WRITER.lock().write_fmt(fmt).unwrap();
+    if let Some(mut w) = DEBUG_WRITER.try_lock() {
+        let _ = w.write_fmt(fmt);
+    }
 }
 
 /// Draw a boot progress bar on the early framebuffer console (UEFI GOP), if available.
@@ -128,11 +136,11 @@ pub fn graphic_console_write_str(s: &str) {
     #[cfg(feature = "graphic")]
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
         maybe_clear_graphic_before_write();
-        // GRAPHIC_CONSOLE uses spin::Mutex (NOT lock::Mutex) so IRQs remain
-        // enabled during the potentially slow framebuffer rendering.  This
-        // keeps xhci_hid::poll() alive on timer ticks.
-        let mut g = cons.lock();
-        let _ = g.write_str(s);
+        // Use try_lock to avoid deadlock if an IRQ tries to log while 
+        // the console is scrolling.
+        if let Some(mut g) = cons.try_lock() {
+            let _ = g.write_str(s);
+        }
     }
 }
 
@@ -142,8 +150,9 @@ pub fn graphic_console_write_fmt(fmt: Arguments) {
     #[cfg(feature = "graphic")]
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
         maybe_clear_graphic_before_write();
-        let mut g = cons.lock();
-        let _ = g.write_fmt(fmt);
+        if let Some(mut g) = cons.try_lock() {
+            let _ = g.write_fmt(fmt);
+        }
     }
 }
 

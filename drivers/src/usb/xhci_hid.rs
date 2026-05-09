@@ -466,12 +466,16 @@ impl CmdRing {
 
     fn sync_link_cycle_bit(&self) {
         let link_off = self.link_ctrl_off();
+        // Preservar todos los bits excepto el bit 0 (Cycle).
+        // El bit 1 (Toggle Cycle) debe permanecer en 1 para que el hardware invierta su ciclo.
         let mut c = self.buf.read_u32(link_off) & !1u32;
         if self.cycle {
             c |= 1;
         }
         fence(Ordering::Release);
         self.buf.write_u32(link_off, c);
+        // Asegurar que el controlador vea el cambio del bit de ciclo en el TRB LINK.
+        self.buf.flush(link_off, 4);
     }
 
     fn new(n: usize) -> DeviceResult<Self> {
@@ -482,6 +486,7 @@ impl CmdRing {
         buf.write_u32(off + 8, link.status);
         fence(Ordering::Release);
         buf.write_u32(off + 12, link.ctrl);
+        buf.flush(off, 16);
         Ok(Self {
             buf,
             cap: n - 1,
@@ -503,8 +508,8 @@ impl CmdRing {
         self.enq += 1;
         if self.enq >= self.cap {
             self.enq = 0;
-            self.cycle = !self.cycle;
             self.sync_link_cycle_bit();
+            self.cycle = !self.cycle;
         } else if self.cap >= 4 && self.enq == self.cap / 2 {
             self.sync_link_cycle_bit();
         }
@@ -533,12 +538,15 @@ impl XferRing {
 
     fn sync_link_cycle_bit(&self) {
         let link_off = self.link_ctrl_off();
+        // Preservar todos los bits excepto el bit 0 (Cycle).
         let mut c = self.buf.read_u32(link_off) & !1u32;
         if self.cycle {
             c |= 1;
         }
         fence(Ordering::Release);
         self.buf.write_u32(link_off, c);
+        // Asegurar que el controlador vea el cambio del bit de ciclo en el TRB LINK.
+        self.buf.flush(link_off, 4);
     }
 
     fn new(n: usize) -> DeviceResult<Self> {
@@ -549,6 +557,7 @@ impl XferRing {
         buf.write_u32(off + 8, link.status);
         fence(Ordering::Release);
         buf.write_u32(off + 12, link.ctrl);
+        buf.flush(off, 16);
         Ok(Self {
             buf,
             cap: n - 1,
@@ -582,8 +591,8 @@ impl XferRing {
         self.enq += 1;
         if self.enq >= self.cap {
             self.enq = 0;
-            self.cycle = !self.cycle;
             self.sync_link_cycle_bit();
+            self.cycle = !self.cycle;
         } else if self.cap >= 4 && self.enq == self.cap / 2 {
             self.sync_link_cycle_bit();
         }
@@ -1734,10 +1743,8 @@ impl XhciInner {
         let mut tmp = [0u8; 8];
         let n = h.report_len.min(tmp.len()).min(8);
         tmp[..n].fill(0);
-        unsafe {
-            core::ptr::copy_nonoverlapping(v as *const u8, tmp.as_mut_ptr(), n);
-        }
         // Asegurar consistencia de datos en arquitecturas con caché no coherente o mapeos WB.
+        // Se debe invalidar ANTES de copiar los datos para que la CPU lea de la RAM (DMA).
         #[cfg(target_arch = "x86_64")]
         {
             let mut addr = v;
@@ -1749,6 +1756,10 @@ impl XhciInner {
                 addr += 64;
             }
             fence(Ordering::SeqCst);
+        }
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(v as *const u8, tmp.as_mut_ptr(), n);
         }
 
         match h.protocol {
