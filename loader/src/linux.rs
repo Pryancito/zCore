@@ -220,6 +220,30 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 err
             })
         }
+        TrapReason::UndefinedInstruction => {
+            warn!("undefined instruction from user mode, pid={}", pid);
+            thread.inner().lock_linux().signals.insert(Signal::SIGILL);
+            Ok(())
+        }
+        TrapReason::SoftwareBreakpoint | TrapReason::HardwareBreakpoint => {
+            warn!("breakpoint from user mode, pid={}", pid);
+            thread.inner().lock_linux().signals.insert(Signal::SIGTRAP);
+            Ok(())
+        }
+        TrapReason::UnalignedAccess => {
+            warn!("unaligned access from user mode, pid={}", pid);
+            thread.inner().lock_linux().signals.insert(Signal::SIGBUS);
+            Ok(())
+        }
+        TrapReason::GernelFault(trap_num) => {
+            let signal = cpu_fault_signal(trap_num);
+            warn!(
+                "cpu fault from user mode: trap={:#x} -> {:?}, pid={}",
+                trap_num, signal, pid
+            );
+            thread.inner().lock_linux().signals.insert(signal);
+            Ok(())
+        }
         _ => {
             error!(
                 "unsupported trap from user mode: {:x?}, pid={}, {:#x?}",
@@ -228,6 +252,36 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 thread.context_cloned(),
             );
             Err(ZxError::NOT_SUPPORTED)
+        }
+    }
+}
+
+/// Map a CPU exception (trap) number to the appropriate Linux signal.
+///
+/// On x86_64 the mapping follows Linux kernel conventions from
+/// `arch/x86/kernel/traps.c`.  On other architectures a conservative
+/// default of SIGSEGV is used.
+fn cpu_fault_signal(trap_num: usize) -> Signal {
+    cfg_if! {
+        if #[cfg(target_arch = "x86_64")] {
+            match trap_num as u8 {
+                0x00 => Signal::SIGFPE,   // #DE  Divide Error
+                0x04 => Signal::SIGSEGV,  // #OF  Overflow
+                0x05 => Signal::SIGSEGV,  // #BR  Bound-Range Exceeded
+                0x07 => Signal::SIGFPE,   // #NM  Device Not Available (no FPU)
+                0x08 => Signal::SIGKILL,  // #DF  Double Fault
+                0x09 => Signal::SIGFPE,   // Coprocessor Segment Overrun
+                0x0a => Signal::SIGSEGV,  // #TS  Invalid TSS
+                0x0b => Signal::SIGBUS,   // #NP  Segment Not Present
+                0x0c => Signal::SIGSEGV,  // #SS  Stack-Segment Fault
+                0x0d => Signal::SIGSEGV,  // #GP  General Protection Fault
+                0x10 => Signal::SIGFPE,   // #MF  x87 FP Exception
+                0x13 => Signal::SIGFPE,   // #XF  SIMD FP Exception
+                _    => Signal::SIGSEGV,
+            }
+        } else {
+            let _ = trap_num;
+            Signal::SIGSEGV
         }
     }
 }
