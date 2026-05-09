@@ -192,6 +192,7 @@ impl Stdin {
         self.buf.lock().push_back(c);
         #[cfg(not(target_os = "none"))]
         {
+            self.data_ready.store(false, Ordering::Relaxed);
             self.eventbus.lock().set(Event::READABLE);
             return;
         }
@@ -272,7 +273,11 @@ impl INode for Stdin {
                 // Propagate any IRQ-side pushes into the EventBus.
                 self.stdin.flush_ready_flag();
                 if self.stdin.can_read() {
-                    return Poll::Ready(self.stdin.poll());
+                    return Poll::Ready(Ok(PollStatus {
+                        read: true,
+                        write: false,
+                        error: false,
+                    }));
                 }
                 let waker = cx.waker().clone();
                 self.stdin.eventbus.lock().subscribe(Box::new({
@@ -283,7 +288,11 @@ impl INode for Stdin {
                 }));
                 self.stdin.flush_ready_flag();
                 if self.stdin.can_read() {
-                    Poll::Ready(self.stdin.poll())
+                    Poll::Ready(Ok(PollStatus {
+                        read: true,
+                        write: false,
+                        error: false,
+                    }))
                 } else {
                     Poll::Pending
                 }
