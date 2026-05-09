@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use bitflags::bitflags;
 use core::{mem::size_of, slice};
 use kernel_hal::{net::get_net_device, user::*};
+use kernel_hal::thread;
 use lock::Mutex;
 
 // Needed by `impl_kobject!`
@@ -52,32 +53,30 @@ const IFF_CHANGE_ALL: u32 = 0xFFFF_FFFF;
 impl Socket for NetlinkSocketState {
     /// missing documentation
     async fn read(&self, data: &mut [u8]) -> (LxResult<usize>, Endpoint) {
-        let mut buffer = self.data.lock();
-        if buffer.is_empty() {
-            return (
-                Err(LxError::EAGAIN),
-                Endpoint::Netlink(NetlinkEndpoint::new(0, 0)),
-            );
-        }
-        let msg = buffer.remove(0);
-        let len = msg.len();
-        if !msg.is_empty() {
-            data[..len].copy_from_slice(&msg[..len]);
-            (
-                Ok(len),
-                Endpoint::Netlink(NetlinkEndpoint {
-                    port_id: 0,
-                    multicast_groups_mask: 0,
-                }),
-            )
-        } else {
-            (
-                Ok(0),
-                Endpoint::Netlink(NetlinkEndpoint {
-                    port_id: 0,
-                    multicast_groups_mask: 0,
-                }),
-            )
+        let endpoint = Endpoint::Netlink(NetlinkEndpoint::new(0, 0));
+        let non_block = self.flags.lock().contains(OpenFlags::NON_BLOCK);
+
+        loop {
+            let maybe_msg = {
+                let mut buffer = self.data.lock();
+                if buffer.is_empty() {
+                    None
+                } else {
+                    Some(buffer.remove(0))
+                }
+            };
+
+            match maybe_msg {
+                Some(msg) => {
+                    let n = core::cmp::min(msg.len(), data.len());
+                    if n != 0 {
+                        data[..n].copy_from_slice(&msg[..n]);
+                    }
+                    return (Ok(n), endpoint);
+                }
+                None if non_block => return (Err(LxError::EAGAIN), endpoint),
+                None => thread::yield_now().await,
+            }
         }
     }
 
@@ -108,9 +107,10 @@ impl Socket for NetlinkSocketState {
                     msg.push_ext(new_header);
 
                     let if_info = IfaceInfoMsg {
-                        ifi_family: AddressFamily::Unspecified.into(),
+                        ifi_family: (u16::from(AddressFamily::Unspecified)) as u8,
+                        ifi_pad: 0,
                         ifi_type: ARPHRD_ETHER,
-                        ifi_index: (i + 1) as u32, // Linux interface indices start at 1
+                        ifi_index: (i as i32) + 1, // Linux interface indices start at 1
                         ifi_flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_LOWER_UP,
                         ifi_change: IFF_CHANGE_ALL, // all flags changeable (kernel convention)
                     };
@@ -120,28 +120,41 @@ impl Socket for NetlinkSocketState {
                     let mut attrs = Vec::new();
 
                     let mac_addr = iface.get_mac();
-                    let attr = RouteAttr {
-                        rta_len: (mac_addr.as_bytes().len() + size_of::<RouteAttr>()) as u16,
-                        rta_type: RouteAttrTypes::Address.into(),
-                    };
-                    attrs.align4();
-                    attrs.push_ext(attr);
-                    for byte in mac_addr.as_bytes() {
-                        attrs.push(*byte);
-                    }
+                    push_rtattr_bytes(
+                        &mut attrs,
+                        RouteAttrTypes::Address.into(),
+                        mac_addr.as_bytes(),
+                    );
+
+                    // Broadcast MAC for Ethernet.
+                    push_rtattr_bytes(
+                        &mut attrs,
+                        RouteAttrTypes::Broadcast.into(),
+                        &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                    );
+
+                    // MTU (best-effort default; drivers can expose real value later).
+                    push_rtattr_u32(&mut attrs, RouteAttrTypes::MTU.into(), 1500);
+
+                    // ifOperStatus: 6 == IF_OPER_UP.
+                    push_rtattr_bytes(&mut attrs, RouteAttrTypes::OperState.into(), &[6u8]);
+
+                    // IFLA_LINK: for plain Ethernet, point to self ifindex.
+                    push_rtattr_u32(
+                        &mut attrs,
+                        RouteAttrTypes::Link.into(),
+                        (i as u32) + 1,
+                    );
 
                     let ifname = iface.get_ifname();
                     // IFLA_IFNAME includes a null terminator (Linux kernel convention)
-                    let attr = RouteAttr {
-                        rta_len: (ifname.as_bytes().len() + 1 + size_of::<RouteAttr>()) as u16,
-                        rta_type: RouteAttrTypes::Ifname.into(),
-                    };
-                    attrs.align4();
-                    attrs.push_ext(attr);
-                    for byte in ifname.as_bytes() {
-                        attrs.push(*byte);
-                    }
-                    attrs.push(0u8); // null terminator
+                    let mut ifname_bytes = Vec::from(ifname.as_bytes());
+                    ifname_bytes.push(0u8);
+                    push_rtattr_bytes(
+                        &mut attrs,
+                        RouteAttrTypes::Ifname.into(),
+                        &ifname_bytes,
+                    );
 
                     msg.align4();
                     msg.append(&mut attrs);
@@ -183,14 +196,39 @@ impl Socket for NetlinkSocketState {
                         let mut attrs = Vec::new();
 
                         let ip_addr = ip.address();
-                        let attr = RouteAttr {
-                            rta_len: (ip_addr.as_bytes().len() + size_of::<RouteAttr>()) as u16,
-                            rta_type: RouteAttrTypes::Address.into(),
-                        };
-                        attrs.align4();
-                        attrs.push_ext(attr);
-                        for byte in ip_addr.as_bytes() {
-                            attrs.push(*byte);
+                        // IFA_LOCAL and IFA_ADDRESS are both used by userland.
+                        push_rtattr_bytes(
+                            &mut attrs,
+                            IfAddrAttrTypes::Local.into(),
+                            ip_addr.as_bytes(),
+                        );
+                        push_rtattr_bytes(
+                            &mut attrs,
+                            IfAddrAttrTypes::Address.into(),
+                            ip_addr.as_bytes(),
+                        );
+
+                        // Label (interface name) with NUL terminator.
+                        let ifname = iface.get_ifname();
+                        let mut ifname_bytes = Vec::from(ifname.as_bytes());
+                        ifname_bytes.push(0u8);
+                        push_rtattr_bytes(
+                            &mut attrs,
+                            IfAddrAttrTypes::Label.into(),
+                            &ifname_bytes,
+                        );
+
+                        // IPv4 broadcast if applicable.
+                        if ip_addr.as_bytes().len() == 4 {
+                            let bcast = ipv4_broadcast(
+                                smoltcp::wire::Ipv4Address::from_bytes(ip_addr.as_bytes()),
+                                ip.prefix_len(),
+                            );
+                            push_rtattr_bytes(
+                                &mut attrs,
+                                IfAddrAttrTypes::Broadcast.into(),
+                                bcast.as_bytes(),
+                            );
                         }
 
                         msg.align4();
@@ -203,7 +241,38 @@ impl Socket for NetlinkSocketState {
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // Unknown/unimplemented request: return NLMSG_ERROR with -EOPNOTSUPP.
+                // This is better than a silent NLMSG_DONE which confuses userland.
+                const EOPNOTSUPP: i32 = 95;
+                #[repr(C)]
+                #[derive(Copy, Clone)]
+                struct NetlinkError {
+                    error: i32,
+                    msg: NetlinkMessageHeader,
+                }
+                const _: () = {
+                    assert!(size_of::<NetlinkError>() == 20);
+                };
+                let err = NetlinkError {
+                    error: -EOPNOTSUPP,
+                    msg: *header,
+                };
+                let mut msg = Vec::new();
+                let new_header = NetlinkMessageHeader {
+                    nlmsg_len: 0,
+                    nlmsg_type: NetlinkMessageType::Error.into(),
+                    nlmsg_flags: NetlinkMessageFlags::MULTI,
+                    nlmsg_seq: header.nlmsg_seq,
+                    nlmsg_pid: 0,
+                };
+                msg.push_ext(new_header);
+                msg.align4();
+                msg.push_ext(err);
+                msg.align4();
+                msg.set_ext(0, msg.len() as u32);
+                buffer.push(msg);
+            }
         }
         let mut msg = Vec::new();
         let new_header = NetlinkMessageHeader {
@@ -334,15 +403,27 @@ struct NetlinkMessageHeader {
     nlmsg_pid: u32,                   // sending process port id
 }
 
+const _: () = {
+    // Linux rtnetlink ABI sanity checks (x86_64): nlmsghdr is 16 bytes.
+    assert!(size_of::<NetlinkMessageHeader>() == 16);
+};
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 struct IfaceInfoMsg {
-    ifi_family: u16,
+    // Matches Linux `struct ifinfomsg` layout.
+    ifi_family: u8,
+    ifi_pad: u8,
     ifi_type: u16,
-    ifi_index: u32,
+    ifi_index: i32,
     ifi_flags: u32,
     ifi_change: u32,
 }
+
+const _: () = {
+    // Linux `struct ifinfomsg` is 16 bytes.
+    assert!(size_of::<IfaceInfoMsg>() == 16);
+};
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -354,12 +435,22 @@ struct IfaceAddrMsg {
     ifa_index: u32,
 }
 
+const _: () = {
+    // Linux `struct ifaddrmsg` is 8 bytes.
+    assert!(size_of::<IfaceAddrMsg>() == 8);
+};
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 struct RouteAttr {
     rta_len: u16,
     rta_type: u16,
 }
+
+const _: () = {
+    // Linux `struct rtattr` is 4 bytes.
+    assert!(size_of::<RouteAttr>() == 4);
+};
 
 bitflags! {
     struct NetlinkMessageFlags : u16 {
@@ -412,6 +503,12 @@ enum_with_unknown! {
         DelAddr = 21,
         /// Get addr
         GetAddr = 22,
+        /// New route
+        NewRoute = 24,
+        /// Delete route
+        DelRoute = 25,
+        /// Get route
+        GetRoute = 26,
     }
 }
 
@@ -430,7 +527,50 @@ enum_with_unknown! {
         MTU = 4,
         /// Link
         Link = 5,
+        /// Operational state (IF_OPER_*)
+        OperState = 16,
     }
+}
+
+enum_with_unknown! {
+    /// ifaddrmsg attribute types (IFA_*)
+    pub doc enum IfAddrAttrTypes(u16) {
+        /// Unspecified
+        Unspecified = 0,
+        /// IFA_ADDRESS
+        Address = 1,
+        /// IFA_LOCAL
+        Local = 2,
+        /// IFA_LABEL
+        Label = 3,
+        /// IFA_BROADCAST
+        Broadcast = 4,
+    }
+}
+
+fn push_rtattr_bytes(dst: &mut Vec<u8>, rta_type: u16, payload: &[u8]) {
+    let attr = RouteAttr {
+        rta_len: (payload.len() + size_of::<RouteAttr>()) as u16,
+        rta_type,
+    };
+    dst.align4();
+    dst.push_ext(attr);
+    dst.extend_from_slice(payload);
+}
+
+fn push_rtattr_u32(dst: &mut Vec<u8>, rta_type: u16, v: u32) {
+    push_rtattr_bytes(dst, rta_type, &v.to_ne_bytes());
+}
+
+fn ipv4_broadcast(addr: smoltcp::wire::Ipv4Address, prefix_len: u8) -> smoltcp::wire::Ipv4Address {
+    let ip = u32::from_be_bytes(addr.0);
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len as u32)
+    };
+    let bcast = ip | (!mask);
+    smoltcp::wire::Ipv4Address::from_bytes(&bcast.to_be_bytes())
 }
 
 trait VecExt {

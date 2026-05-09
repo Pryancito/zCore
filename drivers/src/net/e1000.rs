@@ -110,6 +110,35 @@ impl NetScheme for E1000Interface {
             Err(DeviceError::NotReady)
         }
     }
+
+    fn can_recv(&self) -> bool {
+        self.driver.0.lock().receive().is_some()
+    }
+
+    fn can_send(&self) -> bool {
+        self.driver.0.lock().can_send()
+    }
+
+    fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        iface.update_ip_addrs(|addrs| {
+            if let Some(first) = addrs.first_mut() {
+                *first = IpCidr::Ipv4(cidr);
+            }
+        });
+        Ok(())
+    }
+
+    fn add_route(&self, _cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        if let Some(IpAddress::Ipv4(gw)) = gateway {
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(gw)
+                .map_err(|_| DeviceError::IoError)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct E1000RxToken(Vec<u8>);
@@ -186,7 +215,7 @@ pub fn init(
     let ethernet_addr = EthernetAddress::from_bytes(&mac);
     let ip_addrs = [IpCidr::new(IpAddress::v4(10, 0, 2, (15 + index) as u8), 24)];
     let default_v4_gw = Ipv4Address::new(10, 0, 2, 2); //Qemu user network gateway: 10.0.2.2
-    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 1] = [None; 1];
+    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
     routes.add_default_ipv4_route(default_v4_gw).unwrap();
     let neighbor_cache = NeighborCache::new(BTreeMap::new());

@@ -299,55 +299,79 @@ impl VmAddressRegion {
     }
 
     /// Change protections on a subset of the region of memory in the containing
-    /// address space.  If the requested range overlaps with a subregion,
-    /// protect() will fail.
+    /// address space.
+    ///
+    /// Zircon-style VMARs historically rejected ranges that overlap subregions,
+    /// but Linux `mprotect()` routinely targets ranges that may span multiple
+    /// mapped segments/sub-VMARs (e.g. PIE + vDSO layouts). So we treat a VMAR
+    /// hierarchy as a single address space: protect any overlapping mappings
+    /// in this VMAR and recurse into overlapping children.
     pub fn protect(&self, addr: usize, len: usize, flags: MMUFlags) -> ZxResult {
-        if !page_aligned(addr) || !page_aligned(len) {
+        if !page_aligned(addr) || !page_aligned(len) || len == 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let mut guard = self.inner.lock();
-        let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
         let end_addr = addr + len;
-        // check if there are overlapping subregion
-        if inner
-            .children
-            .iter()
-            .any(|child| child.end_addr() >= addr && child.addr() <= end_addr)
-        {
-            return Err(ZxError::INVALID_ARGS);
+
+        // Collect work items under the VMAR lock, then apply without holding it.
+        let (children, mappings) = {
+            let mut guard = self.inner.lock();
+            let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
+
+            let children: Vec<_> = inner
+                .children
+                .iter()
+                .filter(|child| child.end_addr() > addr && child.addr() < end_addr)
+                .cloned()
+                .collect();
+
+            let mappings: Vec<_> = inner
+                .mappings
+                .iter()
+                .filter(|map| map.end_addr() > addr && map.addr() < end_addr)
+                .cloned()
+                .collect();
+
+            // Ensure the range is fully covered by mappings and/or children.
+            let covered_by_mappings: usize = mappings
+                .iter()
+                .map(|map| end_addr.min(map.end_addr()) - addr.max(map.addr()))
+                .sum();
+            let covered_by_children: usize = children
+                .iter()
+                .map(|child| end_addr.min(child.end_addr()) - addr.max(child.addr()))
+                .sum();
+            if covered_by_mappings + covered_by_children != len {
+                return Err(ZxError::NOT_FOUND);
+            }
+
+            // Validate flags against mapping permissions (children validate themselves).
+            if mappings.iter().any(|map| !map.is_valid_mapping_flags(flags)) {
+                return Err(ZxError::ACCESS_DENIED);
+            }
+
+            (children, mappings)
+        };
+
+        // Apply to children first.
+        for child in children {
+            let begin = addr.max(child.addr());
+            let end = end_addr.min(child.end_addr());
+            if begin < end {
+                child.protect(begin, end - begin, flags)?;
+            }
         }
-        let length: usize = inner
-            .mappings
-            .iter()
-            .filter_map(|map| {
-                if map.end_addr() >= addr && map.addr() <= end_addr {
-                    Some(end_addr.min(map.end_addr()) - addr.max(map.addr()))
-                } else {
-                    None
-                }
-            })
-            .sum();
-        if length != len {
-            return Err(ZxError::NOT_FOUND);
-        }
-        // check if protect flags is valid
-        if inner
-            .mappings
-            .iter()
-            .filter(|map| map.end_addr() >= addr && map.addr() <= end_addr) // get mappings in range: [addr, end_addr]
-            .any(|map| !map.is_valid_mapping_flags(flags))
-        {
-            return Err(ZxError::ACCESS_DENIED);
-        }
-        inner
-            .mappings
-            .iter()
-            .filter(|map| map.end_addr() >= addr && map.addr() <= end_addr)
-            .for_each(|map| {
-                let start_index = pages(addr.max(map.addr()) - map.addr());
-                let end_index = pages(end_addr.min(map.end_addr()) - map.addr());
+
+        // Apply to our own mappings.
+        for map in mappings {
+            let begin = addr.max(map.addr());
+            let end = end_addr.min(map.end_addr());
+            if begin < end {
+                let start_index = pages(begin - map.addr());
+                let end_index = pages(end - map.addr());
                 map.protect(flags, start_index, end_index);
-            });
+            }
+        }
+
         Ok(())
     }
 

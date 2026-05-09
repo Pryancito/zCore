@@ -334,8 +334,6 @@ impl Socket for UdpSocketState {
 
     /// manipulate file descriptor
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
-        warn!("ioctl is unimplemented for this socket");
-        info!("udp ioctrl");
         match request {
             // SIOCGIFCONF: get list of interfaces
             //

@@ -125,6 +125,15 @@ impl LinuxRootfs {
         }
         // Create /run directory
         let _ = fs::create_dir_all(dir.join("run"));
+
+        // 拷贝 nl_dump (netlink dump helper).
+        // Do this AFTER symlink creation to ensure it's a real binary, not a BusyBox link.
+        let nl_dump = self.nl_dump(&musl);
+        if nl_dump.is_file() {
+            let dst = bin.join("nl_dump");
+            let _ = dir::rm(&dst);
+            fs::copy(&nl_dump, &dst).unwrap();
+        }
     }
 
     /// 将 musl 动态库放入 rootfs。
@@ -320,6 +329,50 @@ cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz'
                 .invoke();
         }
 
+        executable
+    }
+
+    /// 编译 nl_dump (static netlink dump helper).
+    fn nl_dump(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("nl_dump");
+        let executable = dir.join("nl_dump");
+        let source = dir.join("nl_dump.c");
+        // Rebuild if missing or if source is newer than the binary.
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified())
+                {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling nl_dump...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile nl_dump");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
         executable
     }
 

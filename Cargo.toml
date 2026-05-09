@@ -33,4 +33,3 @@ x86_64 = { git = "https://github.com/rust-osdev/x86_64", tag = "v0.15.4" }
 # `time-core` >= 0.1.8 usa edition 2024; fijamos `time` a una versión anterior.
 time = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }
 time-core = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }
-time-macros = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }

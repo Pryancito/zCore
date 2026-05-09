@@ -67,7 +67,10 @@ impl Socket for PacketSocketState {
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
-        (false, true, false)
+        let dev = drivers::all_net().first();
+        let readable = dev.as_ref().map(|d| d.can_recv()).unwrap_or(false);
+        let writable = dev.as_ref().map(|d| d.can_send()).unwrap_or(false);
+        (readable, writable, false)
     }
 
     fn ioctl(&self, _request: usize, _arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {

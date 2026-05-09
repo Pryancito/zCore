@@ -5,7 +5,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::{align_of, size_of};
 use core::ops::Deref;
-use core::ptr::null;
 
 /// process init information
 pub struct ProcInitInfo {
@@ -20,7 +19,8 @@ pub struct ProcInitInfo {
 impl ProcInitInfo {
     /// push process init information into stack
     pub fn push_at(&self, stack_top: usize) -> Stack {
-        let mut writer = Stack::new(stack_top);
+        // SysV x86_64 ABI expects the initial stack pointer to be 16-byte aligned at entry.
+        let mut writer = Stack::new(stack_top & !0xF);
         // from stack_top:
         // program name
         writer.push_str(&self.args[0]);
@@ -42,19 +42,20 @@ impl ProcInitInfo {
                 writer.sp
             })
             .collect();
-        // auxiliary vector entries
-        writer.push_slice(&[null::<u8>(), null::<u8>()]);
+        // auxiliary vector entries (terminated by AT_NULL = 0, 0)
+        writer.push_usize_slice(&[0, 0]);
         for (&type_, &value) in self.auxv.iter() {
-            writer.push_slice(&[type_ as usize, value]);
+            writer.push_usize_slice(&[type_ as usize, value]);
         }
         // envionment pointers
-        writer.push_slice(&[null::<u8>()]);
-        writer.push_slice(envs.as_slice());
+        writer.push_usize_slice(&[0]);
+        writer.push_usize_slice(envs.as_slice());
         // argv pointers
-        writer.push_slice(&[null::<u8>()]);
-        writer.push_slice(argv.as_slice());
+        writer.push_usize_slice(&[0]);
+        writer.push_usize_slice(argv.as_slice());
         // argc
-        writer.push_slice(&[argv.len()]);
+        // Force 16-byte alignment for the final stack pointer (points to argc).
+        writer.push_usize_slice_aligned(&[argv.len()], 16);
         writer
     }
 }
@@ -84,14 +85,27 @@ impl Stack {
     /// push slice into stack
     #[allow(unsafe_code)]
     fn push_slice<T: Copy>(&mut self, vs: &[T]) {
+        self.push_slice_aligned(vs, align_of::<T>());
+    }
+
+    #[allow(unsafe_code)]
+    fn push_slice_aligned<T: Copy>(&mut self, vs: &[T], align: usize) {
         self.sp -= vs.len() * size_of::<T>();
-        self.sp -= self.sp % align_of::<T>();
+        self.sp -= self.sp % align;
         assert!(self.stack_top - self.sp <= self.data.len());
         let offset = self.data.len() - (self.stack_top - self.sp);
         unsafe {
             core::slice::from_raw_parts_mut(self.data.as_mut_ptr().add(offset) as *mut T, vs.len())
         }
         .copy_from_slice(vs);
+    }
+
+    fn push_usize_slice(&mut self, vs: &[usize]) {
+        self.push_slice(vs);
+    }
+
+    fn push_usize_slice_aligned(&mut self, vs: &[usize], align: usize) {
+        self.push_slice_aligned(vs, align);
     }
     /// push str into stack
     fn push_str(&mut self, s: &str) {
