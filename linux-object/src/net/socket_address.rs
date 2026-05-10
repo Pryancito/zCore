@@ -326,7 +326,7 @@ impl SockAddr {
     /// Write to msg
     /// Check mutability for user
     #[allow(dead_code)]
-    pub fn write_to_msg(self, msg: UserInOutPtr<MsgHdr>) -> SysResult {
+    pub fn write_to_msg(self, mut msg: UserInOutPtr<MsgHdr>) -> SysResult {
         if msg.is_null() {
             return Ok(0);
         }
@@ -345,6 +345,9 @@ impl SockAddr {
             let mut addr: UserOutPtr<u8> = core::mem::transmute(hdr.msg_name);
             addr.write_array(source)?;
         }
+        // Write back the updated MsgHdr so that msg_namelen reflects the
+        // actual size of the sender address written into msg_name.
+        msg.write(hdr)?;
         Ok(0)
     }
 }

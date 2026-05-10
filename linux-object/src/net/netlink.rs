@@ -359,6 +359,52 @@ impl Socket for NetlinkSocketState {
                 msg.set_ext(0, msg.len() as u32);
                 buffer.push(msg);
             }
+            NetlinkMessageType::GetRoute => {
+                // RTM_GETROUTE: dump the routing table.
+                // We currently have no way to enumerate smoltcp routes, so we
+                // return an empty table.  dhcpcd treats this as "no existing
+                // routes to remove before adding ours", which is safe.
+                // The NLMSG_DONE sentinel is appended after the match block.
+                info!("[netlink] GetRoute: returning empty routing table");
+            }
+            NetlinkMessageType::DelAddr => {
+                // RTM_DELADDR: remove an IP address from an interface.
+                // Return a success ACK; the actual address removal is not
+                // implemented yet (dhcpcd treats a non-fatal error gracefully,
+                // but a clean ACK avoids unnecessary log noise).
+                info!("[netlink] DelAddr: ACK (address removal not yet implemented)");
+                let ack = NetlinkMessageHeader {
+                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
+                    nlmsg_type: NetlinkMessageType::Error.into(),
+                    nlmsg_flags: NetlinkMessageFlags::empty(),
+                    nlmsg_seq: header.nlmsg_seq,
+                    nlmsg_pid: 0,
+                };
+                let mut msg = Vec::new();
+                msg.push_ext(ack);
+                msg.push_ext(0i32); // error = 0 means success
+                msg.align4();
+                msg.set_ext(0, msg.len() as u32);
+                buffer.push(msg);
+            }
+            NetlinkMessageType::DelRoute => {
+                // RTM_DELROUTE: remove a routing entry.
+                // Return a success ACK; same rationale as DelAddr above.
+                info!("[netlink] DelRoute: ACK (route removal not yet implemented)");
+                let ack = NetlinkMessageHeader {
+                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
+                    nlmsg_type: NetlinkMessageType::Error.into(),
+                    nlmsg_flags: NetlinkMessageFlags::empty(),
+                    nlmsg_seq: header.nlmsg_seq,
+                    nlmsg_pid: 0,
+                };
+                let mut msg = Vec::new();
+                msg.push_ext(ack);
+                msg.push_ext(0i32); // error = 0 means success
+                msg.align4();
+                msg.set_ext(0, msg.len() as u32);
+                buffer.push(msg);
+            }
             _ => {
                 // Unknown/unimplemented request: return NLMSG_ERROR with -EOPNOTSUPP.
                 // This is better than a silent NLMSG_DONE which confuses userland.
@@ -440,7 +486,14 @@ impl Socket for NetlinkSocketState {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        Some(Endpoint::Netlink(NetlinkEndpoint::new(0, 0)))
+        // Use the kernel-object ID as nl_pid so that each socket gets a
+        // unique, non-zero identifier.  This is important because dhcpcd
+        // stores the route_fd's nl_pid as `priv->route_pid` and then
+        // filters out netlink messages whose nlmsg_pid equals route_pid.
+        // If nl_pid were 0 (the kernel's pid), every kernel reply would
+        // be silently dropped.
+        let nl_pid = (self.base.id as u32).max(1);
+        Some(Endpoint::Netlink(NetlinkEndpoint::new(nl_pid, 0)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
