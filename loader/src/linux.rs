@@ -38,7 +38,8 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
     //调用zircon-object/src/task/thread.start设置好要执行的thread
-    let (entry, sp, initial_brk) = loader.load(&proc.vmar(), &data, args, envs, path).unwrap();
+    let (entry, sp, initial_brk, execute_path) = loader.load(&proc.vmar(), &data, args, envs, path).unwrap();
+    proc.linux().set_execute_path(&execute_path);
     proc.linux().set_brk(initial_brk);
 
     thread

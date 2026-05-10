@@ -320,10 +320,7 @@ impl Syscall<'_> {
         let vmar = self.zircon_process().vmar();
         vmar.clear()?;
 
-        // Modify exec path
-        proc.set_execute_path(&path_str);
-
-        let (entry, sp, initial_brk) = LinuxElfLoader {
+        let (entry, sp, initial_brk, execute_path) = LinuxElfLoader {
             syscall_entry: self.syscall_entry,
             stack_pages: USER_STACK_PAGES,
             root_inode: proc.root_inode().clone(),
@@ -333,6 +330,7 @@ impl Syscall<'_> {
             error!("execve: LinuxElfLoader::load failed: {:?}", e);
             e
         })?;
+        proc.set_execute_path(&execute_path);
         proc.set_brk(initial_brk);
 
         self.zircon_process().signal_set(Signal::SIGNALED);
