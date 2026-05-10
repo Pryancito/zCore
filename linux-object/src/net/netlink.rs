@@ -444,7 +444,13 @@ impl Socket for NetlinkSocketState {
         // filters out netlink messages whose nlmsg_pid equals route_pid.
         // If nl_pid were 0 (the kernel's pid), every kernel reply would
         // be silently dropped.
-        let nl_pid = (self.base.id as u32).max(1);
+        //
+        // We reduce the 64-bit koid into the u32 space with a modulo so
+        // that the value is always defined (no wrapping UB).  Collisions
+        // can only occur after u32::MAX - 1 simultaneously-alive sockets,
+        // which is not a concern in practice.
+        let reduced = self.base.id % u32::MAX as u64;
+        let nl_pid = (reduced as u32).max(1);
         Some(Endpoint::Netlink(NetlinkEndpoint::new(nl_pid, 0)))
     }
 
