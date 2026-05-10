@@ -617,10 +617,18 @@ struct EventRing {
 impl EventRing {
     fn new(n: usize) -> DeviceResult<Self> {
         let seg = DmaBuf::new(n * 16, 64)?;
+        // Flush the event ring segment to physical memory so that:
+        // 1. The xHC reads zeros (not stale garbage) for unwritten slots.
+        // 2. Cache lines are clean so peek()'s clflush does not write dirty zeros
+        //    back over DMA-written events on non-cache-coherent or partially-coherent
+        //    environments (e.g. VMs with PCIe passthrough or IOMMU bypass).
+        seg.flush(0, seg.len);
         let erst = DmaBuf::new(16, 64)?;
         erst.write_u64(0, seg.phys as u64);
         erst.write_u32(8, n as u32);
         erst.write_u32(12, 0);
+        // Flush the ERST so the xHC can read it via DMA before the first event is posted.
+        erst.flush(0, erst.len);
         Ok(Self {
             seg,
             erst,
