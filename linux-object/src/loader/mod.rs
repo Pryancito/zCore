@@ -56,7 +56,7 @@ impl LinuxElfLoader {
         path: String,
         recursion: u8,
     ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
-        error!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
+        debug!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
         debug!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
             vmar.get_info(),
@@ -73,9 +73,9 @@ impl LinuxElfLoader {
         // Handle shebang scripts (#!).
         // Limit scan to the first 512 bytes to match typical OS shebang length restrictions.
         if data.starts_with(b"\x7fELF") {
-            error!("elf: detected ELF for {:?}", path);
+            debug!("elf: detected ELF for {:?}", path);
         } else if data.starts_with(b"#!") {
-            error!("elf: detected shebang for {:?}", path);
+            debug!("elf: detected shebang for {:?}", path);
             let scan_limit = data.len().min(512);
             let newline = data[..scan_limit]
                 .iter()
@@ -92,7 +92,7 @@ impl LinuxElfLoader {
                 _ => return Err(ZxError::INVALID_ARGS.into()),
             };
             let interp_arg = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
-            error!(
+            debug!(
                 "shebang: interp={:?}, arg={:?}, script={:?}",
                 interp, interp_arg, path
             );
