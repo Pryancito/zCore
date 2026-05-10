@@ -39,7 +39,7 @@ impl LinuxElfLoader {
         args: Vec<String>,
         envs: Vec<String>,
         path: String,
-    ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
+    ) -> LxResult<(VirtAddr, VirtAddr, usize, String)> {
         self.load_impl(vmar, data, args, envs, path, 0)
     }
 
@@ -55,7 +55,7 @@ impl LinuxElfLoader {
         envs: Vec<String>,
         path: String,
         recursion: u8,
-    ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
+    ) -> LxResult<(VirtAddr, VirtAddr, usize, String)> {
         error!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
         error!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
@@ -254,7 +254,7 @@ impl LinuxElfLoader {
             // program). Using interp_base + interp_size ensures brk does not overlap
             // any already-allocated segment.
             let initial_brk = interp_base + interp_size;
-            return Ok((interp_entry, sp, initial_brk));
+            return Ok((interp_entry, sp, initial_brk, path));
         }
 
         let size = elf.load_segment_size();
@@ -361,6 +361,6 @@ impl LinuxElfLoader {
 
         // Initial brk: right after the loaded image.
         let initial_brk = base + size;
-        Ok((entry, sp, initial_brk))
+        Ok((entry, sp, initial_brk, path))
     }
 }
