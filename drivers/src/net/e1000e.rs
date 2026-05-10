@@ -236,7 +236,10 @@ impl E1000eHw {
     unsafe fn read_mac_from_hw(&mut self) {
         let ral = mmio_read(self.base, E1000E_RAL0);
         let rah = mmio_read(self.base, E1000E_RAH0);
-        info!("[e1000e] hardware registers: RAL0={:#010x}, RAH0={:#010x}", ral, rah);
+        info!(
+            "[e1000e] hardware registers: RAL0={:#010x}, RAH0={:#010x}",
+            ral, rah
+        );
         if ral == 0 && (rah & 0xFFFF) == 0 {
             return;
         }
@@ -792,10 +795,7 @@ pub fn init(
     );
     let hw = Arc::new(Mutex::new(hw));
     let stack_rx_queue = Arc::new(Mutex::new(alloc::collections::VecDeque::new()));
-    let driver = E1000eDriver {
-        hw,
-        stack_rx_queue,
-    };
+    let driver = E1000eDriver { hw, stack_rx_queue };
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac_bytes);
     let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)];

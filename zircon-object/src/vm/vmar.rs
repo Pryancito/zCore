@@ -345,7 +345,10 @@ impl VmAddressRegion {
             }
 
             // Validate flags against mapping permissions (children validate themselves).
-            if mappings.iter().any(|map| !map.is_valid_mapping_flags(flags)) {
+            if mappings
+                .iter()
+                .any(|map| !map.is_valid_mapping_flags(flags))
+            {
                 return Err(ZxError::ACCESS_DENIED);
             }
 
@@ -758,7 +761,12 @@ impl VmMapping {
             page_table,
             vmo: vmo.clone(),
         });
-        info!("VmMapping::new: addr={:#x}, size={:#x}, vmo_id={}", addr, size, vmo.id());
+        info!(
+            "VmMapping::new: addr={:#x}, size={:#x}, vmo_id={}",
+            addr,
+            size,
+            vmo.id()
+        );
         vmo.append_mapping(Arc::downgrade(&mapping));
         mapping
     }
@@ -1015,7 +1023,10 @@ impl VmMappingInner {
 impl Drop for VmMapping {
     fn drop(&mut self) {
         let inner = self.inner.lock();
-        info!("VmMapping::drop: addr={:#x}, size={:#x}", inner.addr, inner.size);
+        info!(
+            "VmMapping::drop: addr={:#x}, size={:#x}",
+            inner.addr, inner.size
+        );
         drop(inner);
         self.unmap();
     }

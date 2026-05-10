@@ -136,7 +136,7 @@ pub fn graphic_console_write_str(s: &str) {
     #[cfg(feature = "graphic")]
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
         maybe_clear_graphic_before_write();
-        // Use try_lock to avoid deadlock if an IRQ tries to log while 
+        // Use try_lock to avoid deadlock if an IRQ tries to log while
         // the console is scrolling.
         if let Some(mut g) = cons.try_lock() {
             let _ = g.write_str(s);

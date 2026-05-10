@@ -1,13 +1,13 @@
 //! Linux file objects
 
 mod devfs;
+mod epoll;
+mod eventfd;
 mod file;
 pub mod ioctl;
 mod pipe;
 mod procfs;
 mod pseudo;
-mod epoll;
-mod eventfd;
 pub mod rcore_fs_wrapper;
 pub mod stdio;
 
@@ -48,10 +48,10 @@ use devfs::RandomINode;
 use procfs::ProcFS;
 use pseudo::Pseudo;
 
-pub use file::{File, OpenFlags, PollEvents, SeekFrom};
-pub use pipe::Pipe;
 pub use epoll::{Epoll, EpollEvent};
 pub use eventfd::EventFd;
+pub use file::{File, OpenFlags, PollEvents, SeekFrom};
+pub use pipe::Pipe;
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use stdio::{STDIN, STDOUT};
 

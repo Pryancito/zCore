@@ -174,18 +174,15 @@ impl phy::Device<'_> for E1000Driver {
     type TxToken = E1000TxToken;
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.hw
-            .lock()
-            .receive()
-            .map(|vec_recv| {
-                (
-                    E1000RxToken {
-                        data: vec_recv,
-                        raw_rx_queue: self.raw_rx_queue.clone(),
-                    },
-                    E1000TxToken(self.clone()),
-                )
-            })
+        self.hw.lock().receive().map(|vec_recv| {
+            (
+                E1000RxToken {
+                    data: vec_recv,
+                    raw_rx_queue: self.raw_rx_queue.clone(),
+                },
+                E1000TxToken(self.clone()),
+            )
+        })
     }
 
     fn transmit(&mut self) -> Option<Self::TxToken> {

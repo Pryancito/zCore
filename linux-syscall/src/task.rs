@@ -7,7 +7,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
-use kernel_hal::context::UserContextField;
+use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::TimeSpec;
 use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
@@ -160,7 +160,11 @@ impl Syscall<'_> {
         new_ctx.set_field(UserContextField::StackPointer, newsp);
         new_ctx.set_field(UserContextField::ThreadPointer, newtls);
         new_ctx.set_field(UserContextField::ReturnValue, 0);
-        info!("clone: tid_parent={} context={:#x?}", self.thread.id(), new_ctx);
+        info!(
+            "clone: tid_parent={} context={:#x?}",
+            self.thread.id(),
+            new_ctx
+        );
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
 
@@ -332,11 +336,11 @@ impl Syscall<'_> {
         .load(&vmar, &data, args, envs, path_str)?;
         proc.set_brk(initial_brk);
 
-        // TODO: use right signal
-        // self.zircon_process().signal_set(Signal::SIGNALED);
-        // Workaround, the child process could NOT exit correctly
-        self.thread
-            .with_context(|ctx| ctx.setup_uspace(entry, sp, &[0, 0, 0]))?;
+        self.zircon_process().signal_set(Signal::SIGNALED);
+        self.thread.with_context(|ctx| {
+            *ctx = Box::new(UserContext::new());
+            ctx.setup_uspace(entry, sp, &[0, 0, 0]);
+        })?;
         Ok(0)
     }
 

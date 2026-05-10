@@ -80,16 +80,20 @@ impl LinuxRootfs {
         let dhcpcd = self.dhcpcd(&musl);
         if dhcpcd.is_file() {
             fs::copy(&dhcpcd, bin.join("dhcpcd")).unwrap();
-            
+
             // 拷贝 dhcpcd 配置和 hooks
             let dhcpcd_dir = PROJECT_DIR.join("tools").join("dhcpcd");
             let etc = dir.join("etc");
             fs::copy(dhcpcd_dir.join("src/dhcpcd.conf"), etc.join("dhcpcd.conf")).unwrap();
-            
+
             let lib_dhcpcd = dir.join("lib").join("dhcpcd");
             let hooks_dir = lib_dhcpcd.join("dhcpcd-hooks");
             fs::create_dir_all(&hooks_dir).unwrap();
-            fs::copy(dhcpcd_dir.join("hooks/dhcpcd-run-hooks"), lib_dhcpcd.join("dhcpcd-run-hooks")).unwrap();
+            fs::copy(
+                dhcpcd_dir.join("hooks/dhcpcd-run-hooks"),
+                lib_dhcpcd.join("dhcpcd-run-hooks"),
+            )
+            .unwrap();
             for hook in ["01-test", "20-resolv.conf", "30-hostname"] {
                 let from = dhcpcd_dir.join("hooks").join(hook);
                 if from.is_file() {
@@ -112,15 +116,17 @@ impl LinuxRootfs {
             let etc = dir.join("etc");
             fs::create_dir_all(&etc).unwrap();
             let dhcpcd_conf = etc.join("dhcpcd.conf");
-            fs::write(&dhcpcd_conf,
+            fs::write(
+                &dhcpcd_conf,
                 b"# Eclipse OS dhcpcd configuration\n\
                   # Disable ALL hooks -- Eclipse OS does not support the full hook layer yet\n\
                   nohook *\n\
                   nodev\n\
                   broadcast\n\
                   timeout 30\n\
-                  reboot 5\n"
-            ).unwrap();
+                  reboot 5\n",
+            )
+            .unwrap();
         }
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
@@ -159,7 +165,8 @@ impl LinuxRootfs {
         let udhcpc_dir = dir.join("usr/share/udhcpc");
         fs::create_dir_all(&udhcpc_dir).unwrap();
         let udhcpc_script = udhcpc_dir.join("default.script");
-        fs::write(&udhcpc_script,
+        fs::write(
+            &udhcpc_script,
             b"#!/bin/sh\n\
               # Minimal udhcpc script for Eclipse OS\n\
               case \"$1\" in\n\
@@ -181,8 +188,9 @@ impl LinuxRootfs {
                     done\n\
                   fi\n\
                   ;;\n\
-              esac\n"
-        ).unwrap();
+              esac\n",
+        )
+        .unwrap();
         // Make the script executable
         #[cfg(unix)]
         {
@@ -405,8 +413,7 @@ cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz'
         if executable.is_file() && source.is_file() {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
-                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified())
-                {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
                     if bin_mtime >= src_mtime {
                         return executable;
                     }

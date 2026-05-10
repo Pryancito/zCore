@@ -44,16 +44,19 @@ impl Epoll {
     pub fn ctl(&self, op: i32, fd: FileDesc, event: EpollEvent) -> LxResult<usize> {
         let mut inner = self.inner.lock();
         match op {
-            1 => { // EPOLL_CTL_ADD
+            1 => {
+                // EPOLL_CTL_ADD
                 if inner.interest_list.contains_key(&fd) {
                     return Err(LxError::EEXIST);
                 }
                 inner.interest_list.insert(fd, event);
             }
-            2 => { // EPOLL_CTL_DEL
+            2 => {
+                // EPOLL_CTL_DEL
                 inner.interest_list.remove(&fd).ok_or(LxError::ENOENT)?;
             }
-            3 => { // EPOLL_CTL_MOD
+            3 => {
+                // EPOLL_CTL_MOD
                 let e = inner.interest_list.get_mut(&fd).ok_or(LxError::ENOENT)?;
                 *e = event;
             }
@@ -98,7 +101,11 @@ impl FileLike for Epoll {
 
 impl Epoll {
     /// wait for events on the interest list
-    pub async fn wait(&self, maxevents: usize, process: &crate::process::LinuxProcess) -> LxResult<Vec<EpollEvent>> {
+    pub async fn wait(
+        &self,
+        maxevents: usize,
+        process: &crate::process::LinuxProcess,
+    ) -> LxResult<Vec<EpollEvent>> {
         loop {
             let mut events = Vec::new();
             let interest_list = self.inner.lock().interest_list.clone();
@@ -116,7 +123,7 @@ impl Epoll {
                     if status.error {
                         ready_events |= PollEvents::ERR.bits() as u32;
                     }
-                    
+
                     if ready_events != 0 {
                         events.push(EpollEvent {
                             events: ready_events,
@@ -128,11 +135,11 @@ impl Epoll {
                     }
                 }
             }
-            
+
             if !events.is_empty() {
                 return Ok(events);
             }
-            
+
             // TODO: properly wait for ANY of the files to become ready.
             // For now, we yield and try again. This is inefficient but avoids complex multi-wait logic for now.
             kernel_hal::thread::yield_now().await;

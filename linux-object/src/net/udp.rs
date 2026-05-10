@@ -369,7 +369,9 @@ impl Socket for UdpSocketState {
                 let ifaces = kernel_hal::drivers::all_net();
                 for (i, iface) in ifaces.as_vec().iter().enumerate() {
                     if iface.get_ifname() == ifname {
-                        ifr.ifr_ifru = IfReqUnion { ifindex: (i + 1) as i32 };
+                        ifr.ifr_ifru = IfReqUnion {
+                            ifindex: (i + 1) as i32,
+                        };
                         return Ok(0);
                     }
                 }
@@ -405,7 +407,8 @@ impl Socket for UdpSocketState {
                 let ifname = ifreq_name(&ifr.ifr_name)?;
                 let iface = iface_by_name(ifname)?;
                 #[allow(unsafe_code)]
-                let addr = unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
+                let addr =
+                    unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
                 let prefix_len = iface_ipv4_cidr(&*iface)
                     .map(|cidr| cidr.prefix_len())
                     .unwrap_or(32);
@@ -464,7 +467,6 @@ impl Socket for UdpSocketState {
                 error!("  NOT FOUND!");
                 Err(LxError::ENODEV)
             }
-
 
             // SIOCGIFMTU: get MTU
             SIOCGIFMTU => {

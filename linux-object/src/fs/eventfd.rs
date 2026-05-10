@@ -1,10 +1,10 @@
 use super::*;
+use crate::sync::{Event, EventBus};
 use alloc::sync::Arc;
+use core::convert::TryInto;
 use core::sync::atomic::{AtomicU64, Ordering};
 use lock::Mutex;
-use crate::sync::{Event, EventBus};
 use zircon_object::object::*;
-use core::convert::TryInto;
 
 /// eventfd implementation
 pub struct EventFd {
@@ -53,14 +53,23 @@ impl FileLike for EventFd {
         loop {
             let counter = self.counter.load(Ordering::SeqCst);
             if counter > 0 {
-                let res = if self.flags.bits() & 1 != 0 { // EFD_SEMAPHORE
-                    if self.counter.compare_exchange(counter, counter - 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                let res = if self.flags.bits() & 1 != 0 {
+                    // EFD_SEMAPHORE
+                    if self
+                        .counter
+                        .compare_exchange(counter, counter - 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
                         1
                     } else {
                         continue;
                     }
                 } else {
-                    if self.counter.compare_exchange(counter, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    if self
+                        .counter
+                        .compare_exchange(counter, 0, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
                         counter
                     } else {
                         continue;
@@ -90,7 +99,11 @@ impl FileLike for EventFd {
         loop {
             let counter = self.counter.load(Ordering::SeqCst);
             if u64::MAX - counter > val {
-                if self.counter.compare_exchange(counter, counter + val, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                if self
+                    .counter
+                    .compare_exchange(counter, counter + val, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
                     self.eventbus.lock().set(Event::READABLE);
                     return Ok(8);
                 }
@@ -99,7 +112,7 @@ impl FileLike for EventFd {
                     return Err(LxError::EAGAIN);
                 }
                 // TODO: wait for writeable? EventFd is almost always writeable unless overflow
-                return Err(LxError::EAGAIN); 
+                return Err(LxError::EAGAIN);
             }
         }
     }

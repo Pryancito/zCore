@@ -242,7 +242,8 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
 }
 
 pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
-    static NET_IF_COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static NET_IF_COUNTER: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
     let next_name = || {
         format!(
             "eth{}",

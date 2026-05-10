@@ -42,8 +42,6 @@ impl Default for NetlinkSocketState {
 }
 impl NetlinkSocketState {}
 
-
-
 #[async_trait]
 impl Socket for NetlinkSocketState {
     /// missing documentation
@@ -58,7 +56,11 @@ impl Socket for NetlinkSocketState {
                     None
                 } else {
                     let msg = buffer.remove(0);
-                    info!("Netlink read: msg_type={:?}, len={}", NetlinkMessageType::from(u16::from_le_bytes([msg[4], msg[5]])), msg.len());
+                    info!(
+                        "Netlink read: msg_type={:?}, len={}",
+                        NetlinkMessageType::from(u16::from_le_bytes([msg[4], msg[5]])),
+                        msg.len()
+                    );
                     Some(msg)
                 }
             };
@@ -87,7 +89,10 @@ impl Socket for NetlinkSocketState {
             return Err(LxError::EINVAL);
         }
         let message_type = NetlinkMessageType::from(header.nlmsg_type);
-        info!("Netlink write: message_type={:?}, len={}, seq={}", message_type, header.nlmsg_len, header.nlmsg_seq);
+        info!(
+            "Netlink write: message_type={:?}, len={}, seq={}",
+            message_type, header.nlmsg_len, header.nlmsg_seq
+        );
         let mut buffer = self.data.lock();
         buffer.clear();
         match message_type {
@@ -139,21 +144,13 @@ impl Socket for NetlinkSocketState {
                     push_rtattr_bytes(&mut attrs, RouteAttrTypes::OperState.into(), &[6u8]);
 
                     // IFLA_LINK: for plain Ethernet, point to self ifindex.
-                    push_rtattr_u32(
-                        &mut attrs,
-                        RouteAttrTypes::Link.into(),
-                        (i as u32) + 1,
-                    );
+                    push_rtattr_u32(&mut attrs, RouteAttrTypes::Link.into(), (i as u32) + 1);
 
                     let ifname = iface.get_ifname();
                     // IFLA_IFNAME includes a null terminator (Linux kernel convention)
                     let mut ifname_bytes = Vec::from(ifname.as_bytes());
                     ifname_bytes.push(0u8);
-                    push_rtattr_bytes(
-                        &mut attrs,
-                        RouteAttrTypes::Ifname.into(),
-                        &ifname_bytes,
-                    );
+                    push_rtattr_bytes(&mut attrs, RouteAttrTypes::Ifname.into(), &ifname_bytes);
 
                     msg.align4();
                     msg.append(&mut attrs);
@@ -211,11 +208,7 @@ impl Socket for NetlinkSocketState {
                         let ifname = iface.get_ifname();
                         let mut ifname_bytes = Vec::from(ifname.as_bytes());
                         ifname_bytes.push(0u8);
-                        push_rtattr_bytes(
-                            &mut attrs,
-                            IfAddrAttrTypes::Label.into(),
-                            &ifname_bytes,
-                        );
+                        push_rtattr_bytes(&mut attrs, IfAddrAttrTypes::Label.into(), &ifname_bytes);
 
                         // IPv4 broadcast if applicable.
                         if ip_addr.as_bytes().len() == 4 {
@@ -259,7 +252,9 @@ impl Socket for NetlinkSocketState {
                     #[allow(unsafe_code)]
                     let rta = unsafe { &*(data[ptr..].as_ptr() as *const RouteAttr) };
                     let rta_len = rta.rta_len as usize;
-                    if rta_len < size_of::<RouteAttr>() { break; }
+                    if rta_len < size_of::<RouteAttr>() {
+                        break;
+                    }
                     let payload = &data[ptr + size_of::<RouteAttr>()..ptr + rta_len];
                     let t = IfAddrAttrTypes::from(rta.rta_type);
                     if matches!(t, IfAddrAttrTypes::Local | IfAddrAttrTypes::Address) {
@@ -281,7 +276,10 @@ impl Socket for NetlinkSocketState {
                     let ifaces = get_net_device();
                     if let Some(iface) = ifaces.get(iface_idx) {
                         let _ = iface.set_ipv4_address(cidr);
-                        info!("[netlink] NewAddr: set {}.{}.{}.{}/{} on if{}", bytes[0], bytes[1], bytes[2], bytes[3], ifa.ifa_prefixlen, iface_idx);
+                        info!(
+                            "[netlink] NewAddr: set {}.{}.{}.{}/{} on if{}",
+                            bytes[0], bytes[1], bytes[2], bytes[3], ifa.ifa_prefixlen, iface_idx
+                        );
                     }
                 }
                 // ACK (error=0)
@@ -309,7 +307,9 @@ impl Socket for NetlinkSocketState {
                     #[allow(unsafe_code)]
                     let rta = unsafe { &*(data[ptr..].as_ptr() as *const RouteAttr) };
                     let rta_len = rta.rta_len as usize;
-                    if rta_len < size_of::<RouteAttr>() { break; }
+                    if rta_len < size_of::<RouteAttr>() {
+                        break;
+                    }
                     let payload = &data[ptr + size_of::<RouteAttr>()..ptr + rta_len];
                     if rta.rta_type == RTA_GATEWAY && payload.len() == 4 {
                         let mut arr = [0u8; 4];
@@ -326,8 +326,12 @@ impl Socket for NetlinkSocketState {
                     let ifaces = get_net_device();
                     if let Some(iface) = ifaces.get(ifindex) {
                         let gw_addr = IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&gw));
-                        let _ = iface.add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), Some(gw_addr));
-                        info!("[netlink] NewRoute: default gw {}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]);
+                        let _ = iface
+                            .add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), Some(gw_addr));
+                        info!(
+                            "[netlink] NewRoute: default gw {}.{}.{}.{}",
+                            gw[0], gw[1], gw[2], gw[3]
+                        );
                     }
                 }
                 // ACK
@@ -750,5 +754,3 @@ impl VecExt for Vec<u8> {
         self[offset..(bytes.len() + offset)].copy_from_slice(bytes);
     }
 }
-
-

@@ -74,7 +74,8 @@ async fn run_user(thread: CurrentThread) {
         }
 
         // run
-        trace!("go to user: tid = {} pc = {:x} sp = {:x}",
+        trace!(
+            "go to user: tid = {} pc = {:x} sp = {:x}",
             thread.id(),
             ctx.get_field(UserContextField::InstrPointer),
             ctx.get_field(UserContextField::StackPointer)

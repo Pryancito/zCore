@@ -5,10 +5,9 @@
 #[macro_use]
 pub mod socket_address;
 use crate::fs::{FileLike, PollEvents};
-use kernel_hal::user::{IoVecOut, UserInPtr, UserInOutPtr};
+use kernel_hal::user::{IoVecOut, UserInOutPtr, UserInPtr};
 use smoltcp::wire::IpEndpoint;
 pub use socket_address::*;
-
 
 /// missing documentation
 pub mod tcp;
@@ -128,7 +127,6 @@ pub const IFF_MULTICAST: u32 = 0x1000;
 pub const IFF_LOWER_UP: u32 = 0x1_0000;
 pub const IFF_CHANGE_ALL: u32 = 0xFFFF_FFFF;
 
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SockAddrHw {
@@ -156,7 +154,11 @@ pub struct IfReq {
 
 impl IfReq {
     pub fn name(&self) -> &str {
-        let len = self.ifr_name.iter().position(|&b| b == 0).unwrap_or(self.ifr_name.len());
+        let len = self
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.ifr_name.len());
         core::str::from_utf8(&self.ifr_name[..len]).unwrap_or("")
     }
 }
@@ -273,7 +275,6 @@ impl MsgHdr {
         self.msg_namelen = len;
     }
 }
-
 
 numeric_enum! {
     #[repr(usize)]
