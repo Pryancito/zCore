@@ -7,7 +7,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
-use kernel_hal::context::UserContextField;
+use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::TimeSpec;
 use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
@@ -62,7 +62,6 @@ impl Syscall<'_> {
     ///   as the corresponding file descriptor in the parent.
     ///   This means that the two file descriptors share open file status flags and file offset.
     pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
-        error!("fork: enter");
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process(), false)?; // old pt NULL here
         let new_thread = Thread::create_linux(&new_proc)?;
@@ -88,9 +87,10 @@ impl Syscall<'_> {
     /// (either normally, by calling [`Self::sys_exit`], or abnormally, after delivery of a fatal signal),
     /// or it makes a call to [`Self::sys_execve`].
     pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
-        error!("vfork: enter");
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
+        self.zircon_process().vmar().dump();
         let new_proc = Process::fork_from(self.zircon_process(), true)?;
+        new_proc.vmar().dump();
         let new_thread = Thread::create_linux(&new_proc)?;
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {
@@ -129,7 +129,6 @@ impl Syscall<'_> {
         newtls: usize,
         mut child_tid: UserOutPtr<i32>,
     ) -> SysResult {
-        error!("clone: enter");
         let _flags = CloneFlags::from_bits_truncate(flags);
         info!(
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
@@ -281,11 +280,11 @@ impl Syscall<'_> {
         argv: UserInPtr<UserInPtr<u8>>,
         envp: UserInPtr<UserInPtr<u8>>,
     ) -> SysResult {
-        error!("execve: enter");
         let path_str = path.as_c_str().map_err(|e| {
             error!("execve: path.as_c_str() failed: {:?}", e);
             e
         })?;
+        error!("EXECVE ENTER: path={:?}", path_str);
         let args = argv.read_cstring_array().map_err(|e| {
             error!("execve: argv.read_cstring_array() failed: {:?}", e);
             e
@@ -329,14 +328,18 @@ impl Syscall<'_> {
             stack_pages: USER_STACK_PAGES,
             root_inode: proc.root_inode().clone(),
         }
-        .load(&vmar, &data, args, envs, path_str)?;
+        .load(&vmar, &data, args, envs, path_str)
+        .map_err(|e| {
+            error!("execve: LinuxElfLoader::load failed: {:?}", e);
+            e
+        })?;
         proc.set_brk(initial_brk);
 
-        // TODO: use right signal
-        // self.zircon_process().signal_set(Signal::SIGNALED);
-        // Workaround, the child process could NOT exit correctly
-        self.thread
-            .with_context(|ctx| ctx.setup_uspace(entry, sp, &[0, 0, 0]))?;
+        self.zircon_process().signal_set(Signal::SIGNALED);
+        self.thread.with_context(|ctx| {
+            *ctx = UserContext::new();
+            ctx.setup_uspace(entry, sp, &[0, 0, 0]);
+        })?;
         Ok(0)
     }
 

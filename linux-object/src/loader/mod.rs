@@ -56,8 +56,8 @@ impl LinuxElfLoader {
         path: String,
         recursion: u8,
     ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
-        debug!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
-        debug!(
+        error!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
+        error!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
             vmar.get_info(),
             data.as_ptr(),
@@ -73,9 +73,9 @@ impl LinuxElfLoader {
         // Handle shebang scripts (#!).
         // Limit scan to the first 512 bytes to match typical OS shebang length restrictions.
         if data.starts_with(b"\x7fELF") {
-            debug!("elf: detected ELF for {:?}", path);
+            error!("elf: detected ELF for {:?}", path);
         } else if data.starts_with(b"#!") {
-            debug!("elf: detected shebang for {:?}", path);
+            error!("elf: detected shebang for {:?}", path);
             let scan_limit = data.len().min(512);
             let newline = data[..scan_limit]
                 .iter()
@@ -97,7 +97,7 @@ impl LinuxElfLoader {
                 interp, interp_arg, path
             );
             let interp_rel = interp.trim_start_matches('/');
-            let inode = self.root_inode.lookup(interp_rel).map_err(|e| {
+            let inode = self.root_inode.lookup_follow(interp_rel, 1).map_err(|e| {
                 error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
                 e
             })?;
@@ -115,9 +115,12 @@ impl LinuxElfLoader {
             return self.load_impl(vmar, &interp_data, new_args, envs, interp_path, recursion + 1);
         }
 
-        let elf = ElfFile::new(data).map_err(|_| ZxError::INVALID_ARGS)?;
+        let elf = ElfFile::new(data).map_err(|e| {
+            error!("elf: ElfFile::new failed for {:?}: {:?}", path, e);
+            ZxError::INVALID_ARGS
+        })?;
 
-        debug!("elf info:  {:#x?}", elf.header.pt2);
+        error!("elf info:  {:#x?}", elf.header.pt2);
 
         if let Ok(interp) = elf.get_interpreter() {
             info!("interp: {:?}, path: {:?}", interp, path);
@@ -154,7 +157,10 @@ impl LinuxElfLoader {
                 error!("elf: lookup interp {:?} failed: {:?}", interp, e);
                 e
             })?;
-            let interp_data = inode.read_as_vec()?;
+            let interp_data = inode.read_as_vec().map_err(|e| {
+                error!("elf: read interp {:?} failed: {:?}", interp, e);
+                e
+            })?;
             let interp_elf = ElfFile::new(&interp_data).map_err(|_| {
                 error!("elf: interp {:?} is not a valid ELF", interp);
                 ZxError::INVALID_ARGS
@@ -252,9 +258,15 @@ impl LinuxElfLoader {
         }
 
         let size = elf.load_segment_size();
-        let image_vmar = vmar.allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
+        let image_vmar = vmar.allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
+            error!("elf: allocate vmar for size {:#x} failed: {:?}", size, e);
+            e
+        })?;
         let base = image_vmar.addr();
-        let vmo = image_vmar.load_from_elf(&elf)?;
+        let vmo = image_vmar.load_from_elf(&elf).map_err(|e| {
+            error!("elf: load_from_elf failed: {:?}", e);
+            e
+        })?;
         let entry = base + elf.header.pt2.entry_point() as usize;
 
         debug!(
