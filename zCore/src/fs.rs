@@ -60,7 +60,10 @@ pub(crate) fn init_ram_disk() -> Option<&'static mut [u8]> {
         Some(unsafe {
             let start = _user_img_start as *mut u8;
             let end = _user_img_end as *const () as usize;
-            core::slice::from_raw_parts_mut(start, end - start as usize)
+            core::slice::from_raw_parts_mut(
+                start,
+                end - start as usize,
+            )
         })
     } else {
         kernel_hal::boot::init_ram_disk()

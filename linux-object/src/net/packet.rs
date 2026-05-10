@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use kernel_hal::drivers::prelude::DeviceError;
 use kernel_hal::user::UserInOutPtr;
 use kernel_hal::{drivers, thread};
-use lazy_static::lazy_static;
 use lock::Mutex;
-use smoltcp::wire::EthernetFrame;
 use zircon_object::object::*;
+use lazy_static::lazy_static;
+use smoltcp::wire::EthernetFrame;
 
 // Global list of active AF_PACKET sockets to implement packet tapping.
 lazy_static! {
@@ -39,8 +39,7 @@ impl PacketSocketState {
 #[async_trait]
 impl Socket for PacketSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        let mut endpoint =
-            Endpoint::LinkLevel(LinkLevelEndpoint::new(*self.ifindex.lock() as usize));
+        let mut endpoint = Endpoint::LinkLevel(LinkLevelEndpoint::new(*self.ifindex.lock() as usize));
         let non_block = self.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
@@ -140,19 +139,15 @@ impl Socket for PacketSocketState {
                 for iface in ifaces.as_vec().iter() {
                     if iface.get_ifname() == if_name {
                         let mut data = data;
-                        let ip = iface
-                            .get_ip_address()
-                            .iter()
-                            .find_map(|cidr| match cidr {
-                                smoltcp::wire::IpCidr::Ipv4(cidr) => Some(cidr.address()),
-                                _ => None,
-                            })
-                            .unwrap_or(smoltcp::wire::Ipv4Address::UNSPECIFIED);
-
+                        let ip = iface.get_ip_address().iter().find_map(|cidr| match cidr {
+                            smoltcp::wire::IpCidr::Ipv4(cidr) => Some(cidr.address()),
+                            _ => None,
+                        }).unwrap_or(smoltcp::wire::Ipv4Address::UNSPECIFIED);
+                        
                         data.ifr_ifru.addr.sin_family = AddressFamily::Internet.into();
                         data.ifr_ifru.addr.sin_port = 0;
                         data.ifr_ifru.addr.sin_addr = u32::from_ne_bytes(ip.0);
-
+                        
                         ifr.write(data)?;
                         return Ok(0);
                     }

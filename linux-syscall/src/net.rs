@@ -24,10 +24,7 @@ impl Syscall<'_> {
         let socket_type = match SocketType::try_from(socket_type_val) {
             Ok(t) => t,
             Err(_) => {
-                warn!(
-                    "sys_socket: invalid socket type: {:#x} (masked: {:#x})",
-                    _type, socket_type_val
-                );
+                warn!("sys_socket: invalid socket type: {:#x} (masked: {:#x})", _type, socket_type_val);
                 return Err(LxError::EINVAL);
             }
         };
@@ -514,7 +511,7 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// creates a pair of connected sockets in the specified domain, of the specified type,
+    /// creates a pair of connected sockets in the specified domain, of the specified type, 
     /// and using the optionally specified protocol.
     pub fn sys_socketpair(
         &mut self,

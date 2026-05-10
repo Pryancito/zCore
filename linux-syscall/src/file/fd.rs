@@ -67,13 +67,10 @@ impl Syscall<'_> {
         proc.close_file(fd)?;
         Ok(0)
     }
-
+    
     /// Closes all file descriptors between `first` and `last`.
     pub fn sys_close_range(&self, first: usize, last: usize, _flags: usize) -> SysResult {
-        info!(
-            "close_range: first={}, last={}, flags={}",
-            first, last, _flags
-        );
+        info!("close_range: first={}, last={}, flags={}", first, last, _flags);
         let proc = self.linux_process();
         proc.close_range(first.into(), last.into());
         Ok(0)
@@ -153,7 +150,7 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// creates an eventfd object that can be used as an event notification mechanism by user-space applications,
+    /// creates an eventfd object that can be used as an event notification mechanism by user-space applications, 
     /// and by the kernel to notify user-space applications of events.
     pub fn sys_eventfd2(&self, initval: u32, flags: usize) -> SysResult {
         info!("eventfd2: initval={}, flags={:#x}", initval, flags);

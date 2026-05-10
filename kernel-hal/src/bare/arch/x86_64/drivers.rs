@@ -129,7 +129,9 @@ pub(super) fn init() -> DeviceResult {
             // contents to the screen.  Spawn a periodic flush task matching
             // what the RISC-V init already does.
             if display.need_flush() {
-                crate::thread::spawn(crate::common::future::DisplayFlushFuture::new(display, 30));
+                crate::thread::spawn(crate::common::future::DisplayFlushFuture::new(
+                    display, 30,
+                ));
             }
         } else {
             use crate::KCONFIG;

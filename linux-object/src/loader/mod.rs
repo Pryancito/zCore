@@ -56,12 +56,7 @@ impl LinuxElfLoader {
         path: String,
         recursion: u8,
     ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
-        debug!(
-            "elf: load_impl recursion={} len={:#x} path={:?}",
-            recursion,
-            data.len(),
-            path
-        );
+        debug!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
         debug!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
             vmar.get_info(),
@@ -117,14 +112,7 @@ impl LinuxElfLoader {
             }
             new_args.push(path);
             new_args.extend_from_slice(args.get(1..).unwrap_or_default());
-            return self.load_impl(
-                vmar,
-                &interp_data,
-                new_args,
-                envs,
-                interp_path,
-                recursion + 1,
-            );
+            return self.load_impl(vmar, &interp_data, new_args, envs, interp_path, recursion + 1);
         }
 
         let elf = ElfFile::new(data).map_err(|_| ZxError::INVALID_ARGS)?;
@@ -137,15 +125,10 @@ impl LinuxElfLoader {
             // Load the main program into the first sub-VMAR (allocated at offset 0 in an
             // empty address space, so app_base is typically 0 for a non-PIE binary).
             let app_size = elf.load_segment_size();
-            let app_vmar = vmar
-                .allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
-                .map_err(|e| {
-                    error!(
-                        "elf: allocate vmar for app size {:#x} failed: {:?}",
-                        app_size, e
-                    );
-                    e
-                })?;
+            let app_vmar = vmar.allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
+                error!("elf: allocate vmar for app size {:#x} failed: {:?}", app_size, e);
+                e
+            })?;
             let app_base = app_vmar.addr();
             let app_vmo = app_vmar.load_from_elf(&elf).map_err(|e| {
                 error!("elf: load app from elf failed: {:?}", e);
@@ -177,13 +160,9 @@ impl LinuxElfLoader {
                 ZxError::INVALID_ARGS
             })?;
             let interp_size = interp_elf.load_segment_size();
-            let interp_vmar = vmar
-                .allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
-                .map_err(|e| {
-                    error!(
-                        "elf: allocate vmar for interp {:?} size {:#x} failed: {:?}",
-                        interp, interp_size, e
-                    );
+            let interp_vmar =
+                vmar.allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
+                    error!("elf: allocate vmar for interp {:?} size {:#x} failed: {:?}", interp, interp_size, e);
                     e
                 })?;
             let interp_base = interp_vmar.addr();
