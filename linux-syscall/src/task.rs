@@ -243,11 +243,22 @@ impl Syscall<'_> {
             "wait4: target={:?}, wstatus={:?}, options={:?}",
             target, wstatus, flags,
         );
-        let (pid, code) = match target {
+        let result = match target {
             WaitTarget::AnyChild | WaitTarget::AnyChildInGroup => {
-                wait_child_any(self.zircon_process(), nohang).await?
+                wait_child_any(self.zircon_process(), nohang).await
             }
-            WaitTarget::Pid(pid) => (pid, wait_child(self.zircon_process(), pid, nohang).await?),
+            WaitTarget::Pid(pid) => wait_child(self.zircon_process(), pid, nohang)
+                .await
+                .map(|code| (pid, code)),
+        };
+        let (pid, code) = match result {
+            Ok(pair) => pair,
+            Err(LxError::EAGAIN) if nohang => {
+                // WNOHANG: no child ready yet — return 0 per POSIX waitpid(2).
+                wstatus.write_if_not_null(0)?;
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
         };
         wstatus.write_if_not_null(code)?;
         Ok(pid as usize)
@@ -284,7 +295,7 @@ impl Syscall<'_> {
             error!("execve: path.as_c_str() failed: {:?}", e);
             e
         })?;
-        error!("EXECVE ENTER: path={:?}", path_str);
+        debug!("EXECVE ENTER: path={:?}", path_str);
         let args = argv.read_cstring_array().map_err(|e| {
             error!("execve: argv.read_cstring_array() failed: {:?}", e);
             e
