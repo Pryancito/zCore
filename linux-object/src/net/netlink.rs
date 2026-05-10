@@ -287,19 +287,7 @@ impl Socket for NetlinkSocketState {
                     }
                 }
                 // ACK (error=0)
-                let ack = NetlinkMessageHeader {
-                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
-                    nlmsg_type: NetlinkMessageType::Error.into(),
-                    nlmsg_flags: NetlinkMessageFlags::empty(),
-                    nlmsg_seq: header.nlmsg_seq,
-                    nlmsg_pid: 0,
-                };
-                let mut msg = Vec::new();
-                msg.push_ext(ack);
-                msg.push_ext(0i32); // error = 0 means success
-                msg.align4();
-                msg.set_ext(0, msg.len() as u32);
-                buffer.push(msg);
+                push_ack(&mut buffer, header.nlmsg_seq);
             }
             NetlinkMessageType::NewRoute => {
                 // RTM_NEWROUTE: add a routing entry (default gateway etc.)
@@ -345,19 +333,29 @@ impl Socket for NetlinkSocketState {
                     }
                 }
                 // ACK
-                let ack = NetlinkMessageHeader {
-                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
-                    nlmsg_type: NetlinkMessageType::Error.into(),
-                    nlmsg_flags: NetlinkMessageFlags::empty(),
-                    nlmsg_seq: header.nlmsg_seq,
-                    nlmsg_pid: 0,
-                };
-                let mut msg = Vec::new();
-                msg.push_ext(ack);
-                msg.push_ext(0i32);
-                msg.align4();
-                msg.set_ext(0, msg.len() as u32);
-                buffer.push(msg);
+                push_ack(&mut buffer, header.nlmsg_seq);
+            }
+            NetlinkMessageType::GetRoute => {
+                // RTM_GETROUTE: dump the routing table.
+                // We currently have no way to enumerate smoltcp routes, so we
+                // return an empty table.  dhcpcd treats this as "no existing
+                // routes to remove before adding ours", which is safe.
+                // The NLMSG_DONE sentinel is appended after the match block.
+                info!("[netlink] GetRoute: returning empty routing table");
+            }
+            NetlinkMessageType::DelAddr => {
+                // RTM_DELADDR: remove an IP address from an interface.
+                // Return a success ACK; the actual address removal is not
+                // implemented yet (dhcpcd treats a non-fatal error gracefully,
+                // but a clean ACK avoids unnecessary log noise).
+                info!("[netlink] DelAddr: ACK (address removal not yet implemented)");
+                push_ack(&mut buffer, header.nlmsg_seq);
+            }
+            NetlinkMessageType::DelRoute => {
+                // RTM_DELROUTE: remove a routing entry.
+                // Return a success ACK; same rationale as DelAddr above.
+                info!("[netlink] DelRoute: ACK (route removal not yet implemented)");
+                push_ack(&mut buffer, header.nlmsg_seq);
             }
             _ => {
                 // Unknown/unimplemented request: return NLMSG_ERROR with -EOPNOTSUPP.
@@ -440,7 +438,20 @@ impl Socket for NetlinkSocketState {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        Some(Endpoint::Netlink(NetlinkEndpoint::new(0, 0)))
+        // Use the kernel-object ID as nl_pid so that each socket gets a
+        // unique, non-zero identifier.  This is important because dhcpcd
+        // stores the route_fd's nl_pid as `priv->route_pid` and then
+        // filters out netlink messages whose nlmsg_pid equals route_pid.
+        // If nl_pid were 0 (the kernel's pid), every kernel reply would
+        // be silently dropped.
+        //
+        // We reduce the 64-bit koid into the u32 space with a modulo so
+        // that the value is always defined (no wrapping UB).  Collisions
+        // can only occur after u32::MAX - 1 simultaneously-alive sockets,
+        // which is not a concern in practice.
+        let reduced = self.base.id % u32::MAX as u64;
+        let nl_pid = (reduced as u32).max(1);
+        Some(Endpoint::Netlink(NetlinkEndpoint::new(nl_pid, 0)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
@@ -678,6 +689,23 @@ fn push_rtattr_bytes(dst: &mut Vec<u8>, rta_type: u16, payload: &[u8]) {
 
 fn push_rtattr_u32(dst: &mut Vec<u8>, rta_type: u16, v: u32) {
     push_rtattr_bytes(dst, rta_type, &v.to_ne_bytes());
+}
+
+/// Build a success ACK (NLMSG_ERROR with error=0) and push it onto `buffer`.
+fn push_ack(buffer: &mut Vec<Vec<u8>>, seq: u32) {
+    let ack = NetlinkMessageHeader {
+        nlmsg_len: (size_of::<NetlinkMessageHeader>() + size_of::<i32>()) as u32,
+        nlmsg_type: NetlinkMessageType::Error.into(),
+        nlmsg_flags: NetlinkMessageFlags::empty(),
+        nlmsg_seq: seq,
+        nlmsg_pid: 0,
+    };
+    let mut msg = Vec::new();
+    msg.push_ext(ack);
+    msg.push_ext(0i32); // error = 0 means success
+    msg.align4();
+    msg.set_ext(0, msg.len() as u32);
+    buffer.push(msg);
 }
 
 fn ipv4_broadcast(addr: smoltcp::wire::Ipv4Address, prefix_len: u8) -> smoltcp::wire::Ipv4Address {
