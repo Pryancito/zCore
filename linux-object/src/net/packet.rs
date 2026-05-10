@@ -3,97 +3,62 @@ use crate::{
     fs::{FileLike, OpenFlags, PollEvents, PollStatus},
     net::*,
 };
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use async_trait::async_trait;
+use kernel_hal::drivers::prelude::DeviceError;
+use kernel_hal::user::UserInOutPtr;
 use kernel_hal::{drivers, thread};
 use lock::Mutex;
 use zircon_object::object::*;
+use lazy_static::lazy_static;
 
-// Maximum raw ethernet frame size
-const MAX_FRAME: usize = 1536;
-// Maximum number of buffered frames to prevent unbounded memory growth
-const MAX_RX_QUEUE: usize = 64;
+const ARPHRD_ETHER: u16 = 1;
 
-/// AF_PACKET socket backed by the first available NetScheme device.
-///
-/// Supports both udhcpc (BusyBox) and other raw-socket DHCP clients.
-/// Frames sent by userland go directly to the wire; frames from the
-/// wire are buffered in `rx_queue` and dequeued by blocking read().
+// Global list of active AF_PACKET sockets to implement packet tapping.
+lazy_static! {
+    static ref PACKET_SOCKETS: Mutex<Vec<Weak<PacketSocketState>>> = Mutex::new(Vec::new());
+}
+
 pub struct PacketSocketState {
     base: KObjectBase,
     flags: Mutex<OpenFlags>,
-    /// Buffered received frames (raw ethernet, up to MAX_FRAME bytes each).
-    /// Uses VecDeque for FIFO ordering — oldest frame is dequeued first.
-    rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     /// Index (1-based) of the bound interface; 0 = unbound.
     ifindex: Mutex<u32>,
 }
 
 impl PacketSocketState {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
             base: KObjectBase::new(),
             flags: Mutex::new(OpenFlags::RDWR),
-            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
             ifindex: Mutex::new(0),
-        }
-    }
-
-    /// Try to pull one frame from the hardware and place it in rx_queue.
-    /// Returns true if a frame was queued.
-    fn try_recv_one(&self) -> bool {
-        let dev = match drivers::all_net().first() {
-            Some(d) => d,
-            None => return false,
-        };
-        let mut buf = vec![0u8; MAX_FRAME];
-        match dev.recv(&mut buf) {
-            Ok(n) if n > 0 => {
-                buf.truncate(n);
-                let mut q = self.rx_queue.lock();
-                // Drop oldest frame if queue is full to avoid unbounded growth
-                if q.len() >= MAX_RX_QUEUE {
-                    q.pop_front();
-                }
-                q.push_back(buf);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Drain all available frames from hardware into rx_queue.
-    fn drain_hw(&self) {
-        // Pull up to MAX_RX_QUEUE frames in one batch
-        for _ in 0..MAX_RX_QUEUE {
-            if !self.try_recv_one() {
-                break;
-            }
-        }
+        })
     }
 }
 
 #[async_trait]
 impl Socket for PacketSocketState {
-    /// Blocking read: polls hardware until a frame arrives, then returns it.
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         let endpoint = Endpoint::Ip(smoltcp::wire::IpEndpoint::UNSPECIFIED);
         let non_block = self.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
-            // Drain any available frames from hardware into our queue.
-            self.drain_hw();
+            let dev = match drivers::all_net().first() {
+                Some(d) => d,
+                None => return (Err(LxError::ENODEV), endpoint),
+            };
 
-            // Try to get a buffered frame (FIFO order).
-            let maybe_frame = self.rx_queue.lock().pop_front();
-            if let Some(frame) = maybe_frame {
-                let n = core::cmp::min(frame.len(), data.len());
-                data[..n].copy_from_slice(&frame[..n]);
-                return (Ok(n), endpoint);
-            }
-
-            if non_block {
-                return (Err(LxError::EAGAIN), endpoint);
+            // This calls the driver's NetScheme::recv, which now reads from
+            // its independent raw_rx_queue (filled by the IRQ handler).
+            match dev.recv(data) {
+                Ok(n) => return (Ok(n), endpoint),
+                Err(DeviceError::NotReady) => {
+                    if non_block {
+                        return (Err(LxError::EAGAIN), endpoint);
+                    }
+                }
+                Err(_) => return (Err(LxError::EIO), endpoint),
             }
 
             // Nothing available yet — yield and retry.
@@ -123,19 +88,93 @@ impl Socket for PacketSocketState {
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
-        // Try to pull frames so that subsequent read() can find them.
-        self.drain_hw();
-        let readable = !self.rx_queue.lock().is_empty();
-        let writable = drivers::all_net()
-            .first()
-            .as_ref()
-            .map(|d| d.can_send())
-            .unwrap_or(false);
+        let dev = drivers::all_net().first();
+        let readable = dev.as_ref().map_or(false, |d| d.can_recv());
+        let writable = dev.as_ref().map_or(false, |d| d.can_send());
         (readable, writable, false)
     }
 
-    fn ioctl(&self, _request: usize, _arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
-        Ok(0)
+    fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
+        match request {
+            SIOCGIFINDEX => {
+                let mut ifr = UserInOutPtr::<IfReq>::from(arg1);
+                let data = ifr.read()?;
+                let if_name = data.name();
+                let ifaces = drivers::all_net();
+                for (i, iface) in ifaces.as_vec().iter().enumerate() {
+                    if iface.get_ifname() == if_name {
+                        let mut data = data;
+                        data.ifr_ifru.ifindex = (i + 1) as i32;
+                        ifr.write(data)?;
+                        return Ok(0);
+                    }
+                }
+                Err(LxError::ENODEV)
+            }
+            SIOCGIFFLAGS => {
+                let mut ifr = UserInOutPtr::<IfReq>::from(arg1);
+                let data = ifr.read()?;
+                let mut data = data;
+                // For now, all interfaces are always UP and RUNNING.
+                // We also assume they support BROADCAST and MULTICAST.
+                data.ifr_ifru.flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+                ifr.write(data)?;
+                Ok(0)
+            }
+            SIOCSIFFLAGS => {
+                // Ignore for now, but return success to satisfy tools.
+                Ok(0)
+            }
+            SIOCGIFADDR => {
+                let mut ifr = UserInOutPtr::<IfReq>::from(arg1);
+                let data = ifr.read()?;
+                let if_name = data.name();
+                let ifaces = drivers::all_net();
+                for iface in ifaces.as_vec().iter() {
+                    if iface.get_ifname() == if_name {
+                        let mut data = data;
+                        let ip = iface.get_ip_address().iter().find_map(|cidr| match cidr {
+                            smoltcp::wire::IpCidr::Ipv4(cidr) => Some(cidr.address()),
+                            _ => None,
+                        }).unwrap_or(smoltcp::wire::Ipv4Address::UNSPECIFIED);
+                        
+                        data.ifr_ifru.addr.sin_family = AddressFamily::Internet.into();
+                        data.ifr_ifru.addr.sin_port = 0;
+                        data.ifr_ifru.addr.sin_addr = u32::from_ne_bytes(ip.0);
+                        
+                        ifr.write(data)?;
+                        return Ok(0);
+                    }
+                }
+                Err(LxError::ENODEV)
+            }
+            SIOCGIFHWADDR => {
+                let mut ifr = UserInOutPtr::<IfReq>::from(arg1);
+                let data = ifr.read()?;
+                let if_name = data.name();
+                let ifaces = drivers::all_net();
+                for iface in ifaces.as_vec().iter() {
+                    if iface.get_ifname() == if_name {
+                        let mut data = data;
+                        let mac = iface.get_mac();
+                        unsafe {
+                            data.ifr_ifru.addr.sin_family = ARPHRD_ETHER;
+                            data.ifr_ifru.addr.sin_addr = u32::from_ne_bytes([
+                                mac.as_bytes()[0],
+                                mac.as_bytes()[1],
+                                mac.as_bytes()[2],
+                                mac.as_bytes()[3],
+                            ]);
+                            data.ifr_ifru.addr.sin_zero[..2].copy_from_slice(&mac.as_bytes()[4..6]);
+                        }
+                        ifr.write(data)?;
+                        return Ok(0);
+                    }
+                }
+                Err(LxError::ENODEV)
+            }
+            _ => Ok(0),
+        }
     }
 
     fn socket_type(&self) -> Option<SocketType> {
@@ -152,7 +191,7 @@ impl FileLike for PacketSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let flags = &mut *self.flags.lock();
+        let mut flags = self.flags.lock();
         flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
         flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
         flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
@@ -177,9 +216,6 @@ impl FileLike for PacketSocketState {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
-        // Non-blocking snapshot — try to pull frames, then report state.
-        // select() / poll() syscalls handle blocking/timeout externally.
-        self.drain_hw();
         let (read, write, error) = Socket::poll(self, events);
         Ok(PollStatus { read, write, error })
     }

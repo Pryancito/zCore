@@ -56,7 +56,7 @@ impl Syscall<'_> {
             }
             // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
             (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
-            | (Domain::AF_PACKET, SocketType::SOCK_DGRAM, _) => Arc::new(PacketSocketState::new()),
+            | (Domain::AF_PACKET, SocketType::SOCK_DGRAM, _) => PacketSocketState::new(),
             // AF_UNIX sockets
             (Domain::AF_UNIX, _, _) => UnixSocketState::new(),
             (_, _, _) => {

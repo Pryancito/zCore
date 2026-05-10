@@ -41,40 +41,9 @@ impl Default for UdpSocketState {
     }
 }
 
-const SIOCGIFCONF: usize = 0x8912;
-const SIOCGIFFLAGS: usize = 0x8913;
-const SIOCGIFADDR: usize = 0x8915;
-const SIOCSIFADDR: usize = 0x8916;
-const SIOCGIFNETMASK: usize = 0x891b;
-const SIOCSIFNETMASK: usize = 0x891c;
-const SIOCGIFMETRIC: usize = 0x891d;
-const SIOCGIFMTU: usize = 0x8921;
-const SIOCGIFHWADDR: usize = 0x8927;
-const SIOCGIFINDEX: usize = 0x8933;
-const SIOCGARP: usize = 0x8954;
+// Moved to mod.rs as public constants
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-union IfReqUnion {
-    addr: SockAddrIn,
-    ifindex: i32,
-    ifmtu: i32,
-    ifmetric: i32,
-    flags: i16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IfReq {
-    ifr_name: [u8; 16],
-    ifr_ifru: IfReqUnion,
-}
-
-#[repr(C)]
-struct IfConf {
-    ifc_len: i32,
-    ifc_buf: usize,
-}
+// Moved to mod.rs as public structures
 
 fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
     let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -394,13 +363,10 @@ impl Socket for UdpSocketState {
 
             // SIOCGIFFLAGS: get interface flags
             SIOCGIFFLAGS => {
-                const IFF_UP: i16 = 0x1;
-                const IFF_RUNNING: i16 = 0x40;
-
                 #[allow(unsafe_code)]
                 let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
                 ifr.ifr_ifru = IfReqUnion {
-                    flags: IFF_UP | IFF_RUNNING,
+                    flags: IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST,
                 };
                 Ok(0)
             }

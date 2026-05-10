@@ -98,9 +98,9 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     if has_cmdline_flag(config.cmdline, "FB_ROT180") {
         progress::set_rot180(true);
     }
+    // Draw splash logo immediately after GOP init (this also clears screen to white).
+    logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 0);
-    // Draw splash logo immediately after GOP init.
-    //logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
     debug!("rboot config: {:#x?}", config);
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 5);
 

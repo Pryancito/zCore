@@ -547,7 +547,11 @@ impl Drop for E1000eHw {
 // Public driver wrapper
 // ---------------------------------------------------------------------------
 #[derive(Clone)]
-pub struct E1000eDriver(Arc<Mutex<E1000eHw>>);
+pub struct E1000eDriver {
+    hw: Arc<Mutex<E1000eHw>>,
+    /// Queue for smoltcp (kernel stack)
+    stack_rx_queue: Arc<Mutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>>>,
+}
 
 #[derive(Clone)]
 pub struct E1000eInterface {
@@ -555,8 +559,7 @@ pub struct E1000eInterface {
     driver: E1000eDriver,
     name: String,
     irq: usize,
-    /// Raw frames received from the NIC before smoltcp can consume them.
-    /// AF_PACKET sockets read here; smoltcp uses the separate Device trait path.
+    /// Raw frames received from the NIC for AF_PACKET sockets.
     raw_rx_queue: Arc<Mutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>>>,
 }
 
@@ -569,14 +572,18 @@ impl Scheme for E1000eInterface {
         if irq != self.irq {
             return;
         }
-        let had_data = self.driver.0.lock().handle_interrupt();
+        let had_data = self.driver.hw.lock().handle_interrupt();
         if had_data {
-            // Drain all pending frames into raw_rx_queue so AF_PACKET sockets
-            // can see them, regardless of smoltcp's poll timing.
+            // Duplicate all pending frames into both queues.
             loop {
-                let frame = self.driver.0.lock().receive();
+                let frame = self.driver.hw.lock().receive();
                 match frame {
-                    Some(pkt) => self.raw_rx_queue.lock().push_back(pkt),
+                    Some(pkt) => {
+                        // Push to AF_PACKET queue
+                        self.raw_rx_queue.lock().push_back(pkt.clone());
+                        // Push to kernel stack queue
+                        self.driver.stack_rx_queue.lock().push_back(pkt);
+                    }
                     None => break,
                 }
             }
@@ -632,7 +639,7 @@ impl NetScheme for E1000eInterface {
             return Ok(n);
         }
         // Fallback: try direct DMA ring read (for polling without IRQ).
-        if let Some(pkt) = self.driver.0.lock().receive() {
+        if let Some(pkt) = self.driver.hw.lock().receive() {
             let n = pkt.len().min(buf.len());
             buf[..n].copy_from_slice(&pkt[..n]);
             Ok(n)
@@ -641,7 +648,7 @@ impl NetScheme for E1000eInterface {
         }
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        let mut hw = self.driver.0.lock();
+        let mut hw = self.driver.hw.lock();
         hw.send(data)?;
         Ok(data.len())
     }
@@ -652,7 +659,7 @@ impl NetScheme for E1000eInterface {
     }
 
     fn can_send(&self) -> bool {
-        self.driver.0.lock().can_send()
+        self.driver.hw.lock().can_send()
     }
 
     fn add_route(&self, _cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
@@ -678,13 +685,14 @@ impl phy::Device<'_> for E1000eDriver {
     type TxToken = E1000eTxToken;
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.0
+        // smoltcp now pulls from the stack-specific queue filled by handle_irq.
+        self.stack_rx_queue
             .lock()
-            .receive()
+            .pop_front()
             .map(|pkt| (E1000eRxToken(pkt), E1000eTxToken(self.clone())))
     }
     fn transmit(&mut self) -> Option<Self::TxToken> {
-        if self.0.lock().can_send() {
+        if self.hw.lock().can_send() {
             Some(E1000eTxToken(self.clone()))
         } else {
             None
@@ -714,7 +722,7 @@ impl phy::TxToken for E1000eTxToken {
     {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf)?;
-        let mut hw = self.0 .0.lock();
+        let mut hw = self.0.hw.lock();
         hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;
         Ok(result)
     }
@@ -783,7 +791,11 @@ pub fn init(
         mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
     );
     let hw = Arc::new(Mutex::new(hw));
-    let driver = E1000eDriver(hw);
+    let stack_rx_queue = Arc::new(Mutex::new(alloc::collections::VecDeque::new()));
+    let driver = E1000eDriver {
+        hw,
+        stack_rx_queue,
+    };
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac_bytes);
     let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)];

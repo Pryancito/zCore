@@ -151,9 +151,12 @@ pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
     let bar_w: usize = 400;
     let bar_h: usize = 20;
     let x = sw.saturating_sub(bar_w) / 2;
-    let y = sh.saturating_sub(bar_h) / 2;
+    // Position below the centered logo.
+    // The logo is centered: its bottom is sh/2 + LOGO_HEIGHT/2.
+    // We add 35px padding.
+    let y = (sh / 2).saturating_add(crate::logo::LOGO_HEIGHT / 2).saturating_add(35);
 
-    // Border (white) and inner content (white fill / black remainder).
+    // Border (black) and inner content (black fill / white remainder).
     let white = pixel_white(fmt);
     let black = pixel_black(fmt);
     stroke_rect(
@@ -166,14 +169,14 @@ pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
         bar_w + 4,
         bar_h + 4,
         1,
-        white,
+        black,
     );
     let fill_w = (bar_w * progress) / 100;
     if fill_w > 0 {
-        fill_rect(fb, stride, sw, sh, x, y, fill_w, bar_h, white);
+        fill_rect(fb, stride, sw, sh, x, y, fill_w, bar_h, black);
     }
     if fill_w < bar_w {
-        fill_rect(fb, stride, sw, sh, x + fill_w, y, bar_w - fill_w, bar_h, black);
+        fill_rect(fb, stride, sw, sh, x + fill_w, y, bar_w - fill_w, bar_h, white);
     }
 
     // Fixed-width percentage text (4 chars: "100%" or "  7%"/" 42%").
@@ -193,7 +196,7 @@ pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
     let text_w = 4 * 8;
     let tx = x + (bar_w.saturating_sub(text_w)) / 2;
     let ty = y + bar_h + 15;
-    draw_text_8x16(fb, stride, sw, sh, tx, ty, &buf, white, black);
+    draw_text_8x16(fb, stride, sw, sh, tx, ty, &buf, black, white);
 }
 
 /// Draw the same bar using raw framebuffer parameters.
@@ -203,7 +206,8 @@ pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32)
     let bar_w: usize = 400;
     let bar_h: usize = 20;
     let x = sw.saturating_sub(bar_w) / 2;
-    let y = sh.saturating_sub(bar_h) / 2;
+    // Same offset as bar()
+    let y = (sh / 2).saturating_add(crate::logo::LOGO_HEIGHT / 2).saturating_add(35);
     let white: u32 = 0x00FF_FFFF;
     let black: u32 = 0x0000_0000;
 
@@ -217,14 +221,14 @@ pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32)
         bar_w + 4,
         bar_h + 4,
         1,
-        white,
+        black,
     );
     let fill_w = (bar_w * progress) / 100;
     if fill_w > 0 {
-        fill_rect(fb, stride, sw, sh, x, y, fill_w, bar_h, white);
+        fill_rect(fb, stride, sw, sh, x, y, fill_w, bar_h, black);
     }
     if fill_w < bar_w {
-        fill_rect(fb, stride, sw, sh, x + fill_w, y, bar_w - fill_w, bar_h, black);
+        fill_rect(fb, stride, sw, sh, x + fill_w, y, bar_w - fill_w, bar_h, white);
     }
 
     // Percentage text (fixed width).
@@ -244,7 +248,7 @@ pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32)
     let text_w = 4 * 8;
     let tx = x + (bar_w.saturating_sub(text_w)) / 2;
     let ty = y + bar_h + 15;
-    draw_text_8x16(fb, stride, sw, sh, tx, ty, &buf, white, black);
+    draw_text_8x16(fb, stride, sw, sh, tx, ty, &buf, black, white);
 }
 
 /// Draw a small fault marker block at top-left, encoding `tag` and `code` as pixels.

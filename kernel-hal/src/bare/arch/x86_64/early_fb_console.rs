@@ -240,7 +240,9 @@ pub fn draw_progress_bar(progress: u32) {
     let bar_w: u32 = 400;
     let bar_h: u32 = 20;
     let x = sw.saturating_sub(bar_w) / 2;
-    let y = sh.saturating_sub(bar_h) / 2;
+    // Position below the centered logo (LOGO_HEIGHT=250, so bottom is sh/2 + 125).
+    // Offset sh/2 + 160 puts the bar 35px below the logo.
+    let y = (sh / 2).saturating_add(160);
 
     // Outer border (1px) with 2px margin like the reference.
     stroke_rect(
@@ -249,16 +251,15 @@ pub fn draw_progress_bar(progress: u32) {
         bar_w + 4,
         bar_h + 4,
         1,
-        0xFFFF_FFFF,
+        0xFF00_0000, // Black border
     );
-
     // Inner fill.
     let fill_w = (bar_w * progress) / 100;
     if fill_w > 0 {
-        fill_rect(x, y, fill_w, bar_h, 0xFFFF_FFFF);
+        fill_rect(x, y, fill_w, bar_h, 0xFF00_0000); // Black fill
     }
     if fill_w < bar_w {
-        fill_rect(x + fill_w, y, bar_w - fill_w, bar_h, 0xFF00_0000);
+        fill_rect(x + fill_w, y, bar_w - fill_w, bar_h, 0xFFFF_FFFF); // White remainder
     }
 
     // Fixed-width percentage text (4 chars).
@@ -279,6 +280,6 @@ pub fn draw_progress_bar(progress: u32) {
     let tx = x + (bar_w.saturating_sub(text_w)) / 2;
     let ty = y + bar_h + 15;
     for (i, ch) in buf.iter().copied().enumerate() {
-        draw_char_at(tx + (i as u32) * 8, ty, ch, 0xFFFF_FFFF, 0xFF00_0000);
+        draw_char_at(tx + (i as u32) * 8, ty, ch, 0xFF00_0000, 0xFFFF_FFFF); // Black text on white
     }
 }

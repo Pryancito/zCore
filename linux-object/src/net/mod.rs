@@ -96,6 +96,63 @@ pub const SOCKET_TYPE_MASK: usize = 0xff;
 
 pub const SOCKET_FD: usize = 1000;
 
+pub const SIOCGIFCONF: usize = 0x8912;
+pub const SIOCGIFFLAGS: usize = 0x8913;
+pub const SIOCSIFFLAGS: usize = 0x8914;
+pub const SIOCGIFADDR: usize = 0x8915;
+pub const SIOCSIFADDR: usize = 0x8916;
+pub const SIOCGIFNETMASK: usize = 0x891b;
+pub const SIOCSIFNETMASK: usize = 0x891c;
+pub const SIOCGIFMETRIC: usize = 0x891d;
+pub const SIOCGIFMTU: usize = 0x8921;
+pub const SIOCGIFHWADDR: usize = 0x8927;
+pub const SIOCGIFINDEX: usize = 0x8933;
+pub const SIOCGARP: usize = 0x8954;
+
+pub const IFF_UP: i16 = 0x1;
+pub const IFF_BROADCAST: i16 = 0x2;
+pub const IFF_DEBUG: i16 = 0x4;
+pub const IFF_LOOPBACK: i16 = 0x8;
+pub const IFF_POINTOPOINT: i16 = 0x10;
+pub const IFF_NOTRAILERS: i16 = 0x20;
+pub const IFF_RUNNING: i16 = 0x40;
+pub const IFF_NOARP: i16 = 0x80;
+pub const IFF_PROMISC: i16 = 0x100;
+pub const IFF_ALLMULTI: i16 = 0x200;
+pub const IFF_MASTER: i16 = 0x400;
+pub const IFF_SLAVE: i16 = 0x800;
+pub const IFF_MULTICAST: i16 = 0x1000;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union IfReqUnion {
+    pub addr: SockAddrIn,
+    pub ifindex: i32,
+    pub ifmtu: i32,
+    pub ifmetric: i32,
+    pub flags: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IfReq {
+    pub ifr_name: [u8; 16],
+    pub ifr_ifru: IfReqUnion,
+}
+
+impl IfReq {
+    pub fn name(&self) -> &str {
+        let len = self.ifr_name.iter().position(|&b| b == 0).unwrap_or(self.ifr_name.len());
+        core::str::from_utf8(&self.ifr_name[..len]).unwrap_or("")
+    }
+}
+
+#[repr(C)]
+pub struct IfConf {
+    pub ifc_len: i32,
+    pub ifc_buf: usize,
+}
+
 use numeric_enum_macro::numeric_enum;
 
 numeric_enum! {

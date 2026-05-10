@@ -227,6 +227,21 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     });
     tmp.mount(ramfs).expect("failed to mount RamFS");
 
+    // mount RamFS at /run (essential for dhcpcd and other daemons)
+    let run_ramfs = RamFS::new();
+    let run = root.find(true, "run").unwrap_or_else(|_| {
+        root.create("run", FileType::Dir, 0o755)
+            .expect("failed to mkdir /run")
+    });
+    run.mount(run_ramfs).expect("failed to mount RamFS at /run");
+
+    // Ensure /var/run exists and can be used (often it's a symlink or needs its own mount)
+    if let Ok(var) = root.find(true, "var") {
+        if var.find(true, "run").is_err() {
+            var.create("run", FileType::Dir, 0o755).ok();
+        }
+    }
+
     // mount ProcFS at /proc
     let proc = root.find(true, "proc").unwrap_or_else(|_| {
         root.create("proc", FileType::Dir, 0o666)

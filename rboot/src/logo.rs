@@ -5,12 +5,12 @@
 
 use uefi::proto::console::gop::{ModeInfo, PixelFormat};
 
-const LOGO_WIDTH: usize = 800;
-const LOGO_HEIGHT: usize = 250;
+pub const LOGO_WIDTH: usize = 800;
+pub const LOGO_HEIGHT: usize = 250;
 
 // NOTE: absolute path per request. Consider vendoring into `rboot/src/` later.
 const LOGO_DATA: &[u8] =
-    include_bytes!("/home/moebius/eclipse/eclipse_kernel/userspace/display_service/src/logo.raw");
+    include_bytes!("logo.raw");
 
 pub fn draw_centered(mode: ModeInfo, fb_addr: u64) {
     let (sw, sh) = mode.resolution();
