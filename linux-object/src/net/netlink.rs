@@ -287,19 +287,7 @@ impl Socket for NetlinkSocketState {
                     }
                 }
                 // ACK (error=0)
-                let ack = NetlinkMessageHeader {
-                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
-                    nlmsg_type: NetlinkMessageType::Error.into(),
-                    nlmsg_flags: NetlinkMessageFlags::empty(),
-                    nlmsg_seq: header.nlmsg_seq,
-                    nlmsg_pid: 0,
-                };
-                let mut msg = Vec::new();
-                msg.push_ext(ack);
-                msg.push_ext(0i32); // error = 0 means success
-                msg.align4();
-                msg.set_ext(0, msg.len() as u32);
-                buffer.push(msg);
+                push_ack(&mut buffer, header.nlmsg_seq);
             }
             NetlinkMessageType::NewRoute => {
                 // RTM_NEWROUTE: add a routing entry (default gateway etc.)
@@ -345,19 +333,7 @@ impl Socket for NetlinkSocketState {
                     }
                 }
                 // ACK
-                let ack = NetlinkMessageHeader {
-                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
-                    nlmsg_type: NetlinkMessageType::Error.into(),
-                    nlmsg_flags: NetlinkMessageFlags::empty(),
-                    nlmsg_seq: header.nlmsg_seq,
-                    nlmsg_pid: 0,
-                };
-                let mut msg = Vec::new();
-                msg.push_ext(ack);
-                msg.push_ext(0i32);
-                msg.align4();
-                msg.set_ext(0, msg.len() as u32);
-                buffer.push(msg);
+                push_ack(&mut buffer, header.nlmsg_seq);
             }
             NetlinkMessageType::GetRoute => {
                 // RTM_GETROUTE: dump the routing table.
@@ -373,37 +349,13 @@ impl Socket for NetlinkSocketState {
                 // implemented yet (dhcpcd treats a non-fatal error gracefully,
                 // but a clean ACK avoids unnecessary log noise).
                 info!("[netlink] DelAddr: ACK (address removal not yet implemented)");
-                let ack = NetlinkMessageHeader {
-                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
-                    nlmsg_type: NetlinkMessageType::Error.into(),
-                    nlmsg_flags: NetlinkMessageFlags::empty(),
-                    nlmsg_seq: header.nlmsg_seq,
-                    nlmsg_pid: 0,
-                };
-                let mut msg = Vec::new();
-                msg.push_ext(ack);
-                msg.push_ext(0i32); // error = 0 means success
-                msg.align4();
-                msg.set_ext(0, msg.len() as u32);
-                buffer.push(msg);
+                push_ack(&mut buffer, header.nlmsg_seq);
             }
             NetlinkMessageType::DelRoute => {
                 // RTM_DELROUTE: remove a routing entry.
                 // Return a success ACK; same rationale as DelAddr above.
                 info!("[netlink] DelRoute: ACK (route removal not yet implemented)");
-                let ack = NetlinkMessageHeader {
-                    nlmsg_len: (size_of::<NetlinkMessageHeader>() + 4) as u32,
-                    nlmsg_type: NetlinkMessageType::Error.into(),
-                    nlmsg_flags: NetlinkMessageFlags::empty(),
-                    nlmsg_seq: header.nlmsg_seq,
-                    nlmsg_pid: 0,
-                };
-                let mut msg = Vec::new();
-                msg.push_ext(ack);
-                msg.push_ext(0i32); // error = 0 means success
-                msg.align4();
-                msg.set_ext(0, msg.len() as u32);
-                buffer.push(msg);
+                push_ack(&mut buffer, header.nlmsg_seq);
             }
             _ => {
                 // Unknown/unimplemented request: return NLMSG_ERROR with -EOPNOTSUPP.
@@ -731,6 +683,23 @@ fn push_rtattr_bytes(dst: &mut Vec<u8>, rta_type: u16, payload: &[u8]) {
 
 fn push_rtattr_u32(dst: &mut Vec<u8>, rta_type: u16, v: u32) {
     push_rtattr_bytes(dst, rta_type, &v.to_ne_bytes());
+}
+
+/// Build a success ACK (NLMSG_ERROR with error=0) and push it onto `buffer`.
+fn push_ack(buffer: &mut Vec<Vec<u8>>, seq: u32) {
+    let ack = NetlinkMessageHeader {
+        nlmsg_len: (size_of::<NetlinkMessageHeader>() + size_of::<i32>()) as u32,
+        nlmsg_type: NetlinkMessageType::Error.into(),
+        nlmsg_flags: NetlinkMessageFlags::empty(),
+        nlmsg_seq: seq,
+        nlmsg_pid: 0,
+    };
+    let mut msg = Vec::new();
+    msg.push_ext(ack);
+    msg.push_ext(0i32); // error = 0 means success
+    msg.align4();
+    msg.set_ext(0, msg.len() as u32);
+    buffer.push(msg);
 }
 
 fn ipv4_broadcast(addr: smoltcp::wire::Ipv4Address, prefix_len: u8) -> smoltcp::wire::Ipv4Address {
