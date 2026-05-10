@@ -61,11 +61,18 @@ impl Syscall<'_> {
     ///   Each file descriptor in the child refers to the same open file description (see [`Self::sys_open`])
     ///   as the corresponding file descriptor in the parent.
     ///   This means that the two file descriptors share open file status flags and file offset.
-    pub fn sys_fork(&self) -> SysResult {
-        info!("fork:");
+    pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
+        error!("fork: enter");
+        info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process(), false)?; // old pt NULL here
         let new_thread = Thread::create_linux(&new_proc)?;
         let mut new_ctx = self.thread.context_cloned()?;
+        if newsp != 0 {
+            new_ctx.set_field(UserContextField::StackPointer, newsp);
+        }
+        if newtls != 0 {
+            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+        }
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
@@ -80,11 +87,18 @@ impl Syscall<'_> {
     /// `sys_vfork` differs from [`Self::sys_fork`] in that the calling thread is suspended until the child terminates
     /// (either normally, by calling [`Self::sys_exit`], or abnormally, after delivery of a fatal signal),
     /// or it makes a call to [`Self::sys_execve`].
-    pub async fn sys_vfork(&self) -> SysResult {
-        info!("vfork:");
+    pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
+        error!("vfork: enter");
+        info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process(), true)?;
         let new_thread = Thread::create_linux(&new_proc)?;
         let mut new_ctx = self.thread.context_cloned()?;
+        if newsp != 0 {
+            new_ctx.set_field(UserContextField::StackPointer, newsp);
+        }
+        if newtls != 0 {
+            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+        }
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
@@ -107,7 +121,7 @@ impl Syscall<'_> {
     /// > **NOTE!** This system call is not exactly the same as `clone` in Linux.
     ///
     /// > **NOTE!** This is partially implemented for `musl` only.
-    pub fn sys_clone(
+    pub async fn sys_clone(
         &self,
         flags: usize,
         newsp: usize,
@@ -115,6 +129,7 @@ impl Syscall<'_> {
         newtls: usize,
         mut child_tid: UserOutPtr<i32>,
     ) -> SysResult {
+        error!("clone: enter");
         let _flags = CloneFlags::from_bits_truncate(flags);
         info!(
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
@@ -127,24 +142,25 @@ impl Syscall<'_> {
         let has_thread = flags & CloneFlags::THREAD.bits() != 0;
         if !has_thread && (sigchld_bits == 0x11 || sigchld_bits == 0x00) && newsp == 0 {
             warn!("sys_clone is calling sys_fork for flags {:#x}", flags);
-            return self.sys_fork();
+            return self.sys_fork(0, 0);
         }
         if flags == 0x4111 {
             // VFORK | VM | SIGCHILD
-            warn!("sys_clone is calling sys_fork instead, ignoring other args");
-            return self.sys_fork();
+            warn!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
+            return self.sys_vfork(newsp, newtls).await;
         }
         if flags != 0x7d_0f00 && flags != 0x5d_0f00 {
             // 0x5d0f00: gcc of alpine linux
             // 0x7d0f00: pthread_create of alpine linux
             warn!("sys_clone: unsupported flags {:#x}, trying fork", flags);
-            return self.sys_fork();
+            return self.sys_fork(newsp, newtls);
         }
         let new_thread = Thread::create_linux(self.zircon_process())?;
         let mut new_ctx = self.thread.context_cloned()?;
         new_ctx.set_field(UserContextField::StackPointer, newsp);
         new_ctx.set_field(UserContextField::ThreadPointer, newtls);
         new_ctx.set_field(UserContextField::ReturnValue, 0);
+        info!("clone: tid_parent={} context={:#x?}", self.thread.id(), new_ctx);
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
 
@@ -265,18 +281,28 @@ impl Syscall<'_> {
         argv: UserInPtr<UserInPtr<u8>>,
         envp: UserInPtr<UserInPtr<u8>>,
     ) -> SysResult {
-        let path = path.as_c_str()?;
-        let args = argv.read_cstring_array()?;
+        error!("execve: enter");
+        let path_str = path.as_c_str().map_err(|e| {
+            error!("execve: path.as_c_str() failed: {:?}", e);
+            e
+        })?;
+        let args = argv.read_cstring_array().map_err(|e| {
+            error!("execve: argv.read_cstring_array() failed: {:?}", e);
+            e
+        })?;
         let mut envs: Vec<String> = Vec::new();
         if !envp.is_null() {
-            envs = envp.read_cstring_array()?;
+            envs = envp.read_cstring_array().map_err(|e| {
+                error!("execve: envp.read_cstring_array() failed: {:?}", e);
+                e
+            })?;
         }
         info!(
-            "execve: path: {:?}, argv: {:?}, envs: {:?}",
-            path, argv, envs
+            "execve: path: {:?}, args: {:?}, envs: {:?}",
+            path_str, args, envs
         );
         if args.is_empty() {
-            error!("execve: args is null");
+            error!("execve: args is empty");
             return Err(LxError::EINVAL);
         }
 
@@ -284,26 +310,26 @@ impl Syscall<'_> {
 
         // Read program file
         let proc = self.linux_process();
-        let inode = proc.lookup_inode(path)?;
+        let inode = proc.lookup_inode(path_str)?;
         let data = inode.read_as_vec()?;
 
         proc.remove_cloexec_files();
 
         // 注意！即将销毁旧应用程序的用户空间，现在将必要的信息拷贝到内核！
         // Notice! About to destroy the user space of the old application, now copy the necessary information into kernel!
-        let path = path.to_string();
+        let path_str = path_str.to_string();
         let vmar = self.zircon_process().vmar();
         vmar.clear()?;
 
         // Modify exec path
-        proc.set_execute_path(&path);
+        proc.set_execute_path(&path_str);
 
         let (entry, sp, initial_brk) = LinuxElfLoader {
             syscall_entry: self.syscall_entry,
             stack_pages: USER_STACK_PAGES,
             root_inode: proc.root_inode().clone(),
         }
-        .load(&vmar, &data, args, envs, path)?;
+        .load(&vmar, &data, args, envs, path_str)?;
         proc.set_brk(initial_brk);
 
         // TODO: use right signal

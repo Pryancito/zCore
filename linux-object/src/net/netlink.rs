@@ -5,13 +5,16 @@ use crate::fs::{OpenFlags, PollEvents, PollStatus};
 use crate::{
     error::{LxError, LxResult},
     fs::FileLike,
-    net::{AddressFamily, Endpoint, SockAddr, Socket, SysResult},
+    net::{
+        AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, IFF_BROADCAST, IFF_CHANGE_ALL,
+        IFF_LOWER_UP, IFF_RUNNING, IFF_UP,
+    },
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core::{mem::size_of, slice};
-use kernel_hal::{net::get_net_device, user::*};
+use kernel_hal::net::get_net_device;
 use kernel_hal::thread;
 use lock::Mutex;
 use smoltcp::wire::IpCidr;
@@ -39,16 +42,7 @@ impl Default for NetlinkSocketState {
 }
 impl NetlinkSocketState {}
 
-// Linux ARPHRD_* hardware type constants
-const ARPHRD_ETHER: u16 = 1;
 
-// Linux IFF_* interface flag constants
-const IFF_UP: u32 = 0x1;
-const IFF_BROADCAST: u32 = 0x2;
-const IFF_RUNNING: u32 = 0x40;
-const IFF_LOWER_UP: u32 = 0x1_0000;
-// Mask meaning "all flags may change" used in ifi_change responses
-const IFF_CHANGE_ALL: u32 = 0xFFFF_FFFF;
 
 #[async_trait]
 impl Socket for NetlinkSocketState {
@@ -63,7 +57,9 @@ impl Socket for NetlinkSocketState {
                 if buffer.is_empty() {
                     None
                 } else {
-                    Some(buffer.remove(0))
+                    let msg = buffer.remove(0);
+                    info!("Netlink read: msg_type={:?}, len={}", NetlinkMessageType::from(u16::from_le_bytes([msg[4], msg[5]])), msg.len());
+                    Some(msg)
                 }
             };
 
@@ -91,11 +87,13 @@ impl Socket for NetlinkSocketState {
             return Err(LxError::EINVAL);
         }
         let message_type = NetlinkMessageType::from(header.nlmsg_type);
+        info!("Netlink write: message_type={:?}, len={}, seq={}", message_type, header.nlmsg_len, header.nlmsg_seq);
         let mut buffer = self.data.lock();
         buffer.clear();
         match message_type {
             NetlinkMessageType::GetLink => {
                 let ifaces = get_net_device();
+                info!("Netlink GetLink: found {} interfaces", ifaces.len());
                 for (i, iface) in ifaces.iter().enumerate() {
                     let mut msg = Vec::new();
                     let new_header = NetlinkMessageHeader {
@@ -753,20 +751,4 @@ impl VecExt for Vec<u8> {
     }
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct MsgHdr {
-    pub msg_name: UserInOutPtr<SockAddr>,
-    pub msg_namelen: u32,
-    pub msg_iov: UserInPtr<IoVecOut>,
-    pub msg_iovlen: usize,
-    pub msg_control: usize,
-    pub msg_controllen: usize,
-    pub msg_flags: usize,
-}
 
-impl MsgHdr {
-    pub fn set_msg_name_len(&mut self, len: u32) {
-        self.msg_namelen = len;
-    }
-}

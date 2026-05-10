@@ -1,12 +1,10 @@
 use super::{phys_to_virt, PAGE_SIZE};
 use crate::builder::IoMapper;
-#[cfg(feature = "xhci-usb-hid")]
 use crate::scheme::SchemeUpcast;
+const PCI_COMMAND: u16 = 0x04;
 use crate::{Device, DeviceError, DeviceResult};
 use alloc::{format, sync::Arc, vec::Vec};
 use pci::*;
-
-const PCI_COMMAND: u16 = 0x04;
 const BAR0: u16 = 0x10;
 const BAR5_REG: u16 = 0x24;
 const PCI_CAP_PTR: u16 = 0x34;
@@ -244,10 +242,18 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
 }
 
 pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
-    let name = format!("enp{}s{}f{}", dev.loc.bus, dev.loc.device, dev.loc.function);
+    static NET_IF_COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let next_name = || {
+        format!(
+            "eth{}",
+            NET_IF_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+        )
+    };
+
     match (dev.id.vendor_id, dev.id.device_id) {
         // ---- e1000 (QEMU virtio-style emulation: 82540EM) ----
         (0x8086, 0x100e) | (0x8086, 0x100f) => {
+            let name = next_name();
             if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
                 #[cfg(target_arch = "riscv64")]
                 let addr = if addr == 0 { E1000_BASE as u64 } else { addr };
@@ -301,6 +307,7 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             0x57a0 | 0x57a1 | 0x57b3
             ) =>
         {
+            let name = next_name();
             // Read BAR0 (may be 64-bit)
             let bar0_addr: u64 = {
                 if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {

@@ -758,6 +758,7 @@ impl VmMapping {
             page_table,
             vmo: vmo.clone(),
         });
+        info!("VmMapping::new: addr={:#x}, size={:#x}, vmo_id={}", addr, size, vmo.id());
         vmo.append_mapping(Arc::downgrade(&mapping));
         mapping
     }
@@ -1013,6 +1014,9 @@ impl VmMappingInner {
 
 impl Drop for VmMapping {
     fn drop(&mut self) {
+        let inner = self.inner.lock();
+        info!("VmMapping::drop: addr={:#x}, size={:#x}", inner.addr, inner.size);
+        drop(inner);
         self.unmap();
     }
 }

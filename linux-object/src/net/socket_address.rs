@@ -16,6 +16,7 @@ use super::MsgHdr;
 
 /// missing documentation
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub union SockAddr {
     /// missing documentation
     pub family: u16,
@@ -117,6 +118,10 @@ pub enum Endpoint {
 pub struct LinkLevelEndpoint {
     /// missing documentation
     pub interface_index: usize,
+    /// Hardware address (e.g. MAC)
+    pub addr: [u8; 8],
+    /// Hardware address length
+    pub halen: u8,
 }
 
 impl LinkLevelEndpoint {
@@ -124,6 +129,8 @@ impl LinkLevelEndpoint {
     pub fn new(ifindex: usize) -> Self {
         LinkLevelEndpoint {
             interface_index: ifindex,
+            addr: [0; 8],
+            halen: 0,
         }
     }
 }
@@ -171,15 +178,17 @@ impl From<Endpoint> for SockAddr {
                 _ => unimplemented!("only ipv4"),
             }
         } else if let Endpoint::LinkLevel(link_level) = endpoint {
+            let mut sll_addr = [0u8; 8];
+            sll_addr.copy_from_slice(&link_level.addr);
             SockAddr {
                 addr_ll: SockAddrLl {
                     sll_family: AddressFamily::Packet.into(),
                     sll_protocol: 0,
                     sll_ifindex: link_level.interface_index as u32,
-                    sll_hatype: 0,
+                    sll_hatype: ARPHRD_ETHER, // Assume Ethernet
                     sll_pkttype: 0,
-                    sll_halen: 0,
-                    sll_addr: [0; 8],
+                    sll_halen: link_level.halen,
+                    sll_addr,
                 },
             }
         } else if let Endpoint::Netlink(netlink) = endpoint {
@@ -225,9 +234,12 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
                 ));
                 Ok(Endpoint::Ip((addr, port).into()))
             }
-            AddressFamily::Packet => Ok(Endpoint::LinkLevel(LinkLevelEndpoint::new(
-                addr.addr_ll.sll_ifindex as usize,
-            ))),
+            AddressFamily::Packet => {
+                let mut endpoint = LinkLevelEndpoint::new(addr.addr_ll.sll_ifindex as usize);
+                endpoint.halen = addr.addr_ll.sll_halen;
+                endpoint.addr.copy_from_slice(&addr.addr_ll.sll_addr);
+                Ok(Endpoint::LinkLevel(endpoint))
+            }
             AddressFamily::Netlink => Ok(Endpoint::Netlink(NetlinkEndpoint::new(
                 addr.addr_nl.nl_pid,
                 addr.addr_nl.nl_groups,
@@ -322,31 +334,27 @@ impl SockAddr {
         Ok(0)
     }
 
-    /// # Safety
-    /// Write to msg
-    /// Check mutability for user
-    #[allow(dead_code)]
-    pub fn write_to_msg(self, mut msg: UserInOutPtr<MsgHdr>) -> SysResult {
+    pub fn write_to_msg(&self, mut msg: UserInOutPtr<MsgHdr>) -> SysResult {
         if msg.is_null() {
             return Ok(0);
         }
-        let mut hdr = msg.read().unwrap();
+        let mut hdr = msg.read()?;
 
         let max_addr_len = hdr.msg_namelen as usize;
         let full_len = self.len()?;
         let written_len = min(max_addr_len, full_len);
         hdr.set_msg_name_len(full_len as u32);
 
-        use core::slice;
-
-        #[allow(unsafe_code)]
-        unsafe {
-            let source = slice::from_raw_parts(&self as *const SockAddr as *const u8, written_len);
-            let mut addr: UserOutPtr<u8> = core::mem::transmute(hdr.msg_name);
-            addr.write_array(source)?;
+        if written_len > 0 && !hdr.msg_name.is_null() {
+            #[allow(unsafe_code)]
+            unsafe {
+                let source = core::slice::from_raw_parts(self as *const SockAddr as *const u8, written_len);
+                // Use transmute_copy to convert UserInOutPtr<SockAddr> to UserOutPtr<u8> for byte-wise writing
+                let mut addr_ptr: UserOutPtr<u8> = core::mem::transmute_copy(&hdr.msg_name);
+                addr_ptr.write_array(source)?;
+            }
         }
-        // Write back the updated MsgHdr so that msg_namelen reflects the
-        // actual size of the sender address written into msg_name.
+        
         msg.write(hdr)?;
         Ok(0)
     }

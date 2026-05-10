@@ -308,7 +308,7 @@ impl Syscall<'_> {
         let [a0, a1, a2, a3, a4, _a5] = args;
         debug!("aarch6464_syscall: {:?}, args: {:?}", sys_type, args);
         match sys_type {
-            Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a3, a4.into()),
+            Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a3, a4.into()).await,
             _ => self.unknown_syscall(sys_type),
         }
     }
@@ -330,8 +330,8 @@ impl Syscall<'_> {
             }
             Sys::DUP2 => self.sys_dup2(a0.into(), a1.into()),
             //            Sys::ALARM => self.unimplemented("alarm", Ok(0)),
-            Sys::FORK => self.sys_fork(),
-            Sys::VFORK => self.sys_vfork().await,
+            Sys::FORK => self.sys_fork(0, 0),
+            Sys::VFORK => self.sys_vfork(0, 0).await,
             Sys::RENAME => self.sys_rename(a0.into(), a1.into()),
             Sys::MKDIR => self.sys_mkdir(a0.into(), a1),
             Sys::RMDIR => self.sys_rmdir(a0.into()),
@@ -342,7 +342,7 @@ impl Syscall<'_> {
             Sys::CHOWN => self.unimplemented("chown", Ok(0)),
             Sys::ARCH_PRCTL => self.sys_arch_prctl(a0 as _, a1),
             Sys::TIME => self.sys_time(a0.into()),
-            Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a4, a3.into()),
+            Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a4, a3.into()).await,
             Sys::EPOLL_CREATE => self.sys_epoll_create(a0),
             Sys::EPOLL_WAIT => self.sys_epoll_wait(a0.into(), a1.into(), a2, a3 as isize).await,
             _ => self.unknown_syscall(sys_type),
@@ -354,7 +354,7 @@ impl Syscall<'_> {
         let [a0, a1, a2, a3, a4, _a5] = args;
         match sys_type {
             //Sys::OPEN => self.sys_open(a0.into(), a1, a2),
-            Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a3, a4.into()),
+            Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a3, a4.into()).await,
             _ => self.unknown_syscall(sys_type),
         }
     }

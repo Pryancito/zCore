@@ -29,7 +29,12 @@ hal_fn_impl! {
 
         fn flush_tlb(vaddr: Option<VirtAddr>) {
             if let Some(vaddr) = vaddr {
-                tlb::flush(x86_64::VirtAddr::new(vaddr as u64))
+                let v = vaddr as u64;
+                if v <= 0x0000_7fff_ffff_ffff || v >= 0xffff_8000_0000_0000 {
+                    tlb::flush(x86_64::VirtAddr::new(v));
+                } else {
+                    warn!("flush_tlb: non-canonical vaddr {:#x}", vaddr);
+                }
             } else {
                 tlb::flush_all()
             }

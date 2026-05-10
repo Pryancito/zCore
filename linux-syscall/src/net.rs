@@ -297,11 +297,11 @@ impl Syscall<'_> {
         &mut self,
         sockfd: usize,
         msg: UserInPtr<MsgHdr>,
-        flags: usize,
+        _flags: usize,
     ) -> SysResult {
         info!(
-            "sys_sendmsg: sockfd:{}, msg:{:?}, flags:{}",
-            sockfd, msg, flags
+            "sys_sendmsg: sockfd:{:?}, msg:{:?}, flags:{}",
+            sockfd, msg, _flags
         );
         let hdr = msg.read()?;
         let iov_ptr: UserInPtr<IoVecIn> = unsafe { core::mem::transmute(hdr.msg_iov) };
@@ -326,11 +326,11 @@ impl Syscall<'_> {
         &mut self,
         sockfd: usize,
         msg: UserInOutPtr<MsgHdr>,
-        flags: usize,
+        _flags: usize,
     ) -> SysResult {
         info!(
             "sys_recvmsg: sockfd:{}, msg:{:?}, flags:{}",
-            sockfd, msg, flags
+            sockfd, msg, _flags
         );
         let hdr = msg.read()?;
 

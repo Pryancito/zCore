@@ -54,8 +54,9 @@ impl LinuxElfLoader {
         args: Vec<String>,
         envs: Vec<String>,
         path: String,
-        depth: usize,
+        recursion: u8,
     ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
+        error!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
         debug!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
             vmar.get_info(),
@@ -64,14 +65,17 @@ impl LinuxElfLoader {
             envs
         );
 
-        if depth > Self::MAX_INTERP_DEPTH {
-            error!("load: interpreter chain too deep (depth={})", depth);
+        if recursion as usize > Self::MAX_INTERP_DEPTH {
+            error!("load: interpreter chain too deep (depth={})", recursion);
             return Err(ZxError::INVALID_ARGS.into());
         }
 
         // Handle shebang scripts (#!).
         // Limit scan to the first 512 bytes to match typical OS shebang length restrictions.
-        if data.starts_with(b"#!") {
+        if data.starts_with(b"\x7fELF") {
+            error!("elf: detected ELF for {:?}", path);
+        } else if data.starts_with(b"#!") {
+            error!("elf: detected shebang for {:?}", path);
             let scan_limit = data.len().min(512);
             let newline = data[..scan_limit]
                 .iter()
@@ -88,12 +92,19 @@ impl LinuxElfLoader {
                 _ => return Err(ZxError::INVALID_ARGS.into()),
             };
             let interp_arg = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
-            info!(
+            error!(
                 "shebang: interp={:?}, arg={:?}, script={:?}",
                 interp, interp_arg, path
             );
-            let inode = self.root_inode.lookup(interp)?;
-            let interp_data = inode.read_as_vec()?;
+            let interp_rel = interp.trim_start_matches('/');
+            let inode = self.root_inode.lookup(interp_rel).map_err(|e| {
+                error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
+                e
+            })?;
+            let interp_data = inode.read_as_vec().map_err(|e| {
+                error!("shebang: read interp {:?} failed: {:?}", interp_rel, e);
+                e
+            })?;
             let interp_path: String = interp.into();
             let mut new_args = vec![interp_path.clone()];
             if let Some(arg) = interp_arg {
@@ -101,7 +112,7 @@ impl LinuxElfLoader {
             }
             new_args.push(path);
             new_args.extend_from_slice(args.get(1..).unwrap_or_default());
-            return self.load_impl(vmar, &interp_data, new_args, envs, interp_path, depth + 1);
+            return self.load_impl(vmar, &interp_data, new_args, envs, interp_path, recursion + 1);
         }
 
         let elf = ElfFile::new(data).map_err(|_| ZxError::INVALID_ARGS)?;
@@ -114,9 +125,15 @@ impl LinuxElfLoader {
             // Load the main program into the first sub-VMAR (allocated at offset 0 in an
             // empty address space, so app_base is typically 0 for a non-PIE binary).
             let app_size = elf.load_segment_size();
-            let app_vmar = vmar.allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
+            let app_vmar = vmar.allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
+                error!("elf: allocate vmar for app size {:#x} failed: {:?}", app_size, e);
+                e
+            })?;
             let app_base = app_vmar.addr();
-            let app_vmo = app_vmar.load_from_elf(&elf)?;
+            let app_vmo = app_vmar.load_from_elf(&elf).map_err(|e| {
+                error!("elf: load app from elf failed: {:?}", e);
+                e
+            })?;
             let app_entry = app_base + elf.header.pt2.entry_point() as usize;
 
             // Patch any in-binary syscall-entry trampoline present in the main program.
@@ -133,14 +150,26 @@ impl LinuxElfLoader {
             // the already-kernel-mapped binary via AT_PHDR / AT_ENTRY instead of calling
             // mmap() from user space to re-load it – which is the path that breaks in the
             // fork+execve case and causes a page fault at the raw e_entry (e.g. 0x423a7).
-            let inode = self.root_inode.lookup(interp)?;
+            let inode = self.root_inode.lookup(interp).map_err(|e| {
+                error!("elf: lookup interp {:?} failed: {:?}", interp, e);
+                e
+            })?;
             let interp_data = inode.read_as_vec()?;
-            let interp_elf = ElfFile::new(&interp_data).map_err(|_| ZxError::INVALID_ARGS)?;
+            let interp_elf = ElfFile::new(&interp_data).map_err(|_| {
+                error!("elf: interp {:?} is not a valid ELF", interp);
+                ZxError::INVALID_ARGS
+            })?;
             let interp_size = interp_elf.load_segment_size();
             let interp_vmar =
-                vmar.allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
+                vmar.allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
+                    error!("elf: allocate vmar for interp {:?} size {:#x} failed: {:?}", interp, interp_size, e);
+                    e
+                })?;
             let interp_base = interp_vmar.addr();
-            let _interp_vmo = interp_vmar.load_from_elf(&interp_elf)?;
+            let _interp_vmo = interp_vmar.load_from_elf(&interp_elf).map_err(|e| {
+                error!("elf: load interp {:?} from elf failed: {:?}", interp, e);
+                e
+            })?;
             let interp_entry = interp_base + interp_elf.header.pt2.entry_point() as usize;
 
             match interp_elf.relocate(interp_vmar) {

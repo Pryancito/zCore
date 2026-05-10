@@ -361,12 +361,28 @@ impl Socket for UdpSocketState {
                 Ok(0)
             }
 
+            // SIOCGIFINDEX: get interface index
+            SIOCGIFINDEX => {
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+                let ifname = ifreq_name(&ifr.ifr_name)?;
+                let ifaces = kernel_hal::drivers::all_net();
+                for (i, iface) in ifaces.as_vec().iter().enumerate() {
+                    if iface.get_ifname() == ifname {
+                        ifr.ifr_ifru = IfReqUnion { ifindex: (i + 1) as i32 };
+                        return Ok(0);
+                    }
+                }
+                error!("  NOT FOUND!");
+                Err(LxError::ENODEV)
+            }
+
             // SIOCGIFFLAGS: get interface flags
             SIOCGIFFLAGS => {
                 #[allow(unsafe_code)]
                 let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
                 ifr.ifr_ifru = IfReqUnion {
-                    flags: IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST,
+                    flags: (IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST) as i16,
                 };
                 Ok(0)
             }
@@ -434,45 +450,21 @@ impl Socket for UdpSocketState {
                 #[allow(unsafe_code)]
                 let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
                 let ifname = ifreq_name(&ifr.ifr_name)?;
-                let iface = iface_by_name(ifname)?;
-                let mac = iface.get_mac();
-                // Ethernet family is ARPHRD_ETHER (1)
-                ifr.ifr_ifru = IfReqUnion {
-                    addr: SockAddrIn {
-                        sin_family: 1,
-                        sin_port: 0,
-                        sin_addr: u32::from_ne_bytes([
-                            mac.as_bytes()[0],
-                            mac.as_bytes()[1],
-                            mac.as_bytes()[2],
-                            mac.as_bytes()[3],
-                        ]),
-                        sin_zero: [
-                            mac.as_bytes()[4],
-                            mac.as_bytes()[5],
-                            0, 0, 0, 0, 0, 0,
-                        ],
-                    },
-                };
-                Ok(0)
+                let ifaces = kernel_hal::drivers::all_net();
+                for iface in ifaces.as_vec().iter() {
+                    if iface.get_ifname() == ifname {
+                        let mac = iface.get_mac();
+                        unsafe {
+                            ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_ETHER;
+                            ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
+                        }
+                        return Ok(0);
+                    }
+                }
+                error!("  NOT FOUND!");
+                Err(LxError::ENODEV)
             }
 
-            // SIOCGIFINDEX: get interface index
-            SIOCGIFINDEX => {
-                #[allow(unsafe_code)]
-                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
-                let ifname = ifreq_name(&ifr.ifr_name)?;
-                let ifaces = get_net_device();
-                let index = ifaces.iter().position(|iface| iface.get_ifname() == ifname);
-                if let Some(idx) = index {
-                    ifr.ifr_ifru = IfReqUnion {
-                        ifindex: (idx + 1) as i32,
-                    };
-                    Ok(0)
-                } else {
-                    Err(LxError::ENODEV)
-                }
-            }
 
             // SIOCGIFMTU: get MTU
             SIOCGIFMTU => {

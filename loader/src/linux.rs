@@ -7,7 +7,7 @@ use linux_object::signal::{
 };
 
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
-use kernel_hal::interrupt::{intr_off, intr_on};
+use kernel_hal::interrupt::intr_on;
 use linux_object::fs::{vfs::FileSystem, INodeExt};
 use linux_object::thread::{CurrentThreadExt, ThreadExt};
 use linux_object::{loader::LinuxElfLoader, process::ProcessExt};
@@ -74,12 +74,12 @@ async fn run_user(thread: CurrentThread) {
         }
 
         // run
-        debug!(
-            "go to user: tid = {} pc = {:x}",
+        trace!("go to user: tid = {} pc = {:x} sp = {:x}",
             thread.id(),
-            ctx.get_field(UserContextField::InstrPointer)
+            ctx.get_field(UserContextField::InstrPointer),
+            ctx.get_field(UserContextField::StackPointer)
         );
-        trace!("ctx = {:#x?}", ctx);
+        trace!("ctx before enter: {:#x?}", ctx);
         ctx.enter_uspace();
         debug!(
             "back from user: tid = {} pc = {:x} trap reason = {:?}",
@@ -164,10 +164,13 @@ pub fn push_stack<T>(stack_top: usize, val: T) -> usize {
 }
 
 macro_rules! run_with_irq_enable {
-    ($($statements:stmt)*) => {
-        intr_on();
-        $($statements)*
-        intr_off();
+    ($($body:tt)*) => {
+        {
+            intr_on();
+            let ret = { $($body)* };
+            kernel_hal::interrupt::intr_off();
+            ret
+        }
     };
 }
 
@@ -183,10 +186,11 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             thread_fn,
             syscall_entry: kernel_hal::context::syscall_entry as *const () as usize,
         };
-        trace!("Syscall : {} {:x?}", num as u32, args);
-        run_with_irq_enable! {
-            let ret = syscall.syscall(num as u32, args).await as usize
-        }
+        trace!("Syscall: {} {:x?}", num as u32, args);
+        let ret = run_with_irq_enable! {
+            syscall.syscall(num as u32, args).await as usize
+        };
+        trace!("Syscall ret: {} -> {:x}", num as u32, ret);
         thread.with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))?;
         return Ok(());
     }

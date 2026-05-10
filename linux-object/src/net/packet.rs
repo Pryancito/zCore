@@ -12,8 +12,7 @@ use kernel_hal::{drivers, thread};
 use lock::Mutex;
 use zircon_object::object::*;
 use lazy_static::lazy_static;
-
-const ARPHRD_ETHER: u16 = 1;
+use smoltcp::wire::EthernetFrame;
 
 // Global list of active AF_PACKET sockets to implement packet tapping.
 lazy_static! {
@@ -40,7 +39,7 @@ impl PacketSocketState {
 #[async_trait]
 impl Socket for PacketSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        let endpoint = Endpoint::Ip(smoltcp::wire::IpEndpoint::UNSPECIFIED);
+        let mut endpoint = Endpoint::LinkLevel(LinkLevelEndpoint::new(*self.ifindex.lock() as usize));
         let non_block = self.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
@@ -49,10 +48,17 @@ impl Socket for PacketSocketState {
                 None => return (Err(LxError::ENODEV), endpoint),
             };
 
-            // This calls the driver's NetScheme::recv, which now reads from
-            // its independent raw_rx_queue (filled by the IRQ handler).
             match dev.recv(data) {
-                Ok(n) => return (Ok(n), endpoint),
+                Ok(n) => {
+                    // Try to parse Ethernet header to extract source MAC
+                    if let Ok(frame) = EthernetFrame::new_checked(&data[..n]) {
+                        if let Endpoint::LinkLevel(ref mut ll) = endpoint {
+                            ll.addr[..6].copy_from_slice(frame.src_addr().as_bytes());
+                            ll.halen = 6;
+                        }
+                    }
+                    return (Ok(n), endpoint);
+                }
                 Err(DeviceError::NotReady) => {
                     if non_block {
                         return (Err(LxError::EAGAIN), endpoint);
@@ -117,7 +123,7 @@ impl Socket for PacketSocketState {
                 let mut data = data;
                 // For now, all interfaces are always UP and RUNNING.
                 // We also assume they support BROADCAST and MULTICAST.
-                data.ifr_ifru.flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+                data.ifr_ifru.flags = (IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST) as i16;
                 ifr.write(data)?;
                 Ok(0)
             }
@@ -158,14 +164,8 @@ impl Socket for PacketSocketState {
                         let mut data = data;
                         let mac = iface.get_mac();
                         unsafe {
-                            data.ifr_ifru.addr.sin_family = ARPHRD_ETHER;
-                            data.ifr_ifru.addr.sin_addr = u32::from_ne_bytes([
-                                mac.as_bytes()[0],
-                                mac.as_bytes()[1],
-                                mac.as_bytes()[2],
-                                mac.as_bytes()[3],
-                            ]);
-                            data.ifr_ifru.addr.sin_zero[..2].copy_from_slice(&mac.as_bytes()[4..6]);
+                            data.ifr_ifru.hwaddr.sa_family = ARPHRD_ETHER;
+                            data.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
                         }
                         ifr.write(data)?;
                         return Ok(0);

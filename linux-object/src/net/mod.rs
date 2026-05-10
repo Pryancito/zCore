@@ -5,8 +5,10 @@
 #[macro_use]
 pub mod socket_address;
 use crate::fs::{FileLike, PollEvents};
+use kernel_hal::user::{IoVecOut, UserInPtr, UserInOutPtr};
 use smoltcp::wire::IpEndpoint;
 pub use socket_address::*;
+
 
 /// missing documentation
 pub mod tcp;
@@ -108,25 +110,37 @@ pub const SIOCGIFMTU: usize = 0x8921;
 pub const SIOCGIFHWADDR: usize = 0x8927;
 pub const SIOCGIFINDEX: usize = 0x8933;
 pub const SIOCGARP: usize = 0x8954;
+pub const ARPHRD_ETHER: u16 = 1;
 
-pub const IFF_UP: i16 = 0x1;
-pub const IFF_BROADCAST: i16 = 0x2;
-pub const IFF_DEBUG: i16 = 0x4;
-pub const IFF_LOOPBACK: i16 = 0x8;
-pub const IFF_POINTOPOINT: i16 = 0x10;
-pub const IFF_NOTRAILERS: i16 = 0x20;
-pub const IFF_RUNNING: i16 = 0x40;
-pub const IFF_NOARP: i16 = 0x80;
-pub const IFF_PROMISC: i16 = 0x100;
-pub const IFF_ALLMULTI: i16 = 0x200;
-pub const IFF_MASTER: i16 = 0x400;
-pub const IFF_SLAVE: i16 = 0x800;
-pub const IFF_MULTICAST: i16 = 0x1000;
+pub const IFF_UP: u32 = 0x1;
+pub const IFF_BROADCAST: u32 = 0x2;
+pub const IFF_DEBUG: u32 = 0x4;
+pub const IFF_LOOPBACK: u32 = 0x8;
+pub const IFF_POINTOPOINT: u32 = 0x10;
+pub const IFF_NOTRAILERS: u32 = 0x20;
+pub const IFF_RUNNING: u32 = 0x40;
+pub const IFF_NOARP: u32 = 0x80;
+pub const IFF_PROMISC: u32 = 0x100;
+pub const IFF_ALLMULTI: u32 = 0x200;
+pub const IFF_MASTER: u32 = 0x400;
+pub const IFF_SLAVE: u32 = 0x800;
+pub const IFF_MULTICAST: u32 = 0x1000;
+pub const IFF_LOWER_UP: u32 = 0x1_0000;
+pub const IFF_CHANGE_ALL: u32 = 0xFFFF_FFFF;
+
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockAddrHw {
+    pub sa_family: u16,
+    pub sa_data: [u8; 14],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union IfReqUnion {
     pub addr: SockAddrIn,
+    pub hwaddr: SockAddrHw,
     pub ifindex: i32,
     pub ifmtu: i32,
     pub ifmetric: i32,
@@ -240,6 +254,26 @@ numeric_enum! {
         IPPROTO_TCP = 6,
     }
 }
+
+#[repr(C)]
+pub struct MsgHdr {
+    pub msg_name: UserInOutPtr<SockAddr>,
+    pub msg_namelen: u32,
+    _pad1: u32,
+    pub msg_iov: UserInPtr<IoVecOut>,
+    pub msg_iovlen: usize,
+    pub msg_control: UserInOutPtr<u8>,
+    pub msg_controllen: usize,
+    pub msg_flags: i32,
+    _pad2: i32,
+}
+
+impl MsgHdr {
+    pub fn set_msg_name_len(&mut self, len: u32) {
+        self.msg_namelen = len;
+    }
+}
+
 
 numeric_enum! {
     #[repr(usize)]
