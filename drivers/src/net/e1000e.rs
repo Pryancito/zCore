@@ -194,10 +194,12 @@ impl E1000eHw {
     fn recycle_rx_desc(&mut self, idx: usize, desc: &mut RxDesc) {
         desc.status = 0;
         desc.errors = 0;
-        desc.addr = self.rx_bufs_pa[idx] as u64;
         fence(Ordering::SeqCst);
-        self.rx_tail = idx;
+        self.rx_tail = (idx + 1) % NUM_RX;
+        // RDT should point to the last descriptor available to the NIC.
+        // That is the one just before the one we are about to check.
         unsafe { mmio_write(self.base, E1000E_RDT, idx as u32) };
+        fence(Ordering::SeqCst);
     }
 
     // -----------------------------------------------------------------------
@@ -418,8 +420,9 @@ impl E1000eHw {
             E1000E_RDLEN,
             (NUM_RX * size_of::<RxDesc>()) as u32,
         );
-        mmio_write(self.base, E1000E_RDH, 0);
-        mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32);
+        unsafe { mmio_write(self.base, E1000E_RDH, 0) };
+        unsafe { mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32) };
+        self.rx_tail = 0; // rx_tail now tracks the next descriptor to check
         mmio_write(
             self.base,
             E1000E_RCTL,
@@ -448,8 +451,8 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     fn receive(&mut self) -> Option<Vec<u8>> {
         let ring = self.rx_ring_va as *mut RxDesc;
-        let next = (self.rx_tail + 1) % NUM_RX;
-        let desc = unsafe { &mut *ring.add(next) };
+        let idx = self.rx_tail;
+        let desc = unsafe { &mut *ring.add(idx) };
 
         fence(Ordering::SeqCst);
         // Status bit 0 = DD (Descriptor Done)
@@ -458,14 +461,14 @@ impl E1000eHw {
         }
         // Must be a complete frame and fit in our DMA buffer.
         if desc.status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
-            self.recycle_rx_desc(next, desc);
+            self.recycle_rx_desc(idx, desc);
             return None;
         }
         let len = desc.len as usize;
-        let buf = unsafe { core::slice::from_raw_parts(self.rx_bufs_va[next] as *const u8, len) };
+        let buf = unsafe { core::slice::from_raw_parts(self.rx_bufs_va[idx] as *const u8, len) };
         let pkt = buf.to_vec();
 
-        self.recycle_rx_desc(next, desc);
+        self.recycle_rx_desc(idx, desc);
         Some(pkt)
     }
 
@@ -572,21 +575,17 @@ impl Scheme for E1000eInterface {
         if irq != self.irq {
             return;
         }
-        let had_data = self.driver.hw.lock().handle_interrupt();
-        if had_data {
+        let mut hw = self.driver.hw.lock();
+        if hw.handle_interrupt() {
             // Duplicate all pending frames into both queues.
-            loop {
-                let frame = self.driver.hw.lock().receive();
-                match frame {
-                    Some(pkt) => {
-                        // Push to AF_PACKET queue
-                        self.raw_rx_queue.lock().push_back(pkt.clone());
-                        // Push to kernel stack queue
-                        self.driver.stack_rx_queue.lock().push_back(pkt);
-                    }
-                    None => break,
-                }
+            while let Some(pkt) = hw.receive() {
+                // Push to AF_PACKET queue
+                self.raw_rx_queue.lock().push_back(pkt.clone());
+                // Push to kernel stack queue
+                self.driver.stack_rx_queue.lock().push_back(pkt);
             }
+            drop(hw); // Release lock before polling smoltcp
+
             // Also let smoltcp poll for TX completion / ARP / TCP state.
             let ts = Instant::from_micros(timer_now_as_micros() as i64);
             let sockets = get_sockets();
@@ -648,14 +647,14 @@ impl NetScheme for E1000eInterface {
         }
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
+        info!("[e1000e] sending {} bytes", data.len());
         let mut hw = self.driver.hw.lock();
         hw.send(data)?;
         Ok(data.len())
     }
 
     fn can_recv(&self) -> bool {
-        // Cannot peek without consuming; callers must attempt recv().
-        true
+        !self.raw_rx_queue.lock().is_empty()
     }
 
     fn can_send(&self) -> bool {

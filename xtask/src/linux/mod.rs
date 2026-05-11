@@ -221,6 +221,15 @@ impl LinuxRootfs {
             let _ = dir::rm(&dst);
             fs::copy(&nl_dump, &dst).unwrap();
         }
+
+        // 拷贝 edhcpc (Eclipse DHCPv4 client).
+        // This is a static, minimal DHCPv4 client that uses rtnetlink to apply IP/gw.
+        let edhcpc = self.edhcpc(&musl);
+        if edhcpc.is_file() {
+            let dst = bin.join("edhcpc");
+            let _ = dir::rm(&dst);
+            fs::copy(&edhcpc, &dst).unwrap();
+        }
     }
 
     /// 将 musl 动态库放入 rootfs。
@@ -475,6 +484,50 @@ cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz'
             .status();
         if !status.success() {
             println!("Failed to compile nl_dump");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// 编译 edhcpc (static DHCPv4 client for Eclipse OS).
+    fn edhcpc(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("edhcpc");
+        let executable = dir.join("edhcpc");
+        let source = dir.join("edhcpc.c");
+        // Rebuild if missing or if source is newer than the binary.
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified())
+                {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling edhcpc...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile edhcpc");
             return executable;
         }
 
