@@ -109,7 +109,7 @@ impl Syscall<'_> {
             self.zircon_process().id(),
             new_proc.id()
         );
-        new_proc.wait_signal(Signal::SIGNALED).await; // wait for execve
+        new_proc.wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED).await; // wait for execve or termination
         Ok(new_proc.id() as usize)
     }
 
@@ -348,7 +348,7 @@ impl Syscall<'_> {
         proc.set_execute_path(&execute_path);
         proc.set_brk(initial_brk);
 
-        self.zircon_process().signal_set(Signal::SIGNALED);
+        self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
         self.thread.with_context(|ctx| {
             *ctx = UserContext::new();
             ctx.setup_uspace(entry, sp, &[0, 0, 0]);
@@ -401,7 +401,7 @@ impl Syscall<'_> {
     pub fn sys_exit(&mut self, exit_code: i32) -> SysResult {
         info!("exit: code={}", exit_code);
         self.thread.exit_linux(exit_code);
-        Err(LxError::ENOSYS)
+        Ok(0)
     }
 
     /// `sys_exit_group` is equivalent to [`Self::sys_exit`]
@@ -413,7 +413,7 @@ impl Syscall<'_> {
         info!("exit_group: code={}", exit_code);
         let proc = self.zircon_process();
         proc.exit(exit_code as i64);
-        Err(LxError::ENOSYS)
+        Ok(0)
     }
 
     /// Allows the calling thread to sleep for
