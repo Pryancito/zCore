@@ -364,60 +364,87 @@ static int send_dhcp_packet(int pfd, const uint8_t mac[6], const uint8_t *dhcp, 
     return (n < 0) ? -1 : 0;
 }
 
-static int recv_dhcp_packet(int pfd, uint32_t xid_be, struct dhcp_offer *offer_out, int *msg_type_out,
-                            uint32_t deadline_ms) {
+static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32_t xid_be,
+                              struct dhcp_offer *offer_out, int *msg_type_out) {
+    if (payload_len < offsetof(struct dhcp_msg, options)) return -1;
+    const struct dhcp_msg *m = (const struct dhcp_msg *)payload;
+    if (m->op != BOOTREPLY) return -1;
+    if (m->xid != xid_be) return -1;
+    if (ntohl(m->cookie) != 0x63825363) return -1;
+
+    struct dhcp_offer o;
+    int mt = 0;
+    size_t opt_off = offsetof(struct dhcp_msg, options);
+    if (payload_len <= opt_off) return -1;
+    parse_options((const uint8_t *)m->options, payload_len - opt_off, &mt, &o);
+    if (mt == 0) return -1;
+    o.yiaddr = m->yiaddr;
+    *offer_out = o;
+    *msg_type_out = mt;
+    return 0;
+}
+
+static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer *offer_out,
+                                     int *msg_type_out) {
     uint8_t buf[2048];
+    ssize_t n = recv(pfd, buf, sizeof(buf), 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+        return -1;
+    }
+    if ((size_t)n < sizeof(struct ether_header) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr)) return 1;
+
+    const struct ether_header *eth = (const struct ether_header *)buf;
+    if (ntohs(eth->ether_type) != ETHERTYPE_IP) return 1;
+
+    const struct ipv4_hdr *ip = (const struct ipv4_hdr *)(buf + sizeof(*eth));
+    const uint8_t ihl = (uint8_t)((ip->ver_ihl & 0x0f) * 4);
+    if ((ip->ver_ihl >> 4) != 4) return 1;
+    if (ihl < sizeof(struct ipv4_hdr)) return 1;
+    if (ip->proto != 17) return 1;
+
+    if ((size_t)n < sizeof(*eth) + ihl + sizeof(struct udp_hdr)) return 1;
+    const struct udp_hdr *udp = (const struct udp_hdr *)(buf + sizeof(*eth) + ihl);
+    if (ntohs(udp->dport) != DHCP_CLIENT_PORT) return 1;
+    if (ntohs(udp->sport) != DHCP_SERVER_PORT) return 1;
+
+    const uint16_t ulen = ntohs(udp->len);
+    if (ulen < sizeof(struct udp_hdr)) return 1;
+    const size_t payload_len = (size_t)ulen - sizeof(struct udp_hdr);
+    const uint8_t *payload = (const uint8_t *)udp + sizeof(struct udp_hdr);
+    if ((const uint8_t *)payload + payload_len > buf + n) return 1;
+
+    if (parse_dhcp_payload(payload, payload_len, xid_be, offer_out, msg_type_out) == 0) return 0;
+    return 1;
+}
+
+static int try_recv_dhcp_udp_once(int fd, uint32_t xid_be, struct dhcp_offer *offer_out, int *msg_type_out) {
+    uint8_t buf[2048];
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+        return -1;
+    }
+    if (n <= 0) return 1;
+    if (parse_dhcp_payload(buf, (size_t)n, xid_be, offer_out, msg_type_out) == 0) return 0;
+    return 1;
+}
+
+static int recv_dhcp_message_any(int pfd, int fd, uint32_t xid_be, struct dhcp_offer *offer_out,
+                                 int *msg_type_out, uint32_t deadline_ms) {
     for (;;) {
         uint32_t t = now_ms();
         if (t >= deadline_ms) return -1;
 
-        ssize_t n = recv(pfd, buf, sizeof(buf), 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(50 * 1000);
-                continue;
-            }
-            return -1;
-        }
-        if ((size_t)n < sizeof(struct ether_header) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr))
-            continue;
+        int pr = try_recv_dhcp_packet_once(pfd, xid_be, offer_out, msg_type_out);
+        if (pr == 0) return 0;
+        if (pr < 0) return -1;
 
-        const struct ether_header *eth = (const struct ether_header *)buf;
-        if (ntohs(eth->ether_type) != ETHERTYPE_IP) continue;
+        int ur = try_recv_dhcp_udp_once(fd, xid_be, offer_out, msg_type_out);
+        if (ur == 0) return 0;
+        if (ur < 0) return -1;
 
-        const struct ipv4_hdr *ip = (const struct ipv4_hdr *)(buf + sizeof(*eth));
-        const uint8_t ihl = (uint8_t)((ip->ver_ihl & 0x0f) * 4);
-        if ((ip->ver_ihl >> 4) != 4) continue;
-        if (ihl < sizeof(struct ipv4_hdr)) continue;
-        if (ip->proto != 17) continue;
-
-        if ((size_t)n < sizeof(*eth) + ihl + sizeof(struct udp_hdr)) continue;
-        const struct udp_hdr *udp = (const struct udp_hdr *)(buf + sizeof(*eth) + ihl);
-        if (ntohs(udp->dport) != DHCP_CLIENT_PORT) continue;
-        if (ntohs(udp->sport) != DHCP_SERVER_PORT) continue;
-
-        const uint16_t ulen = ntohs(udp->len);
-        if (ulen < sizeof(struct udp_hdr)) continue;
-        const size_t payload_len = (size_t)ulen - sizeof(struct udp_hdr);
-        const uint8_t *payload = (const uint8_t *)udp + sizeof(struct udp_hdr);
-        if ((const uint8_t *)payload + payload_len > buf + n) continue;
-        if (payload_len < offsetof(struct dhcp_msg, options)) continue;
-
-        const struct dhcp_msg *m = (const struct dhcp_msg *)payload;
-        if (m->op != BOOTREPLY) continue;
-        if (m->xid != xid_be) continue;
-        if (ntohl(m->cookie) != 0x63825363) continue;
-
-        struct dhcp_offer o;
-        int mt = 0;
-        size_t opt_off = offsetof(struct dhcp_msg, options);
-        if (payload_len <= opt_off) continue;
-        parse_options((const uint8_t *)m->options, payload_len - opt_off, &mt, &o);
-        if (mt == 0) continue;
-        o.yiaddr = m->yiaddr;
-        *offer_out = o;
-        *msg_type_out = mt;
-        return 0;
+        usleep(50 * 1000);
     }
 }
 
@@ -679,7 +706,7 @@ int main(int argc, char **argv) {
 
     struct dhcp_offer offer;
     int mt = 0;
-    if (recv_dhcp_packet(pfd, xid_be, &offer, &mt, deadline) < 0 || mt != DHCPOFFER) {
+    if (recv_dhcp_message_any(pfd, fd, xid_be, &offer, &mt, deadline) < 0 || mt != DHCPOFFER) {
         warnx("timeout waiting for DHCPOFFER");
         return 1;
     }
@@ -695,7 +722,7 @@ int main(int argc, char **argv) {
 
     struct dhcp_offer ack;
     int mt2 = 0;
-    if (recv_dhcp_packet(pfd, xid_be, &ack, &mt2, deadline) < 0) {
+    if (recv_dhcp_message_any(pfd, fd, xid_be, &ack, &mt2, deadline) < 0) {
         warnx("timeout waiting for DHCPACK");
         return 1;
     }
@@ -749,4 +776,3 @@ int main(int argc, char **argv) {
     close(fd);
     return 0;
 }
-
