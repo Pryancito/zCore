@@ -9,7 +9,7 @@ use core::convert::TryInto;
 /// eventfd implementation
 pub struct EventFd {
     base: KObjectBase,
-    counter: AtomicU64,
+    counter: Arc<AtomicU64>,
     eventbus: Arc<Mutex<EventBus>>,
     flags: OpenFlags,
 }
@@ -21,7 +21,7 @@ impl EventFd {
     pub fn new(initval: u32, flags: OpenFlags) -> Arc<Self> {
         Arc::new(EventFd {
             base: KObjectBase::new(),
-            counter: AtomicU64::new(initval as u64),
+            counter: Arc::new(AtomicU64::new(initval as u64)),
             eventbus: EventBus::new(),
             flags,
         })
@@ -35,15 +35,16 @@ impl FileLike for EventFd {
     }
 
     fn set_flags(&self, _f: OpenFlags) -> LxResult {
-        // Only NON_BLOCK can be changed
-        // Actually, Linux allows changing NONBLOCK
-        // let mut flags = self.flags; // Wait, self.flags is immutable in this struct
-        // flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        // Ok(())
-        // For simplicity, we should probably make flags mutable or ignore set_flags for now if it's not critical.
-        // But FileLike::set_flags is usually called.
-        // I'll make flags a Mutex or Atomic if needed, but for now just return Ok.
         Ok(())
+    }
+
+    fn dup(&self) -> Arc<dyn FileLike> {
+        Arc::new(Self {
+            base: KObjectBase::new(),
+            counter: self.counter.clone(),
+            eventbus: self.eventbus.clone(),
+            flags: self.flags,
+        })
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {

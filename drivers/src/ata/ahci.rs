@@ -11,7 +11,11 @@ use core::sync::atomic::{fence, Ordering};
 
 use crate::bus::{drivers_dma_alloc, phys_to_virt, virt_to_phys};
 use crate::scheme::{BlockScheme, Scheme};
-use crate::{DeviceError, DeviceResult};
+use crate::{Device, DeviceError, DeviceResult};
+use crate::bus::pci_drivers::PciDriver;
+use crate::builder::IoMapper;
+use alloc::sync::Arc;
+use pci::{PCIDevice, BAR};
 
 use lock::Mutex;
 
@@ -456,4 +460,46 @@ impl Scheme for AhciInterface {
     }
 
     fn handle_irq(&self, _irq: usize) {}
+}
+
+pub struct AhciDriverPci;
+
+impl PciDriver for AhciDriverPci {
+    fn name(&self) -> &str {
+        "ahci"
+    }
+
+    fn matched(&self, _vendor_id: u16, _device_id: u16) -> bool {
+        false
+    }
+
+    fn matched_dev(&self, dev: &PCIDevice) -> bool {
+        // Match standard AHCI: class=0x01 (mass storage), subclass=0x06 (SATA), prog_if=0x01 (AHCI)
+        dev.id.class == 0x01 && dev.id.subclass == 0x06 && dev.id.prog_if == 0x01
+    }
+
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+        let (addr, len) = if let Some(BAR::Memory(a, l, _, _)) = dev.bars[5] {
+            (a as usize, l as usize)
+        } else {
+            return Err(DeviceError::NotSupported);
+        };
+
+        if addr == 0 {
+            return Err(DeviceError::NotSupported);
+        }
+
+        let map_len = len.max(4096 * 8);
+
+        if let Some(m) = mapper {
+            m.query_or_map(addr, map_len);
+        }
+
+        let vaddr = phys_to_virt(addr);
+        // Note: we don't have access to pci::enable here, so we assume IRQ is either not used or handled elsewhere,
+        // or we use a default. In the original code, `enable` was called. 
+        // For AHCI, irq handling is currently a no-op anyway (`fn handle_irq(&self, _irq: usize) {}`).
+        let blk = Arc::new(AhciInterface::new(vaddr, 0)?);
+        Ok(Device::Block(blk))
+    }
 }

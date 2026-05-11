@@ -28,9 +28,10 @@ lazy_static! {
 /// - Client: socket → connect  (→ ECONNREFUSED if no listener)
 pub struct UnixSocketState {
     base: KObjectBase,
-    inner: Mutex<UnixInner>,
+    inner: Arc<Mutex<UnixInner>>,
 }
 
+#[derive(Debug)]
 struct UnixInner {
     flags: OpenFlags,
     /// Local bound path (set by bind or inherited on accept)
@@ -54,7 +55,7 @@ impl Default for UnixSocketState {
     fn default() -> Self {
         Self {
             base: KObjectBase::new(),
-            inner: Mutex::new(UnixInner {
+            inner: Arc::new(Mutex::new(UnixInner {
                 flags: OpenFlags::RDWR,
                 path: String::new(),
                 peer: None,
@@ -64,7 +65,7 @@ impl Default for UnixSocketState {
                 accept_queue: VecDeque::new(),
                 connected: false,
                 peer_closed: false,
-            }),
+            })),
         }
     }
 }
@@ -336,6 +337,13 @@ impl FileLike for UnixSocketState {
         inner.flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
         inner.flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
         Ok(())
+    }
+
+    fn dup(&self) -> Arc<dyn FileLike> {
+        Arc::new(Self {
+            base: KObjectBase::new(),
+            inner: self.inner.clone(),
+        })
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {

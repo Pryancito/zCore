@@ -17,15 +17,15 @@ use zircon_object::impl_kobject;
 #[allow(unused_imports)]
 use zircon_object::object::*;
 
-/// UDP socket structure
 pub struct UdpSocketState {
     /// Kernel object base
     base: KObjectBase,
     /// UdpSocket Inner
-    inner: Mutex<UdpInner>,
+    inner: Arc<Mutex<UdpInner>>,
 }
 
 /// UDP socket inner
+#[derive(Debug)]
 pub struct UdpInner {
     /// A wrapper for `SocketHandle`
     handle: GlobalSocketHandle,
@@ -45,10 +45,6 @@ impl Default for UdpSocketState {
 
 // Moved to mod.rs as public structures
 
-fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
-    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    core::str::from_utf8(&raw[..len]).map_err(|_| LxError::EINVAL)
-}
 
 fn iface_by_name(ifname: &str) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
     get_net_device()
@@ -116,11 +112,11 @@ impl UdpSocketState {
 
         UdpSocketState {
             base: KObjectBase::new(),
-            inner: Mutex::new(UdpInner {
+            inner: Arc::new(Mutex::new(UdpInner {
                 handle,
                 remote_endpoint: None,
                 flags: OpenFlags::RDWR,
-            }),
+            })),
         }
     }
 }
@@ -578,6 +574,13 @@ impl FileLike for UdpSocketState {
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
         Socket::ioctl(self, request, arg1, arg2, arg3)
+    }
+
+    fn dup(&self) -> Arc<dyn FileLike> {
+        Arc::new(Self {
+            base: KObjectBase::new(),
+            inner: self.inner.clone(),
+        })
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {

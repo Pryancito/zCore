@@ -5,9 +5,15 @@
 #[macro_use]
 pub mod socket_address;
 use crate::fs::{FileLike, PollEvents};
+use crate::error::{LxError, LxResult};
 use kernel_hal::user::{IoVecOut, UserInPtr, UserInOutPtr};
 use smoltcp::wire::IpEndpoint;
 pub use socket_address::*;
+
+pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
+    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    core::str::from_utf8(&raw[..len]).map_err(|_| LxError::EINVAL)
+}
 
 
 /// missing documentation
@@ -31,6 +37,8 @@ pub mod netlink;
 pub use netlink::*;
 pub mod unix;
 pub use unix::*;
+pub mod listen_table;
+pub use listen_table::*;
 
 /// missing documentation
 // pub mod icmp;

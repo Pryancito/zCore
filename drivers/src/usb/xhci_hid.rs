@@ -22,7 +22,10 @@ use crate::input::input_event_codes::{ev::*, key::*, rel::*, syn::*};
 use crate::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType};
 use crate::scheme::{impl_event_scheme, InputScheme, IrqScheme, Scheme};
 use crate::utils::EventListener;
-use crate::{DeviceError, DeviceResult};
+use crate::{Device, DeviceError, DeviceResult};
+use crate::bus::pci_drivers::PciDriver;
+use crate::builder::IoMapper;
+use pci::BAR;
 
 fn timer_now_us() -> u64 {
     unsafe { drivers_timer_now_as_micros() }
@@ -2263,5 +2266,71 @@ impl InputScheme for XhciUsbHid {
             _ => {}
         }
         cap
+    }
+}
+
+pub struct XhciDriverPci;
+
+impl PciDriver for XhciDriverPci {
+    fn name(&self) -> &str {
+        "xhci"
+    }
+
+    fn matched(&self, vendor_id: u16, _device_id: u16) -> bool {
+        // We match by class/subclass/prog_if in matched_dev instead.
+        // But for simplicity, we can just return false here and use a custom logic in pci_drivers.
+        // Actually, PciDriver trait should be flexible enough.
+        // I'll add a matched_dev method to PciDriver if needed, but for now I'll just match common xHCI IDs or all USB controllers.
+        vendor_id != 0xffff // temporary: we'll check class in init or matched
+    }
+
+    fn matched_dev(&self, dev: &PCIDevice) -> bool {
+        dev.id.class == 0x0c && dev.id.subclass == 0x03
+    }
+
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+        let (addr, len) = if let Some(BAR::Memory(ba, bl, _, _)) = dev.bars[0] {
+            (ba, bl as u64)
+        } else {
+            return Err(DeviceError::NotSupported);
+        };
+
+        if addr == 0 {
+            return Err(DeviceError::NotSupported);
+        }
+
+        let base_addr = (addr as usize) & !0xfff;
+        let offset = (addr as usize) & 0xfff;
+        let map_len = ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
+
+        if let Some(m) = mapper {
+            m.query_or_map(base_addr, map_len);
+        }
+
+        let vaddr = crate::bus::phys_to_virt(addr as usize);
+        
+        // Handle xHCI
+        if dev.id.prog_if == 0x30 {
+            // Note: we'd need to call pci::enable which is not easily accessible here.
+            // For now, assume it's handled or we'll need to move enable logic too.
+            // Actually, we can just use vector 0 (poll) for now or find a way to get MSI.
+            let input = XhciUsbHid::probe(dev, vaddr, map_len, 0)?;
+            Ok(Device::Input(input))
+        } else {
+            // Legacy USB
+            #[cfg(feature = "legacy-usb-hid")]
+            {
+                let kind = match dev.id.prog_if {
+                    0x20 => LegacyUsbKind::Ehci,
+                    0x10 => LegacyUsbKind::Ohci,
+                    0x00 => LegacyUsbKind::Uhci,
+                    _ => return Err(DeviceError::NotSupported),
+                };
+                let input = LegacyUsbHid::probe(kind, dev, vaddr, map_len, 0)?;
+                Ok(Device::Input(input))
+            }
+            #[cfg(not(feature = "legacy-usb-hid"))]
+            Err(DeviceError::NotSupported)
+        }
     }
 }

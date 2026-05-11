@@ -191,8 +191,7 @@ else ifeq ($(ARCH), aarch64)
 endif
 
 qemu_opts += \
-	-netdev user,id=net1 \
-	-device e1000e,netdev=net1
+	-netdev user,id=net1 -device e1000e,netdev=net1 \
 	# -netdev tap,id=net1,script=ifup.sh,downscript=ifdown.sh
 
 ifeq ($(DISK), on)

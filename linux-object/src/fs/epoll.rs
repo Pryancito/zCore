@@ -11,6 +11,7 @@ pub struct Epoll {
     flags: OpenFlags,
 }
 
+#[derive(Debug)]
 struct EpollInner {
     interest_list: BTreeMap<FileDesc, EpollEvent>,
 }
@@ -71,6 +72,16 @@ impl FileLike for Epoll {
 
     fn set_flags(&self, _f: OpenFlags) -> LxResult {
         Ok(())
+    }
+
+    fn dup(&self) -> Arc<dyn FileLike> {
+        Arc::new(Self {
+            base: KObjectBase::new(),
+            inner: Mutex::new(EpollInner {
+                interest_list: self.inner.lock().interest_list.clone(),
+            }),
+            flags: self.flags,
+        })
     }
 
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {

@@ -3,10 +3,6 @@
 #![feature(get_mut_unchecked)]
 // `generators`/`generator_trait` fue renombrado y luego retirado; en nightlies nuevas se usa coroutines.
 #![feature(coroutines, coroutine_trait, yield_expr)]
-#![feature(stmt_expr_attributes)]
-// `atomic_mut_ptr` ya no existe; el crate usa esta feature solo como gate histórico.
-#![feature(box_into_inner)]
-#![feature(new_uninit)]
 // some interfaces is still under developing
 #![allow(dead_code)]
 

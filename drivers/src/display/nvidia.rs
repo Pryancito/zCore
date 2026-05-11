@@ -4,7 +4,10 @@ use alloc::vec::Vec;
 use crate::prelude::{ColorFormat, DisplayInfo, FrameBuffer};
 use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
 use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
-use crate::DeviceResult;
+use crate::{Device, DeviceResult, DeviceError, builder::IoMapper};
+use crate::bus::pci_drivers::PciDriver;
+use pci::{PCIDevice, BAR};
+use alloc::sync::Arc;
 use lock::Mutex;
 
 // --- Registers and Constants (aligned with Nova / open-gpu-kernel-modules) ---
@@ -644,3 +647,114 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 }
+
+#[allow(dead_code)]
+pub struct NvidiaGpuDriverPci;
+
+impl PciDriver for NvidiaGpuDriverPci {
+    fn name(&self) -> &str {
+        "Nvidia GPU"
+    }
+
+    fn matched(&self, vendor_id: u16, _device_id: u16) -> bool {
+        vendor_id == 0x10DE
+    }
+
+    fn matched_dev(&self, dev: &PCIDevice) -> bool {
+        dev.id.vendor_id == 0x10DE && dev.id.class == 0x03
+    }
+
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+        use crate::bus::pci::{read_bar_addr, probe_bar_size, PortOpsImpl, PCI_ACCESS};
+        use crate::bus::phys_to_virt;
+        use crate::bus::PAGE_SIZE;
+        const BAR0: u16 = 0x10;
+
+        #[cfg(target_arch = "x86_64")]
+        let bar0_addr = {
+            if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
+                if a != 0 {
+                    a
+                } else {
+                    let ops = &PortOpsImpl;
+                    unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
+                }
+            } else {
+                let ops = &PortOpsImpl;
+                unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
+            }
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
+            a
+        } else {
+            0
+        };
+
+        if bar0_addr == 0 {
+            return Err(DeviceError::NoResources);
+        }
+
+        if let Some(m) = mapper {
+            m.query_or_map(bar0_addr as usize, PAGE_SIZE * 1024);
+        }
+        let bar0_vaddr = phys_to_virt(bar0_addr as usize);
+
+        let fb_bar = (1..6usize).find_map(|i| {
+            if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[i] {
+                if addr == 0 {
+                    return None;
+                }
+                let actual_len: u64 = if len == 0 {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let bar_reg = BAR0 + (i as u16 * 4);
+                        let ops = &PortOpsImpl;
+                        let sz = unsafe { probe_bar_size(ops, PCI_ACCESS, dev.loc, bar_reg) };
+                        if sz == 0 { 256 * 1024 * 1024 } else { sz }
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    { 256 * 1024 * 1024 }
+                } else {
+                    len as u64
+                };
+                if actual_len >= (16 * 1024 * 1024) {
+                    Some((addr, actual_len))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        if let Some((fb_addr, fb_len)) = fb_bar {
+            if let Some(m) = mapper {
+                m.query_or_map(fb_addr as usize, fb_len as usize);
+            }
+            let fb_vaddr = phys_to_virt(fb_addr as usize);
+
+            let gpu_name = alloc::format!(
+                "nvidia-gpu-{}:{}.{}",
+                dev.loc.bus, dev.loc.device, dev.loc.function
+            );
+            log::warn!(
+                "[NVIDIA] GPU at {} bar0={:#x} fb={:#x} fb_len={:#x}",
+                gpu_name, bar0_addr, fb_addr, fb_len
+            );
+            let gpu = Arc::new(NvidiaGpu::new(
+                gpu_name,
+                dev.id.device_id,
+                bar0_vaddr,
+                fb_vaddr,
+                fb_len as usize,
+                1920,
+                1080,
+            )?);
+            Ok(Device::Drm(gpu))
+        } else {
+            Err(DeviceError::NoResources)
+        }
+    }
+}
+

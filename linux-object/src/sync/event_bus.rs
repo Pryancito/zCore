@@ -49,6 +49,14 @@ pub struct EventBus {
     /// EventBus callback
     callbacks: Vec<EventHandler>,
 }
+impl core::fmt::Debug for EventBus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EventBus")
+            .field("event", &self.event)
+            .field("callbacks_len", &self.callbacks.len())
+            .finish()
+    }
+}
 
 impl EventBus {
     /// create an event bus

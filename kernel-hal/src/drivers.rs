@@ -11,7 +11,7 @@ use zcore_drivers::scheme::{
 use zcore_drivers::{Device, DeviceError};
 
 /// Re-exported modules from crate [`zcore_drivers`].
-pub use zcore_drivers::{prelude, scheme};
+pub use zcore_drivers::{prelude, scheme, utils};
 
 /// A wrapper of a device array with the same [`Scheme`].
 pub struct DeviceList<T: Scheme + ?Sized>(RwLock<Vec<Arc<T>>>);

@@ -33,6 +33,7 @@ impl Syscall<'_> {
         let protocol_num = protocol;
         let protocol = Protocol::try_from(protocol_num).ok();
 
+        warn!("sys_socket: domain={:?}, type={:?}, protocol={:#x}", domain, socket_type, protocol_num);
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
             (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
@@ -69,6 +70,7 @@ impl Syscall<'_> {
                 return Err(LxError::ENOSYS);
             }
         };
+
         socket.set_flags(flags)?;
         let fd = self.linux_process().add_socket(socket)?; // dyn FileLike
         Ok(fd.into())
@@ -252,6 +254,7 @@ impl Syscall<'_> {
             None
         } else {
             let endpoint = sockaddr_to_endpoint(dest_addr.read()?, addrlen)?;
+            info!("sys_sendto: sockfd:{:?}, endpoint:{:?}", sockfd, endpoint);
             Some(endpoint)
         };
         let file_like = self.linux_process().get_file_like(sockfd.into())?;

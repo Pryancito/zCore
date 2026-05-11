@@ -139,7 +139,7 @@ impl LinkLevelEndpoint {
 }
 
 /// missing documentation
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct NetlinkEndpoint {
     /// missing documentation
     pub port_id: u32,

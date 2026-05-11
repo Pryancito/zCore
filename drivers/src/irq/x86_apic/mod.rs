@@ -94,21 +94,34 @@ impl Scheme for Apic {
 
 impl IrqScheme for Apic {
     fn is_valid_irq(&self, gsi: usize) -> bool {
-        self.ioapic_list.find(gsi as _).is_some()
+        self.ioapic_list.find(gsi as _).is_some() || (gsi >= X86_INT_BASE && gsi < X86_INT_LOCAL_APIC_BASE)
     }
 
     fn mask(&self, gsi: usize) -> DeviceResult {
-        self.with_ioapic(gsi as _, |apic| {
+        if let Some(apic) = self.ioapic_list.find(gsi as _) {
             apic.toggle(gsi as _, false);
             Ok(())
-        })
+        } else if gsi >= X86_INT_BASE && gsi < X86_INT_LOCAL_APIC_BASE {
+            // MSI vector: effectively always unmasked at the APIC level,
+            // managed at the PCI device level.
+            Ok(())
+        } else {
+            error!("cannot find IOAPIC for global system interrupt number {}", gsi);
+            Err(DeviceError::InvalidParam)
+        }
     }
 
     fn unmask(&self, gsi: usize) -> DeviceResult {
-        self.with_ioapic(gsi as _, |apic| {
+        if let Some(apic) = self.ioapic_list.find(gsi as _) {
             apic.toggle(gsi as _, true);
             Ok(())
-        })
+        } else if gsi >= X86_INT_BASE && gsi < X86_INT_LOCAL_APIC_BASE {
+            // MSI vector
+            Ok(())
+        } else {
+            error!("cannot find IOAPIC for global system interrupt number {}", gsi);
+            Err(DeviceError::InvalidParam)
+        }
     }
 
     fn configure(&self, gsi: usize, tm: IrqTriggerMode, pol: IrqPolarity) -> DeviceResult {

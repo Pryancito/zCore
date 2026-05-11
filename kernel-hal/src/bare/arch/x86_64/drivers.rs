@@ -17,6 +17,7 @@ pub(super) fn init_early() -> DeviceResult {
 }
 
 pub(super) fn init() -> DeviceResult {
+    zcore_drivers::init();
     Apic::init_local_apic_bsp(crate::mem::phys_to_virt);
     let irq = Arc::new(Apic::new(
         super::special::pc_firmware_tables().0 as usize,
@@ -52,7 +53,7 @@ pub(super) fn init() -> DeviceResult {
         xhci_hid::pci_set_irq_host(irq_apic);
     }
 
-    drivers::add_device(Device::Irq(irq));
+    drivers::add_device(Device::Irq(irq.clone()));
 
     #[cfg(not(feature = "no-pci"))]
     {
@@ -112,10 +113,19 @@ pub(super) fn init() -> DeviceResult {
         for d in pci_devs.into_iter() {
             drivers::add_device(d);
         }
+
+        // Finish MSI registrations for USB
         #[cfg(feature = "xhci-usb-hid")]
         {
             use zcore_drivers::usb::xhci_hid;
             let _ = xhci_hid::pci_finish_msi_registrations();
+        }
+
+        // Finish MSI registrations for Net
+        {
+            use zcore_drivers::net;
+            net::pci_set_irq_host(irq.clone());
+            let _ = net::pci_finish_msi_registrations();
         }
     }
 
