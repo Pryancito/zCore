@@ -90,12 +90,11 @@ impl LinuxRootfs {
             let hooks_dir = lib_dhcpcd.join("dhcpcd-hooks");
             fs::create_dir_all(&hooks_dir).unwrap();
             fs::copy(dhcpcd_dir.join("hooks/dhcpcd-run-hooks"), lib_dhcpcd.join("dhcpcd-run-hooks")).unwrap();
-            for hook in ["01-test", "20-resolv.conf", "30-hostname"] {
-                let from = dhcpcd_dir.join("hooks").join(hook);
-                if from.is_file() {
-                    fs::copy(from, hooks_dir.join(hook)).unwrap();
-                }
-            }
+            // Do NOT install hook scripts into dhcpcd-hooks/ — they depend on sysctl,
+            // resolvconf, hostname, and /proc/sys/kernel/hostname which are not yet
+            // implemented in Eclipse OS. When hooks fail with exit 127 dhcpcd reports
+            // a script error and times out.  The empty hook directory means
+            // dhcpcd-run-hooks sources nothing and exits cleanly.
 
             // Create directories for dhcpcd runtime files
             let var_run_dhcpcd = dir.join("var/run/dhcpcd");
@@ -137,16 +136,40 @@ impl LinuxRootfs {
         let to = lib.join(format!("ld-musl-{arch}.so.1", arch = self.0.name()));
         fs::copy(from, &to).unwrap();
         Ext::new(self.strip(&musl)).arg("-s").arg(to).invoke();
-        // 为常用功能建立符号链接
-        const SH: &[&str] = &[
-            "cat", "cp", "echo", "false", "grep", "gzip", "ip", "kill", "ln", "ls", "mkdir", "mv",
-            "pidof", "ping", "ping6", "printenv", "ps", "pwd", "rm", "rmdir", "sh", "sleep",
-            "stat", "tar", "touch", "true", "uname", "usleep", "watch", "ifconfig", "route",
-            "udhcpc",
-        ];
+        // 为 busybox 支持的所有 applets 建立符号链接
         let bin = dir.join("bin");
-        for sh in SH {
-            unix::fs::symlink("busybox", bin.join(sh)).unwrap();
+        let busybox_bin = bin.join("busybox");
+        
+        // Base list of essential applets
+        let mut applets: Vec<String> = vec![
+            "cat", "cp", "echo", "false", "grep", "gzip", "ip", "kill",
+            "ln", "ls", "mkdir", "mv", "pidof", "ping", "ps", "pwd", "rm", 
+            "rmdir", "sh", "sleep", "stat", "tar", "touch", "true", "uname", 
+            "usleep", "watch", "ifconfig", "route", "udhcpc", "udhcpc6", 
+            "sed", "awk", "cmp", "diff", "logger", "hostname", "cut", "sort", 
+            "uniq", "head", "tail", "wc", "xargs", "find", "test", "expr", 
+            "id", "date", "env", "chmod", "chown", "vi", "top", "less"
+        ].into_iter().map(String::from).collect();
+
+        // Try to complement the list with busybox --list if it can run on host
+        if let Ok(out) = std::process::Command::new(&busybox_bin).arg("--list").output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    for line in s.lines() {
+                        let applet = line.trim().to_string();
+                        if !applet.is_empty() && !applets.contains(&applet) {
+                            applets.push(applet);
+                        }
+                    }
+                }
+            }
+        }
+
+        for applet in &applets {
+            let link = bin.join(applet);
+            if !link.exists() && !link.is_symlink() {
+                let _ = unix::fs::symlink("busybox", &link);
+            }
         }
         // Create standard pseudo-filesystem mount points
         let _ = fs::create_dir_all(dir.join("run"));
@@ -240,15 +263,34 @@ impl LinuxRootfs {
         dircpy::copy_dir(source, &target).unwrap();
         // 配置
         Make::new().current_dir(&target).arg("defconfig").invoke();
+        // Force static linking and disable PIE (Type EXEC is more stable in zCore)
+        Ext::new("sed")
+            .current_dir(&target)
+            .arg("-i")
+            .arg("s/.*CONFIG_STATIC.*/CONFIG_STATIC=y/\
+                  s/.*CONFIG_PIE.*/CONFIG_PIE=n/\
+                  s/.*CONFIG_FEATURE_INDIVIDUAL.*/CONFIG_FEATURE_INDIVIDUAL=n/\
+                  s/.*CONFIG_FEATURE_SHARED_BUSYBOX.*/CONFIG_FEATURE_SHARED_BUSYBOX=n/")
+            .arg(".config")
+            .invoke();
+
         // 编译
-        let musl = musl.as_ref();
+        let musl = musl.as_ref().canonicalize().unwrap();
+        let cross_compile = format!(
+            "{musl}/bin/{arch}-linux-musl-",
+            musl = musl.display(),
+            arch = self.0.name(),
+        );
+        
         Make::new()
             .current_dir(&target)
-            .arg(format!(
-                "CROSS_COMPILE={musl}/{arch}-linux-musl-",
-                musl = musl.canonicalize().unwrap().join("bin").display(),
-                arch = self.0.name(),
-            ))
+            .arg(format!("CROSS_COMPILE={cross_compile}"))
+            .arg("LDFLAGS=-static -no-pie")
+            .arg("EXTRA_LDFLAGS=-static -no-pie")
+            .arg("CFLAGS=-fno-PIC -fno-PIE")
+            .arg("EXTRA_CFLAGS=-fno-PIC -fno-PIE")
+            .arg("CONFIG_STATIC=y")
+            .arg("CONFIG_PIE=n")
             .invoke();
         // 裁剪
         Ext::new(self.strip(musl))

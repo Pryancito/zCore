@@ -296,6 +296,7 @@ impl Syscall<'_> {
             e
         })?;
         debug!("EXECVE ENTER: path={:?}", path_str);
+        warn!("EXECVE: path={:?}", path_str);
         let args = argv.read_cstring_array().map_err(|e| {
             error!("execve: argv.read_cstring_array() failed: {:?}", e);
             e
@@ -314,6 +315,9 @@ impl Syscall<'_> {
         if args.is_empty() {
             error!("execve: args is empty");
             return Err(LxError::EINVAL);
+        }
+        if args[0].is_empty() {
+            warn!("execve: argv[0] is empty for path {:?}", path_str);
         }
 
         // TODO: check and kill other threads
@@ -465,6 +469,64 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         self.thread.set_robust_list(head, len);
+        Ok(0)
+    }
+
+    /// `getuid` returns the real user ID of the calling process.
+    pub fn sys_getuid(&self) -> SysResult {
+        debug!("getuid");
+        Ok(0)
+    }
+
+    /// `geteuid` returns the effective user ID of the calling process.
+    pub fn sys_geteuid(&self) -> SysResult {
+        debug!("geteuid");
+        Ok(0)
+    }
+
+    /// `getgid` returns the real group ID of the calling process.
+    pub fn sys_getgid(&self) -> SysResult {
+        debug!("getgid");
+        Ok(0)
+    }
+
+    /// `getegid` returns the effective group ID of the calling process.
+    pub fn sys_getegid(&self) -> SysResult {
+        debug!("getegid");
+        Ok(0)
+    }
+
+    /// `setpgid` sets the PGID of the process specified by pid to pgid.
+    pub fn sys_setpgid(&self, pid: usize, pgid: usize) -> SysResult {
+        debug!("setpgid: pid={}, pgid={}", pid, pgid);
+        // Stub: return success
+        Ok(0)
+    }
+
+    /// `getpgid` returns the PGID of the process specified by pid.
+    pub fn sys_getpgid(&self, pid: usize) -> SysResult {
+        debug!("getpgid: pid={}", pid);
+        // Stub: return pid as its own pgid
+        let proc = if pid == 0 {
+            self.zircon_process().id()
+        } else {
+            pid as u64
+        };
+        Ok(proc as usize)
+    }
+
+    /// `setsid` creates a new session if the calling process is not a process group leader.
+    pub fn sys_setsid(&self) -> SysResult {
+        debug!("setsid");
+        // Stub: return current pid as new sid
+        Ok(self.zircon_process().id() as usize)
+    }
+
+    /// `chmod` changes the mode of the file specified by path.
+    pub fn sys_chmod(&self, path: UserInPtr<u8>, mode: usize) -> SysResult {
+        let _path = path.as_c_str()?;
+        debug!("chmod: path={:?}, mode={:#o}", _path, mode);
+        // Stub: return success
         Ok(0)
     }
 }

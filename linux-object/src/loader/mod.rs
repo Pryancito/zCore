@@ -153,8 +153,9 @@ impl LinuxElfLoader {
             // the already-kernel-mapped binary via AT_PHDR / AT_ENTRY instead of calling
             // mmap() from user space to re-load it – which is the path that breaks in the
             // fork+execve case and causes a page fault at the raw e_entry (e.g. 0x423a7).
-            let inode = self.root_inode.lookup(interp).map_err(|e| {
-                error!("elf: lookup interp {:?} failed: {:?}", interp, e);
+            let interp_rel = interp.trim_start_matches('/');
+            let inode = self.root_inode.lookup_follow(interp_rel, 4).map_err(|e| {
+                error!("elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)", interp, e);
                 e
             })?;
             let interp_data = inode.read_as_vec().map_err(|e| {
@@ -286,7 +287,7 @@ impl LinuxElfLoader {
             Err(error) => {
                 // Segments stay mapped under `image_vmar.addr()`; do not clobber `base` with the
                 // first program header vaddr (often not PT_LOAD). Wrong AT_BASE breaks PIE/musl
-                // (e.g. user PC stuck at raw e_entry like 0x423a7 → page fault NOT_FOUND).
+                // (e.g. user PC stuck at raw e_entry like 0x423a7 -> page fault NOT_FOUND).
                 warn!(
                     "elf relocate Err:{:?}, keeping load base {:#x}",
                     error, base
