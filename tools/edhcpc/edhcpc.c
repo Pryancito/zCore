@@ -418,29 +418,30 @@ static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer
     return 1;
 }
 
-static int try_recv_dhcp_udp_once(int fd, uint32_t xid_be, struct dhcp_offer *offer_out, int *msg_type_out) {
+static int try_recv_dhcp_udp_once(int udp_fd, uint32_t xid_be, struct dhcp_offer *offer_out,
+                                  int *msg_type_out) {
     uint8_t buf[2048];
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    ssize_t n = recv(udp_fd, buf, sizeof(buf), 0);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
     }
-    if (n <= 0) return 1;
+    if (n == 0) return 1;
     if (parse_dhcp_payload(buf, (size_t)n, xid_be, offer_out, msg_type_out) == 0) return 0;
     return 1;
 }
 
-static int recv_dhcp_message_any(int pfd, int fd, uint32_t xid_be, struct dhcp_offer *offer_out,
+static int recv_dhcp_message_any(int packet_fd, int udp_fd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                  int *msg_type_out, uint32_t deadline_ms) {
     for (;;) {
         uint32_t t = now_ms();
         if (t >= deadline_ms) return -1;
 
-        int pr = try_recv_dhcp_packet_once(pfd, xid_be, offer_out, msg_type_out);
+        int pr = try_recv_dhcp_packet_once(packet_fd, xid_be, offer_out, msg_type_out);
         if (pr == 0) return 0;
         if (pr < 0) return -1;
 
-        int ur = try_recv_dhcp_udp_once(fd, xid_be, offer_out, msg_type_out);
+        int ur = try_recv_dhcp_udp_once(udp_fd, xid_be, offer_out, msg_type_out);
         if (ur == 0) return 0;
         if (ur < 0) return -1;
 
