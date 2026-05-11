@@ -366,21 +366,20 @@ static int send_dhcp_packet(int pfd, const uint8_t mac[6], const uint8_t *dhcp, 
 
 static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32_t xid_be,
                               struct dhcp_offer *offer_out, int *msg_type_out) {
-    if (payload_len < offsetof(struct dhcp_msg, options)) return -1;
     const struct dhcp_msg *m = (const struct dhcp_msg *)payload;
     if (m->op != BOOTREPLY) return -1;
     if (m->xid != xid_be) return -1;
     if (ntohl(m->cookie) != 0x63825363) return -1;
 
-    struct dhcp_offer o;
-    int mt = 0;
+    struct dhcp_offer offer;
+    int msg_type = 0;
     size_t opt_off = offsetof(struct dhcp_msg, options);
     if (payload_len <= opt_off) return -1;
-    parse_options((const uint8_t *)m->options, payload_len - opt_off, &mt, &o);
-    if (mt == 0) return -1;
-    o.yiaddr = m->yiaddr;
-    *offer_out = o;
-    *msg_type_out = mt;
+    parse_options((const uint8_t *)m->options, payload_len - opt_off, &msg_type, &offer);
+    if (msg_type == 0) return -1;
+    offer.yiaddr = m->yiaddr;
+    *offer_out = offer;
+    *msg_type_out = msg_type;
     return 0;
 }
 
@@ -437,13 +436,13 @@ static int recv_dhcp_message_any(int packet_fd, int udp_fd, uint32_t xid_be, str
         uint32_t t = now_ms();
         if (t >= deadline_ms) return -1;
 
-        int pr = try_recv_dhcp_packet_once(packet_fd, xid_be, offer_out, msg_type_out);
-        if (pr == 0) return 0;
-        if (pr < 0) return -1;
+        int packet_result = try_recv_dhcp_packet_once(packet_fd, xid_be, offer_out, msg_type_out);
+        if (packet_result == 0) return 0;
+        if (packet_result < 0) return -1;
 
-        int ur = try_recv_dhcp_udp_once(udp_fd, xid_be, offer_out, msg_type_out);
-        if (ur == 0) return 0;
-        if (ur < 0) return -1;
+        int udp_result = try_recv_dhcp_udp_once(udp_fd, xid_be, offer_out, msg_type_out);
+        if (udp_result == 0) return 0;
+        if (udp_result < 0) return -1;
 
         usleep(50 * 1000);
     }
