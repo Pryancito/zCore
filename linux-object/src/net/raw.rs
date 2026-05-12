@@ -6,6 +6,7 @@ use crate::{
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use async_trait::async_trait;
+use kernel_hal::thread;
 use lock::Mutex;
 use smoltcp::{
     socket::{RawPacketMetadata, RawSocket, RawSocketBuffer},
@@ -16,12 +17,16 @@ use smoltcp::{
 #[allow(unused_imports)]
 use zircon_object::object::*;
 
-/// missing documentation
 pub struct RawSocketState {
-    base: zircon_object::object::KObjectBase,
+    base: KObjectBase,
+    inner: Arc<RawSocketInner>,
+}
+
+#[derive(Debug)]
+struct RawSocketInner {
     handle: GlobalSocketHandle,
-    header_included: bool,
-    flags: Arc<Mutex<OpenFlags>>,
+    header_included: Mutex<bool>,
+    flags: Mutex<OpenFlags>,
 }
 
 impl RawSocketState {
@@ -44,10 +49,12 @@ impl RawSocketState {
         let handle = GlobalSocketHandle(get_sockets().lock().add(socket));
 
         RawSocketState {
-            base: zircon_object::object::KObjectBase::new(),
-            handle,
-            header_included: false,
-            flags: Arc::new(Mutex::new(OpenFlags::RDWR)),
+            base: KObjectBase::new(),
+            inner: Arc::new(RawSocketInner {
+                handle,
+                header_included: Mutex::new(false),
+                flags: Mutex::new(OpenFlags::RDWR),
+            }),
         }
     }
 }
@@ -62,7 +69,7 @@ impl Socket for RawSocketState {
             poll_ifaces();
             let net_sockets = get_sockets();
             let mut sockets = net_sockets.lock();
-            let mut socket = sockets.get::<RawSocket>(self.handle.0);
+            let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
             if socket.can_recv() {
                 if let Ok(size) = socket.recv_slice(data) {
                     let packet = Ipv4Packet::new_unchecked(data);
@@ -78,14 +85,17 @@ impl Socket for RawSocketState {
                         }),
                     );
                 }
-            } else {
+            }
+            let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
+            drop(socket);
+            drop(sockets);
+            if non_block {
                 return (
-                    Err(LxError::ENOTCONN),
+                    Err(LxError::EAGAIN),
                     Endpoint::Ip(IpEndpoint::UNSPECIFIED),
                 );
             }
-            drop(socket);
-            drop(sockets);
+            thread::yield_now().await;
         }
     }
 
@@ -93,15 +103,24 @@ impl Socket for RawSocketState {
         info!("raw write");
         let net_sockets = get_sockets();
         let mut sockets = net_sockets.lock();
-        let mut socket = sockets.get::<RawSocket>(self.handle.0);
-        if self.header_included {
+        let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
+        if *self.inner.header_included.lock() {
             match socket.send_slice(data) {
                 Ok(()) => Ok(data.len()),
                 Err(_) => Err(LxError::ENOBUFS),
             }
         } else if let Some(Endpoint::Ip(endpoint)) = sendto_endpoint {
-            // todo: this is a temporary solution
-            let v4_src = Ipv4Address::new(192, 168, 0, 123);
+            let ifaces = kernel_hal::drivers::all_net();
+            let v4_src = if let Some(iface) = ifaces.first() {
+                iface.get_ip_address().into_iter().find_map(|cidr| {
+                    match cidr {
+                        smoltcp::wire::IpCidr::Ipv4(ipv4) => Some(ipv4.address()),
+                        _ => None,
+                    }
+                }).unwrap_or(Ipv4Address::new(10, 0, 2, 15))
+            } else {
+                Ipv4Address::new(127, 0, 0, 1)
+            };
 
             if let IpAddress::Ipv4(v4_dst) = endpoint.addr {
                 let len = data.len();
@@ -136,22 +155,22 @@ impl Socket for RawSocketState {
         unimplemented!()
     }
 
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        // match (level, opt) {
-        //     (IPPROTO_IP, IP_HDRINCL) => {
-        //         if let Some(arg) = data.first() {
-        //             self.header_included = *arg > 0;
-        //             debug!("hdrincl set to {}", self.header_included);
-        //         }
-        //     }
-        //     _ => {}
-        // }
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        match (level, opt) {
+            (IPPROTO_IP, IP_HDRINCL) => {
+                if let Some(arg) = data.first() {
+                    *self.inner.header_included.lock() = *arg > 0;
+                    debug!("hdrincl set to {}", *self.inner.header_included.lock());
+                }
+            }
+            _ => {}
+        }
         Ok(0)
     }
     fn get_buffer_capacity(&self) -> Option<(usize, usize)> {
         let sockets = get_sockets();
         let mut s = sockets.lock();
-        let socket = s.get::<RawSocket>(self.handle.0);
+        let socket = s.get::<RawSocket>(self.inner.handle.0);
         let (recv_ca, send_ca) = (
             socket.payload_recv_capacity(),
             socket.payload_send_capacity(),
@@ -165,9 +184,9 @@ impl Socket for RawSocketState {
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         // Minimal implementation: raw sockets are generally writable,
         // and readable if the underlying smoltcp socket can recv.
-        let sockets = get_sockets();
-        let mut sockets = sockets.lock();
-        let socket = sockets.get::<RawSocket>(self.handle.0);
+        let s = get_sockets();
+        let mut s = s.lock();
+        let socket = s.get::<RawSocket>(self.inner.handle.0);
         (socket.can_recv(), socket.can_send(), false)
     }
 }
@@ -177,15 +196,22 @@ zircon_object::impl_kobject!(RawSocketState);
 #[async_trait]
 impl FileLike for RawSocketState {
     fn flags(&self) -> OpenFlags {
-        *self.flags.lock()
+        *self.inner.flags.lock()
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let flags = &mut *self.flags.lock();
+        let mut flags = self.inner.flags.lock();
         flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
         flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
         flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
         Ok(())
+    }
+
+    fn dup(&self) -> Arc<dyn FileLike> {
+        Arc::new(Self {
+            base: KObjectBase::new(),
+            inner: self.inner.clone(),
+        })
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {

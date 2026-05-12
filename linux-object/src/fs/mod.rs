@@ -164,6 +164,9 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     devfs_root
         .add("shm", Arc::new(RandomINode::new(true)))
         .expect("failed to mknod /dev/shm");
+    devfs_root
+        .add("tty", stdio::STDIN.clone())
+        .expect("failed to mknod /dev/tty");
     if let Some(display) = drivers::all_display().first() {
         use devfs::{EventDev, FbDev, MiceDev};
 
@@ -227,7 +230,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     });
     tmp.mount(ramfs).expect("failed to mount RamFS");
 
-    // mount RamFS at /run (essential for dhcpcd and other daemons)
+    // mount RamFS at /run (essential for DHCP clients and other daemons)
     let run_ramfs = RamFS::new();
     let run = root.find(true, "run").unwrap_or_else(|_| {
         root.create("run", FileType::Dir, 0o755)

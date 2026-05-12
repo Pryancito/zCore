@@ -39,7 +39,7 @@ impl LinuxElfLoader {
         args: Vec<String>,
         envs: Vec<String>,
         path: String,
-    ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
+    ) -> LxResult<(VirtAddr, VirtAddr, usize, String)> {
         self.load_impl(vmar, data, args, envs, path, 0)
     }
 
@@ -55,7 +55,7 @@ impl LinuxElfLoader {
         envs: Vec<String>,
         path: String,
         recursion: u8,
-    ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
+    ) -> LxResult<(VirtAddr, VirtAddr, usize, String)> {
         debug!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
         debug!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
@@ -97,7 +97,7 @@ impl LinuxElfLoader {
                 interp, interp_arg, path
             );
             let interp_rel = interp.trim_start_matches('/');
-            let inode = self.root_inode.lookup(interp_rel).map_err(|e| {
+            let inode = self.root_inode.lookup_follow(interp_rel, 1).map_err(|e| {
                 error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
                 e
             })?;
@@ -115,7 +115,10 @@ impl LinuxElfLoader {
             return self.load_impl(vmar, &interp_data, new_args, envs, interp_path, recursion + 1);
         }
 
-        let elf = ElfFile::new(data).map_err(|_| ZxError::INVALID_ARGS)?;
+        let elf = ElfFile::new(data).map_err(|e| {
+            error!("elf: ElfFile::new failed for {:?}: {:?}", path, e);
+            ZxError::INVALID_ARGS
+        })?;
 
         debug!("elf info:  {:#x?}", elf.header.pt2);
 
@@ -150,11 +153,15 @@ impl LinuxElfLoader {
             // the already-kernel-mapped binary via AT_PHDR / AT_ENTRY instead of calling
             // mmap() from user space to re-load it – which is the path that breaks in the
             // fork+execve case and causes a page fault at the raw e_entry (e.g. 0x423a7).
-            let inode = self.root_inode.lookup(interp).map_err(|e| {
-                error!("elf: lookup interp {:?} failed: {:?}", interp, e);
+            let interp_rel = interp.trim_start_matches('/');
+            let inode = self.root_inode.lookup_follow(interp_rel, 4).map_err(|e| {
+                error!("elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)", interp, e);
                 e
             })?;
-            let interp_data = inode.read_as_vec()?;
+            let interp_data = inode.read_as_vec().map_err(|e| {
+                error!("elf: read interp {:?} failed: {:?}", interp, e);
+                e
+            })?;
             let interp_elf = ElfFile::new(&interp_data).map_err(|_| {
                 error!("elf: interp {:?} is not a valid ELF", interp);
                 ZxError::INVALID_ARGS
@@ -248,13 +255,19 @@ impl LinuxElfLoader {
             // program). Using interp_base + interp_size ensures brk does not overlap
             // any already-allocated segment.
             let initial_brk = interp_base + interp_size;
-            return Ok((interp_entry, sp, initial_brk));
+            return Ok((interp_entry, sp, initial_brk, path));
         }
 
         let size = elf.load_segment_size();
-        let image_vmar = vmar.allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
+        let image_vmar = vmar.allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
+            error!("elf: allocate vmar for size {:#x} failed: {:?}", size, e);
+            e
+        })?;
         let base = image_vmar.addr();
-        let vmo = image_vmar.load_from_elf(&elf)?;
+        let vmo = image_vmar.load_from_elf(&elf).map_err(|e| {
+            error!("elf: load_from_elf failed: {:?}", e);
+            e
+        })?;
         let entry = base + elf.header.pt2.entry_point() as usize;
 
         debug!(
@@ -274,7 +287,7 @@ impl LinuxElfLoader {
             Err(error) => {
                 // Segments stay mapped under `image_vmar.addr()`; do not clobber `base` with the
                 // first program header vaddr (often not PT_LOAD). Wrong AT_BASE breaks PIE/musl
-                // (e.g. user PC stuck at raw e_entry like 0x423a7 → page fault NOT_FOUND).
+                // (e.g. user PC stuck at raw e_entry like 0x423a7 -> page fault NOT_FOUND).
                 warn!(
                     "elf relocate Err:{:?}, keeping load base {:#x}",
                     error, base
@@ -349,6 +362,6 @@ impl LinuxElfLoader {
 
         // Initial brk: right after the loaded image.
         let initial_brk = base + size;
-        Ok((entry, sp, initial_brk))
+        Ok((entry, sp, initial_brk, path))
     }
 }

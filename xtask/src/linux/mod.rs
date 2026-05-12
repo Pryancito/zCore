@@ -76,52 +76,6 @@ impl LinuxRootfs {
 
         // 拷贝 busybox
         fs::copy(busybox, bin.join("busybox")).unwrap();
-        // 拷贝 dhcpcd
-        let dhcpcd = self.dhcpcd(&musl);
-        if dhcpcd.is_file() {
-            fs::copy(&dhcpcd, bin.join("dhcpcd")).unwrap();
-            
-            // 拷贝 dhcpcd 配置和 hooks
-            let dhcpcd_dir = PROJECT_DIR.join("tools").join("dhcpcd");
-            let etc = dir.join("etc");
-            fs::copy(dhcpcd_dir.join("src/dhcpcd.conf"), etc.join("dhcpcd.conf")).unwrap();
-            
-            let lib_dhcpcd = dir.join("lib").join("dhcpcd");
-            let hooks_dir = lib_dhcpcd.join("dhcpcd-hooks");
-            fs::create_dir_all(&hooks_dir).unwrap();
-            fs::copy(dhcpcd_dir.join("hooks/dhcpcd-run-hooks"), lib_dhcpcd.join("dhcpcd-run-hooks")).unwrap();
-            for hook in ["01-test", "20-resolv.conf", "30-hostname"] {
-                let from = dhcpcd_dir.join("hooks").join(hook);
-                if from.is_file() {
-                    fs::copy(from, hooks_dir.join(hook)).unwrap();
-                }
-            }
-
-            // Create directories for dhcpcd runtime files
-            let var_run_dhcpcd = dir.join("var/run/dhcpcd");
-            fs::create_dir_all(&var_run_dhcpcd).unwrap();
-            let var_lib_dhcpcd = dir.join("var/lib/dhcpcd");
-            fs::create_dir_all(&var_lib_dhcpcd).unwrap();
-
-            // /run/dhcpcd — dhcpcd control socket lives here by default
-            let run_dhcpcd = dir.join("run/dhcpcd");
-            fs::create_dir_all(&run_dhcpcd).unwrap();
-
-            // Write a minimal dhcpcd.conf — always overwrite to ensure hooks are disabled.
-            // This lets us test if dhcpcd progresses past PREINIT without the hook layer.
-            let etc = dir.join("etc");
-            fs::create_dir_all(&etc).unwrap();
-            let dhcpcd_conf = etc.join("dhcpcd.conf");
-            fs::write(&dhcpcd_conf,
-                b"# Eclipse OS dhcpcd configuration\n\
-                  # Disable ALL hooks -- Eclipse OS does not support the full hook layer yet\n\
-                  nohook *\n\
-                  nodev\n\
-                  broadcast\n\
-                  timeout 30\n\
-                  reboot 5\n"
-            ).unwrap();
-        }
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
         let machine_id = dir.join("etc/machine-id");
@@ -137,16 +91,40 @@ impl LinuxRootfs {
         let to = lib.join(format!("ld-musl-{arch}.so.1", arch = self.0.name()));
         fs::copy(from, &to).unwrap();
         Ext::new(self.strip(&musl)).arg("-s").arg(to).invoke();
-        // 为常用功能建立符号链接
-        const SH: &[&str] = &[
-            "cat", "cp", "echo", "false", "grep", "gzip", "ip", "kill", "ln", "ls", "mkdir", "mv",
-            "pidof", "ping", "ping6", "printenv", "ps", "pwd", "rm", "rmdir", "sh", "sleep",
-            "stat", "tar", "touch", "true", "uname", "usleep", "watch", "ifconfig", "route",
-            "udhcpc",
-        ];
+        // 为 busybox 支持的所有 applets 建立符号链接
         let bin = dir.join("bin");
-        for sh in SH {
-            unix::fs::symlink("busybox", bin.join(sh)).unwrap();
+        let busybox_bin = bin.join("busybox");
+        
+        // Base list of essential applets
+        let mut applets: Vec<String> = vec![
+            "cat", "cp", "echo", "false", "grep", "gzip", "ip", "kill",
+            "ln", "ls", "mkdir", "mv", "pidof", "ping", "ps", "pwd", "rm", 
+            "rmdir", "sh", "sleep", "stat", "tar", "touch", "true", "uname", 
+            "usleep", "watch", "ifconfig", "route", "udhcpc", "udhcpc6", 
+            "sed", "awk", "cmp", "diff", "logger", "hostname", "cut", "sort", 
+            "uniq", "head", "tail", "wc", "xargs", "find", "test", "expr", 
+            "id", "date", "env", "chmod", "chown", "vi", "top", "less"
+        ].into_iter().map(String::from).collect();
+
+        // Try to complement the list with busybox --list if it can run on host
+        if let Ok(out) = std::process::Command::new(&busybox_bin).arg("--list").output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    for line in s.lines() {
+                        let applet = line.trim().to_string();
+                        if !applet.is_empty() && !applets.contains(&applet) {
+                            applets.push(applet);
+                        }
+                    }
+                }
+            }
+        }
+
+        for applet in &applets {
+            let link = bin.join(applet);
+            if !link.exists() && !link.is_symlink() {
+                let _ = unix::fs::symlink("busybox", &link);
+            }
         }
         // Create standard pseudo-filesystem mount points
         let _ = fs::create_dir_all(dir.join("run"));
@@ -198,6 +176,15 @@ impl LinuxRootfs {
             let _ = dir::rm(&dst);
             fs::copy(&nl_dump, &dst).unwrap();
         }
+
+        // 拷贝 edhcpc (Eclipse DHCPv4 client).
+        // This is a static, minimal DHCPv4 client that uses rtnetlink to apply IP/gw.
+        let edhcpc = self.edhcpc(&musl);
+        if edhcpc.is_file() {
+            let dst = bin.join("edhcpc");
+            let _ = dir::rm(&dst);
+            fs::copy(&edhcpc, &dst).unwrap();
+        }
     }
 
     /// 将 musl 动态库放入 rootfs。
@@ -240,15 +227,34 @@ impl LinuxRootfs {
         dircpy::copy_dir(source, &target).unwrap();
         // 配置
         Make::new().current_dir(&target).arg("defconfig").invoke();
+        // Force static linking and disable PIE (Type EXEC is more stable in zCore)
+        Ext::new("sed")
+            .current_dir(&target)
+            .arg("-i")
+            .arg("s/.*CONFIG_STATIC.*/CONFIG_STATIC=y/\
+                  s/.*CONFIG_PIE.*/CONFIG_PIE=n/\
+                  s/.*CONFIG_FEATURE_INDIVIDUAL.*/CONFIG_FEATURE_INDIVIDUAL=n/\
+                  s/.*CONFIG_FEATURE_SHARED_BUSYBOX.*/CONFIG_FEATURE_SHARED_BUSYBOX=n/")
+            .arg(".config")
+            .invoke();
+
         // 编译
-        let musl = musl.as_ref();
+        let musl = musl.as_ref().canonicalize().unwrap();
+        let cross_compile = format!(
+            "{musl}/bin/{arch}-linux-musl-",
+            musl = musl.display(),
+            arch = self.0.name(),
+        );
+        
         Make::new()
             .current_dir(&target)
-            .arg(format!(
-                "CROSS_COMPILE={musl}/{arch}-linux-musl-",
-                musl = musl.canonicalize().unwrap().join("bin").display(),
-                arch = self.0.name(),
-            ))
+            .arg(format!("CROSS_COMPILE={cross_compile}"))
+            .arg("LDFLAGS=-static -no-pie")
+            .arg("EXTRA_LDFLAGS=-static -no-pie")
+            .arg("CFLAGS=-fno-PIC -fno-PIE")
+            .arg("EXTRA_CFLAGS=-fno-PIC -fno-PIE")
+            .arg("CONFIG_STATIC=y")
+            .arg("CONFIG_PIE=n")
             .invoke();
         // 裁剪
         Ext::new(self.strip(musl))
@@ -352,50 +358,6 @@ cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz'
         path
     }
 
-    /// 编译 dhcpcd。
-    fn dhcpcd(&self, musl: &Path) -> PathBuf {
-        let dhcpcd_dir = PROJECT_DIR.join("tools").join("dhcpcd");
-        let executable = dhcpcd_dir.join("src/dhcpcd");
-
-        if executable.is_file() {
-            return executable;
-        }
-
-        println!("Compiling dhcpcd...");
-        let musl = musl.canonicalize().unwrap();
-        let bin = musl.join("bin");
-        let arch = self.0.name();
-
-        // 尝试编译
-        let mut res = Ext::new("./configure")
-            .current_dir(&dhcpcd_dir)
-            .env("CC", format!("{}/{}-linux-musl-gcc", bin.display(), arch))
-            .arg("--prefix=")
-            .arg("--sbindir=/bin")
-            .arg("--sysconfdir=/etc")
-            .arg("--dbdir=/var/lib/dhcpcd")
-            .arg("--libexecdir=/lib/dhcpcd")
-            .arg("--disable-privsep")
-            .arg("--without-dev")
-            .status();
-
-        if res.success() {
-            res = Make::new().current_dir(&dhcpcd_dir).status();
-        }
-
-        if !res.success() {
-            println!("Failed to compile dhcpcd");
-        } else {
-            // 裁剪
-            Ext::new(self.strip(&musl))
-                .arg("-s")
-                .arg(&executable)
-                .invoke();
-        }
-
-        executable
-    }
-
     /// 编译 nl_dump (static netlink dump helper).
     fn nl_dump(&self, musl: &Path) -> PathBuf {
         let dir = PROJECT_DIR.join("tools").join("nl_dump");
@@ -433,6 +395,50 @@ cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz'
             .status();
         if !status.success() {
             println!("Failed to compile nl_dump");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// 编译 edhcpc (static DHCPv4 client for Eclipse OS).
+    fn edhcpc(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("edhcpc");
+        let executable = dir.join("edhcpc");
+        let source = dir.join("edhcpc.c");
+        // Rebuild if missing or if source is newer than the binary.
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified())
+                {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling edhcpc...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile edhcpc");
             return executable;
         }
 

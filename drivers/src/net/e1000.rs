@@ -15,18 +15,18 @@ use smoltcp::Result;
 
 use super::{timer_now_as_micros, ProviderImpl};
 use crate::net::get_sockets;
-use crate::scheme::{NetScheme, Scheme};
-use crate::{DeviceError, DeviceResult};
+use crate::scheme::{NetScheme, Scheme, SchemeUpcast};
+use crate::{Device, DeviceError, DeviceResult};
+use crate::bus::pci_drivers::PciDriver;
+use crate::builder::IoMapper;
+use pci::{PCIDevice, BAR};
 use isomorphic_drivers::net::ethernet::intel::e1000::E1000;
 use isomorphic_drivers::net::ethernet::structs::EthernetAddress as DriverEthernetAddress;
 use lock::Mutex;
 
 #[derive(Clone)]
 pub struct E1000Driver {
-    hw: Arc<Mutex<E1000<ProviderImpl>>>,
-    /// Shared raw frame queue — frames are cloned here by RxToken::consume()
-    /// so AF_PACKET sockets can read them even after smoltcp has processed them.
-    raw_rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    pub hw: Arc<Mutex<E1000<crate::net::ProviderImpl>>>,
 }
 
 #[derive(Clone)]
@@ -44,25 +44,20 @@ impl Scheme for E1000Interface {
 
     fn handle_irq(&self, irq: usize) {
         if irq != self.irq {
-            // not ours, skip it
             return;
         }
 
-        let data = self.driver.hw.lock().handle_interrupt();
-
-        if data {
-            let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-            let sockets = get_sockets();
-            let mut sockets = sockets.lock();
-            match self.iface.lock().poll(&mut sockets, timestamp) {
-                Ok(p) => {
-                    //SOCKET_ACTIVITY.notify_all();
-                    trace!("e1000 try_handle_interrupt poll: {:?}", p);
+        let mut hw = self.driver.hw.lock();
+        if hw.handle_interrupt() {
+            let self_clone = self.clone();
+            crate::utils::deferred_job::push_deferred_job(move || {
+                let ts = Instant::from_micros(timer_now_as_micros() as i64);
+                let sockets = get_sockets();
+                let mut sockets = sockets.lock();
+                if let Err(e) = self_clone.iface.lock().poll(&mut sockets, ts) {
+                    warn!("[e1000] poll error: {}", e);
                 }
-                Err(err) => {
-                    warn!("poll got err {}", err);
-                }
-            }
+            });
         }
     }
 }
@@ -87,7 +82,6 @@ impl NetScheme for E1000Interface {
         let mut sockets = sockets.lock();
         match self.iface.lock().poll(&mut sockets, timestamp) {
             Ok(p) => {
-                //SOCKET_ACTIVITY.notify_all();
                 trace!("e1000 NetScheme poll: {:?}", p);
                 Ok(())
             }
@@ -99,16 +93,10 @@ impl NetScheme for E1000Interface {
     }
 
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
-        // Check raw_rx_queue first (filled by RxToken::consume via smoltcp poll).
-        if let Some(pkt) = self.driver.raw_rx_queue.lock().pop_front() {
+        // Try to read directly from hardware.
+        if let Some(pkt) = self.driver.hw.lock().receive() {
             let n = pkt.len().min(buf.len());
             buf[..n].copy_from_slice(&pkt[..n]);
-            return Ok(n);
-        }
-        // Fallback: try to read directly from hardware.
-        if let Some(vec_recv) = self.driver.hw.lock().receive() {
-            let n = vec_recv.len().min(buf.len());
-            buf[..n].copy_from_slice(&vec_recv[..n]);
             Ok(n)
         } else {
             Err(DeviceError::NotReady)
@@ -126,13 +114,7 @@ impl NetScheme for E1000Interface {
     }
 
     fn can_recv(&self) -> bool {
-        // Check if we have buffered frames first.
-        if !self.driver.raw_rx_queue.lock().is_empty() {
-            return true;
-        }
-        // We cannot safely peek the DMA ring without consuming. Return true so
-        // callers always attempt recv(); the actual receive will return NotReady
-        // if there is nothing available.
+        // Return true so callers always attempt recv(); actual receive will return NotReady if nothing.
         true
     }
 
@@ -164,7 +146,6 @@ impl NetScheme for E1000Interface {
 
 pub struct E1000RxToken {
     data: Vec<u8>,
-    raw_rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
 pub struct E1000TxToken(E1000Driver);
@@ -174,18 +155,12 @@ impl phy::Device<'_> for E1000Driver {
     type TxToken = E1000TxToken;
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.hw
-            .lock()
-            .receive()
-            .map(|vec_recv| {
-                (
-                    E1000RxToken {
-                        data: vec_recv,
-                        raw_rx_queue: self.raw_rx_queue.clone(),
-                    },
-                    E1000TxToken(self.clone()),
-                )
-            })
+        self.hw.lock().receive().map(|pkt| {
+            (
+                E1000RxToken { data: pkt },
+                E1000TxToken(self.clone()),
+            )
+        })
     }
 
     fn transmit(&mut self) -> Option<Self::TxToken> {
@@ -209,9 +184,8 @@ impl phy::RxToken for E1000RxToken {
     where
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
-        // Clone the raw frame into the shared queue BEFORE smoltcp processes it.
-        // This ensures AF_PACKET sockets (udhcpc, dhcpcd) can see every frame.
-        self.raw_rx_queue.lock().push_back(self.data.clone());
+        // Dispatch to global packet tapping (AF_PACKET sockets)
+        super::net_dispatch_packet(&self.data);
         f(&mut self.data)
     }
 }
@@ -231,7 +205,6 @@ impl phy::TxToken for E1000TxToken {
     }
 }
 
-// JudgeDuck-OS/kern/e1000.c
 pub fn init(
     name: String,
     irq: usize,
@@ -241,20 +214,14 @@ pub fn init(
 ) -> DeviceResult<E1000Interface> {
     info!("Probing e1000 {}", name);
 
-    // randomly generated
     let mac: [u8; 6] = [0x54, 0x51, 0x9F, 0x71, 0xC0, index as u8];
-
     let e1000 = E1000::new(header, size, DriverEthernetAddress::from_bytes(&mac));
-
-    let raw_rx_queue = Arc::new(Mutex::new(VecDeque::new()));
-    let net_driver = E1000Driver {
-        hw: Arc::new(Mutex::new(e1000)),
-        raw_rx_queue: raw_rx_queue.clone(),
-    };
+    let hw = Arc::new(Mutex::new(e1000));
+    let net_driver = E1000Driver { hw: hw.clone() };
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac);
     let ip_addrs = [IpCidr::new(IpAddress::v4(10, 0, 2, (15 + index) as u8), 24)];
-    let default_v4_gw = Ipv4Address::new(10, 0, 2, 2); //Qemu user network gateway: 10.0.2.2
+    let default_v4_gw = Ipv4Address::new(10, 0, 2, 2);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
     routes.add_default_ipv4_route(default_v4_gw).unwrap();
@@ -280,4 +247,31 @@ pub fn init(
     };
 
     Ok(e1000_iface)
+}
+
+pub struct E1000DriverPci;
+
+impl PciDriver for E1000DriverPci {
+    fn name(&self) -> &str {
+        "e1000"
+    }
+
+    fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
+        vendor_id == 0x8086 && (device_id == 0x100e || device_id == 0x100f)
+    }
+
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+        if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
+            if let Some(m) = mapper {
+                m.query_or_map(addr as usize, 4096 * 8);
+            }
+            let vaddr = crate::bus::phys_to_virt(addr as usize);
+            let name = alloc::format!("eth{}", dev.loc.bus);
+            let vector = irq.map(|idx| idx + 32).unwrap_or(0);
+            let iface = init(name, vector, vaddr, len as usize, 0)?;
+            Ok(Device::Net(Arc::new(iface)))
+        } else {
+            Err(crate::DeviceError::NotSupported)
+        }
+    }
 }

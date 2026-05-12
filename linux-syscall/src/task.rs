@@ -62,7 +62,6 @@ impl Syscall<'_> {
     ///   as the corresponding file descriptor in the parent.
     ///   This means that the two file descriptors share open file status flags and file offset.
     pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
-        error!("fork: enter");
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process(), false)?; // old pt NULL here
         let new_thread = Thread::create_linux(&new_proc)?;
@@ -88,9 +87,10 @@ impl Syscall<'_> {
     /// (either normally, by calling [`Self::sys_exit`], or abnormally, after delivery of a fatal signal),
     /// or it makes a call to [`Self::sys_execve`].
     pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
-        error!("vfork: enter");
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
+        self.zircon_process().vmar().dump();
         let new_proc = Process::fork_from(self.zircon_process(), true)?;
+        new_proc.vmar().dump();
         let new_thread = Thread::create_linux(&new_proc)?;
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {
@@ -109,7 +109,7 @@ impl Syscall<'_> {
             self.zircon_process().id(),
             new_proc.id()
         );
-        new_proc.wait_signal(Signal::SIGNALED).await; // wait for execve
+        new_proc.wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED).await; // wait for execve or termination
         Ok(new_proc.id() as usize)
     }
 
@@ -129,7 +129,6 @@ impl Syscall<'_> {
         newtls: usize,
         mut child_tid: UserOutPtr<i32>,
     ) -> SysResult {
-        error!("clone: enter");
         let _flags = CloneFlags::from_bits_truncate(flags);
         info!(
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
@@ -248,11 +247,22 @@ impl Syscall<'_> {
             "wait4: target={:?}, wstatus={:?}, options={:?}",
             target, wstatus, flags,
         );
-        let (pid, code) = match target {
+        let result = match target {
             WaitTarget::AnyChild | WaitTarget::AnyChildInGroup => {
-                wait_child_any(self.zircon_process(), nohang).await?
+                wait_child_any(self.zircon_process(), nohang).await
             }
-            WaitTarget::Pid(pid) => (pid, wait_child(self.zircon_process(), pid, nohang).await?),
+            WaitTarget::Pid(pid) => wait_child(self.zircon_process(), pid, nohang)
+                .await
+                .map(|code| (pid, code)),
+        };
+        let (pid, code) = match result {
+            Ok(pair) => pair,
+            Err(LxError::EAGAIN) if nohang => {
+                // WNOHANG: no child ready yet — return 0 per POSIX waitpid(2).
+                wstatus.write_if_not_null(0)?;
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
         };
         wstatus.write_if_not_null(code)?;
         Ok(pid as usize)
@@ -285,11 +295,12 @@ impl Syscall<'_> {
         argv: UserInPtr<UserInPtr<u8>>,
         envp: UserInPtr<UserInPtr<u8>>,
     ) -> SysResult {
-        error!("execve: enter");
         let path_str = path.as_c_str().map_err(|e| {
             error!("execve: path.as_c_str() failed: {:?}", e);
             e
         })?;
+        debug!("EXECVE ENTER: path={:?}", path_str);
+        warn!("EXECVE: path={:?}", path_str);
         let args = argv.read_cstring_array().map_err(|e| {
             error!("execve: argv.read_cstring_array() failed: {:?}", e);
             e
@@ -309,6 +320,9 @@ impl Syscall<'_> {
             error!("execve: args is empty");
             return Err(LxError::EINVAL);
         }
+        if args[0].is_empty() {
+            warn!("execve: argv[0] is empty for path {:?}", path_str);
+        }
 
         // TODO: check and kill other threads
 
@@ -325,15 +339,17 @@ impl Syscall<'_> {
         let vmar = self.zircon_process().vmar();
         vmar.clear()?;
 
-        // Modify exec path
-        proc.set_execute_path(&path_str);
-
-        let (entry, sp, initial_brk) = LinuxElfLoader {
+        let (entry, sp, initial_brk, execute_path) = LinuxElfLoader {
             syscall_entry: self.syscall_entry,
             stack_pages: USER_STACK_PAGES,
             root_inode: proc.root_inode().clone(),
         }
-        .load(&vmar, &data, args, envs, path_str)?;
+        .load(&vmar, &data, args, envs, path_str)
+        .map_err(|e| {
+            error!("execve: LinuxElfLoader::load failed: {:?}", e);
+            e
+        })?;
+        proc.set_execute_path(&execute_path);
         proc.set_brk(initial_brk);
 
         self.zircon_process().signal_set(Signal::SIGNALED);
@@ -389,7 +405,7 @@ impl Syscall<'_> {
     pub fn sys_exit(&mut self, exit_code: i32) -> SysResult {
         info!("exit: code={}", exit_code);
         self.thread.exit_linux(exit_code);
-        Err(LxError::ENOSYS)
+        Ok(0)
     }
 
     /// `sys_exit_group` is equivalent to [`Self::sys_exit`]
@@ -401,7 +417,7 @@ impl Syscall<'_> {
         info!("exit_group: code={}", exit_code);
         let proc = self.zircon_process();
         proc.exit(exit_code as i64);
-        Err(LxError::ENOSYS)
+        Ok(0)
     }
 
     /// Allows the calling thread to sleep for
@@ -457,6 +473,64 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         self.thread.set_robust_list(head, len);
+        Ok(0)
+    }
+
+    /// `getuid` returns the real user ID of the calling process.
+    pub fn sys_getuid(&self) -> SysResult {
+        debug!("getuid");
+        Ok(0)
+    }
+
+    /// `geteuid` returns the effective user ID of the calling process.
+    pub fn sys_geteuid(&self) -> SysResult {
+        debug!("geteuid");
+        Ok(0)
+    }
+
+    /// `getgid` returns the real group ID of the calling process.
+    pub fn sys_getgid(&self) -> SysResult {
+        debug!("getgid");
+        Ok(0)
+    }
+
+    /// `getegid` returns the effective group ID of the calling process.
+    pub fn sys_getegid(&self) -> SysResult {
+        debug!("getegid");
+        Ok(0)
+    }
+
+    /// `setpgid` sets the PGID of the process specified by pid to pgid.
+    pub fn sys_setpgid(&self, pid: usize, pgid: usize) -> SysResult {
+        debug!("setpgid: pid={}, pgid={}", pid, pgid);
+        // Stub: return success
+        Ok(0)
+    }
+
+    /// `getpgid` returns the PGID of the process specified by pid.
+    pub fn sys_getpgid(&self, pid: usize) -> SysResult {
+        debug!("getpgid: pid={}", pid);
+        // Stub: return pid as its own pgid
+        let proc = if pid == 0 {
+            self.zircon_process().id()
+        } else {
+            pid as u64
+        };
+        Ok(proc as usize)
+    }
+
+    /// `setsid` creates a new session if the calling process is not a process group leader.
+    pub fn sys_setsid(&self) -> SysResult {
+        debug!("setsid");
+        // Stub: return current pid as new sid
+        Ok(self.zircon_process().id() as usize)
+    }
+
+    /// `chmod` changes the mode of the file specified by path.
+    pub fn sys_chmod(&self, path: UserInPtr<u8>, mode: usize) -> SysResult {
+        let _path = path.as_c_str()?;
+        debug!("chmod: path={:?}, mode={:#o}", _path, mode);
+        // Stub: return success
         Ok(0)
     }
 }

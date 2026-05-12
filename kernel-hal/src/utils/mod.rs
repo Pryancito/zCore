@@ -11,6 +11,7 @@ pub(crate) mod init_once;
 
 pub mod lazy_init;
 pub mod mpsc_queue;
+pub mod deferred_job;
 
 #[cfg(not(feature = "libos"))]
 pub struct PerCpuCell<T>(pub UnsafeCell<T>);

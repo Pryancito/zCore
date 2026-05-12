@@ -336,7 +336,7 @@ impl Socket for NetlinkSocketState {
             NetlinkMessageType::GetRoute => {
                 // RTM_GETROUTE: dump the routing table.
                 // We currently have no way to enumerate smoltcp routes, so we
-                // return an empty table.  dhcpcd treats this as "no existing
+                // return an empty table.  Many DHCP clients treat this as "no existing
                 // routes to remove before adding ours", which is safe.
                 // The NLMSG_DONE sentinel is appended after the match block.
                 info!("[netlink] GetRoute: returning empty routing table");
@@ -344,7 +344,7 @@ impl Socket for NetlinkSocketState {
             NetlinkMessageType::DelAddr => {
                 // RTM_DELADDR: remove an IP address from an interface.
                 // Return a success ACK; the actual address removal is not
-                // implemented yet (dhcpcd treats a non-fatal error gracefully,
+                // implemented yet (clients treat a non-fatal error gracefully,
                 // but a clean ACK avoids unnecessary log noise).
                 info!("[netlink] DelAddr: ACK (address removal not yet implemented)");
                 push_ack(&mut buffer, header.nlmsg_seq);
@@ -437,7 +437,7 @@ impl Socket for NetlinkSocketState {
 
     fn endpoint(&self) -> Option<Endpoint> {
         // Use the kernel-object ID as nl_pid so that each socket gets a
-        // unique, non-zero identifier.  This is important because dhcpcd
+        // unique, non-zero identifier.  This is important because some clients
         // stores the route_fd's nl_pid as `priv->route_pid` and then
         // filters out netlink messages whose nlmsg_pid equals route_pid.
         // If nl_pid were 0 (the kernel's pid), every kernel reply would
@@ -484,6 +484,15 @@ impl FileLike for NetlinkSocketState {
         flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
         flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
         Ok(())
+    }
+
+    fn dup(&self) -> Arc<dyn FileLike> {
+        Arc::new(Self {
+            base: KObjectBase::new(),
+            data: self.data.clone(),
+            _local_endpoint: self._local_endpoint.clone(),
+            flags: self.flags.clone(),
+        })
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {

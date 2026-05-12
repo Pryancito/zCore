@@ -73,12 +73,16 @@ impl ProcessExt for Process {
 
         // notify parent on terminated
         let parent = parent.clone();
-        new_proc.add_signal_callback(Box::new(move |signal| {
-            if signal.contains(Signal::PROCESS_TERMINATED) {
-                info!("Received signal: {:?}", signal);
-                parent.signal_set(Signal::SIGCHLD);
+        new_proc.add_signal_callback(Box::new({
+            let parent = parent.clone();
+            let pid = new_proc.id();
+            move |signal| {
+                if signal.contains(Signal::PROCESS_TERMINATED) {
+                    warn!("Child {} terminated, signaling parent SIGCHLD", pid);
+                    parent.signal_set(Signal::SIGCHLD);
+                }
+                false
             }
-            false
         }));
         Ok(new_proc)
     }
@@ -92,20 +96,29 @@ impl ProcessExt for Process {
 /// - the child was stopped by a signal. TODO
 /// - the child was resumed by a signal. TODO
 pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxResult<ExitCode> {
+    let child = {
+        let inner = proc.linux().inner.lock();
+        inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
+    };
     loop {
-        let mut inner = proc.linux().inner.lock();
-        let child = inner.children.get(&pid).ok_or(LxError::ECHILD)?;
         if let Status::Exited(code) = child.status() {
+            let mut inner = proc.linux().inner.lock();
             inner.children.remove(&pid);
             return Ok((code as i32) << 8);
         }
         if nonblock {
             return Err(LxError::EAGAIN);
         }
-        let child: Arc<dyn KernelObject> = child.clone();
-        drop(inner);
-        child.signal_clear(Signal::PROCESS_TERMINATED);
-        child.wait_signal(Signal::PROCESS_TERMINATED).await;
+        let child_obj: Arc<dyn KernelObject> = child.clone();
+        child_obj.wait_signal(Signal::PROCESS_TERMINATED).await;
+
+        // Check again after wait
+        if let Status::Exited(code) = child.status() {
+            let mut inner = proc.linux().inner.lock();
+            inner.children.remove(&pid);
+            return Ok((code as i32) << 8);
+        }
+        continue;
     }
 }
 
@@ -116,21 +129,42 @@ pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(Ko
         if inner.children.is_empty() {
             return Err(LxError::ECHILD);
         }
+        let mut exited_pid = None;
+        warn!("wait_child_any: checking {} children", inner.children.len());
         for (&pid, child) in inner.children.iter() {
-            if let Status::Exited(code) = child.status() {
-                inner.children.remove(&pid);
-                return Ok((pid, (code as i32) << 8));
+            let status = child.status();
+            warn!("  child {}: status={:?}", pid, status);
+            if let Status::Exited(code) = status {
+                exited_pid = Some((pid, code));
+                break;
+            }
+        }
+        if let Some((pid, code)) = exited_pid {
+            warn!("wait_child_any: reaping child {}", pid);
+            inner.children.remove(&pid);
+            return Ok((pid, (code as i32) << 8));
+        }
+        if nonblock {
+            return Err(LxError::EAGAIN);
+        }
+        let proc_obj: Arc<dyn KernelObject> = proc.clone();
+        proc_obj.signal_clear(Signal::SIGCHLD);
+        // Check again after clear to avoid race
+        let mut found_exited = false;
+        for child in inner.children.values() {
+            if let Status::Exited(_) = child.status() {
+                found_exited = true;
+                break;
             }
         }
         drop(inner);
-        if nonblock {
-            warn!("Nonblock flag isn't supported");
-            // return Err(LxError::EAGAIN);
+        if found_exited {
+            warn!("wait_child_any: found exited child after clear, continuing");
+            continue;
         }
-        let proc: Arc<dyn KernelObject> = proc.clone();
-        proc.signal_clear(Signal::SIGCHLD);
-        //等待进程结束信号
-        proc.wait_signal(Signal::SIGCHLD).await;
+        warn!("wait_child_any: waiting for SIGCHLD");
+        proc_obj.wait_signal(Signal::SIGCHLD).await;
+        warn!("wait_child_any: woke up from SIGCHLD");
     }
 }
 

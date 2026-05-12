@@ -42,6 +42,12 @@ pub mod utils;
 ))]
 pub mod usb;
 
+/// Initialize all drivers.
+pub fn init() {
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    bus::pci_drivers::init_all();
+}
+
 /// The error type for external device.
 #[derive(Debug)]
 pub enum DeviceError {

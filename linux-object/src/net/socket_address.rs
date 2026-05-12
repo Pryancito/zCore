@@ -122,6 +122,8 @@ pub struct LinkLevelEndpoint {
     pub addr: [u8; 8],
     /// Hardware address length
     pub halen: u8,
+    /// Protocol (host-endian)
+    pub protocol: u16,
 }
 
 impl LinkLevelEndpoint {
@@ -131,12 +133,13 @@ impl LinkLevelEndpoint {
             interface_index: ifindex,
             addr: [0; 8],
             halen: 0,
+            protocol: 0,
         }
     }
 }
 
 /// missing documentation
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct NetlinkEndpoint {
     /// missing documentation
     pub port_id: u32,
@@ -183,7 +186,7 @@ impl From<Endpoint> for SockAddr {
             SockAddr {
                 addr_ll: SockAddrLl {
                     sll_family: AddressFamily::Packet.into(),
-                    sll_protocol: 0,
+                    sll_protocol: link_level.protocol.to_be(),
                     sll_ifindex: link_level.interface_index as u32,
                     sll_hatype: ARPHRD_ETHER, // Assume Ethernet
                     sll_pkttype: 0,
@@ -238,6 +241,7 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
                 let mut endpoint = LinkLevelEndpoint::new(addr.addr_ll.sll_ifindex as usize);
                 endpoint.halen = addr.addr_ll.sll_halen;
                 endpoint.addr.copy_from_slice(&addr.addr_ll.sll_addr);
+                endpoint.protocol = u16::from_be(addr.addr_ll.sll_protocol);
                 Ok(Endpoint::LinkLevel(endpoint))
             }
             AddressFamily::Netlink => Ok(Endpoint::Netlink(NetlinkEndpoint::new(

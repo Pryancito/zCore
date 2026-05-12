@@ -1,11 +1,115 @@
 use core::fmt;
 use log::{self, Level, LevelFilter, Log, Metadata, Record};
 
+// ---------------------------------------------------------------------------
+// Kernel log ring buffer  (exposed as "dmesg")
+// ---------------------------------------------------------------------------
+//
+// A fixed 256 KiB circular buffer holds all kernel log messages.
+// Access is serialized with a simple spinlock so it is safe to call from
+// any context, including interrupt handlers.
+
+const KLOG_BUF_SIZE: usize = 256 * 1024; // 256 KiB
+
+struct KlogBuf {
+    buf:   [u8; KLOG_BUF_SIZE],
+    head:  usize,   // write pointer (wraps around)
+    used:  usize,   // bytes currently stored (≤ KLOG_BUF_SIZE)
+}
+
+impl KlogBuf {
+    const fn new() -> Self {
+        Self { buf: [0u8; KLOG_BUF_SIZE], head: 0, used: 0 }
+    }
+
+    /// Append bytes; oldest data is silently overwritten when full.
+    fn write(&mut self, data: &[u8]) {
+        for &b in data {
+            self.buf[self.head] = b;
+            self.head = (self.head + 1) % KLOG_BUF_SIZE;
+            if self.used < KLOG_BUF_SIZE {
+                self.used += 1;
+            }
+        }
+    }
+
+    /// Copy the stored bytes (oldest first) into `dst`.
+    /// Returns the number of bytes written.
+    fn read_all(&self, dst: &mut [u8]) -> usize {
+        let len = self.used.min(dst.len());
+        if len == 0 { return 0; }
+        // start = position of oldest byte
+        let start = if self.used < KLOG_BUF_SIZE {
+            0
+        } else {
+            self.head  // head points to the oldest byte when full
+        };
+        for i in 0..len {
+            dst[i] = self.buf[(start + i) % KLOG_BUF_SIZE];
+        }
+        len
+    }
+
+    fn size(&self) -> usize { self.used }
+}
+
+struct KlogLock {
+    locked: core::sync::atomic::AtomicBool,
+    buf:    core::cell::UnsafeCell<KlogBuf>,
+}
+
+// SAFETY: we serialise all access with the spinlock.
+unsafe impl Sync for KlogLock {}
+unsafe impl Send for KlogLock {}
+
+impl KlogLock {
+    const fn new() -> Self {
+        Self {
+            locked: core::sync::atomic::AtomicBool::new(false),
+            buf: core::cell::UnsafeCell::new(KlogBuf::new()),
+        }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut KlogBuf) -> R) -> R {
+        use core::sync::atomic::Ordering;
+        // Spin until we acquire the lock.
+        while self.locked.compare_exchange_weak(
+            false, true, Ordering::Acquire, Ordering::Relaxed
+        ).is_err() {
+            core::hint::spin_loop();
+        }
+        // SAFETY: we hold the lock.
+        let r = f(unsafe { &mut *self.buf.get() });
+        self.locked.store(false, Ordering::Release);
+        r
+    }
+}
+
+static KLOG: KlogLock = KlogLock::new();
+
+/// Write a slice of bytes into the kernel log ring buffer.
+fn klog_write(data: &[u8]) {
+    KLOG.with(|b| b.write(data));
+}
+
+/// Copy the full kernel log into `dst` (oldest first).
+/// Returns the number of bytes written.
+pub fn klog_read_all(dst: &mut [u8]) -> usize {
+    KLOG.with(|b| b.read_all(dst))
+}
+
+/// Total bytes currently stored in the kernel log ring buffer.
+pub fn klog_size() -> usize {
+    KLOG.with(|b| b.size())
+}
+
 /// Initialize logging with the default max log level (WARN).
 pub fn init() {
     static LOGGER: SimpleLogger = SimpleLogger;
     log::set_logger(&LOGGER).unwrap();
     log::set_max_level(LevelFilter::Warn);
+    // Register the ring-buffer accessors so linux-syscall can read them.
+    kernel_hal::console::klog_register(klog_read_all, klog_size);
 }
 
 /// Reset max log level.
@@ -136,6 +240,41 @@ impl Log for SimpleLogger {
             info = with_color!(ColorCode::White, "{cpu_id} {pid}:{tid} {target}]"),
             data = with_color!(args_color, "{args}", args = record.args()),
         ));
+
+        // Also write a plain-text copy into the ring buffer for dmesg.
+        {
+            struct KlogWriter { buf: [u8; 1024], pos: usize }
+            impl fmt::Write for KlogWriter {
+                fn write_str(&mut self, s: &str) -> fmt::Result {
+                    let bytes = s.as_bytes();
+                    let free = self.buf.len().saturating_sub(self.pos);
+                    let n = bytes.len().min(free);
+                    self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+                    self.pos += n;
+                    Ok(())
+                }
+            }
+            let mut w = KlogWriter { buf: [0u8; 1024], pos: 0 };
+            let micros = now.as_micros();
+            let syslog_prio = match level {
+                Level::Error => 3u8,
+                Level::Warn  => 4,
+                Level::Info  => 6,
+                Level::Debug => 7,
+                Level::Trace => 7,
+            };
+            let _ = core::fmt::write(
+                &mut w,
+                format_args!(
+                    "<{prio}>[{s:>3}.{us:06}] {args}\n",
+                    prio = syslog_prio,
+                    s  = micros / 1_000_000,
+                    us = micros % 1_000_000,
+                    args = record.args(),
+                ),
+            );
+            klog_write(&w.buf[..w.pos]);
+        }
 
         // When running with `LOG=debug` (or more verbose) we still don't have a native GPU
         // driver early in boot. Mirror logs to the UEFI GOP framebuffer console so we can

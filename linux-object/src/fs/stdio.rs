@@ -15,6 +15,8 @@ use kernel_hal::console::{self, ConsoleWinSize};
 use lazy_static::lazy_static;
 use lock::Mutex;
 use rcore_fs::vfs::*;
+use zircon_object::object::KernelObject;
+use zircon_object::task::Thread;
 
 // Foreground process group for the (single) controlling TTY.
 // This is a minimal job-control hook for Ctrl+C / SIGINT delivery.
@@ -316,9 +318,24 @@ impl INode for Stdin {
             }
             TIOCGPGRP => {
                 // Get foreground process group.
-                // TODO: verify pointer
-                let pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
+                let mut pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
+                if pgid == 0 {
+                    // If no foreground group is set, pretend the caller is in foreground.
+                    // This is a common hack for simple OSs to support interactive shells.
+                    if let Some(arc) = kernel_hal::thread::get_current_thread() {
+                        if let Ok(thread) = arc.downcast::<Thread>() {
+                            pgid = thread.proc().id() as i32;
+                        }
+                    }
+                }
+                if pgid == 0 {
+                    pgid = 1;
+                }
                 unsafe { *(data as *mut i32) = pgid };
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                debug!("stdin TCSETS/W/F, stubbed.");
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),
@@ -327,6 +344,26 @@ impl INode for Stdin {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    /// Get metadata of the INode
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(Metadata {
+            dev: 1,
+            inode: 12,
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::CharDevice,
+            mode: 0o666,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: make_rdev(5, 0),
+        })
     }
 }
 
@@ -365,9 +402,22 @@ impl INode for Stdout {
             }
             TIOCGPGRP => {
                 // pretend to be have a tty process group
-                // TODO: verify pointer
-                let pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
+                let mut pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
+                if pgid == 0 {
+                    if let Some(arc) = kernel_hal::thread::get_current_thread() {
+                        if let Ok(thread) = arc.downcast::<Thread>() {
+                            pgid = thread.proc().id() as i32;
+                        }
+                    }
+                }
+                if pgid == 0 {
+                    pgid = 1;
+                }
                 unsafe { *(data as *mut i32) = pgid };
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                debug!("stdout TCSETS/W/F, stubbed.");
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),

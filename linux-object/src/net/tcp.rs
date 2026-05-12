@@ -26,10 +26,11 @@ pub struct TcpSocketState {
     /// Kernel object base
     base: KObjectBase,
     /// TcpSocket Inner
-    inner: Mutex<TcpInner>,
+    inner: Arc<Mutex<TcpInner>>,
 }
 
 /// TCP socket inner
+#[derive(Debug)]
 pub struct TcpInner {
     /// missing documentation
     handle: GlobalSocketHandle,
@@ -57,12 +58,12 @@ impl TcpSocketState {
 
         TcpSocketState {
             base: KObjectBase::new(),
-            inner: Mutex::new(TcpInner {
+            inner: Arc::new(Mutex::new(TcpInner {
                 handle,
                 local_endpoint: None,
                 is_listening: false,
                 flags: OpenFlags::RDWR,
-            }),
+            })),
         }
     }
 }
@@ -205,9 +206,12 @@ impl Socket for TcpSocketState {
         let socket = sets.get::<TcpSocket>(inner.handle.0);
 
         //Todo, syscall async poll needs to be executed after first Pending
-        if inner.is_listening && socket.is_active() {
-            // a new connection
-            read = true;
+        if inner.is_listening {
+            if let Some(ep) = inner.local_endpoint {
+                if let Ok(true) = crate::net::LISTEN_TABLE.can_accept(ep.port) {
+                    read = true;
+                }
+            }
         } else if !socket.is_open() {
             error = true;
         } else {
@@ -239,7 +243,6 @@ impl Socket for TcpSocketState {
     fn listen(&self) -> SysResult {
         let mut inner = self.inner.lock();
         if inner.is_listening {
-            // it is ok to listen twice
             info!("It's already listening");
             return Ok(0);
         }
@@ -247,71 +250,54 @@ impl Socket for TcpSocketState {
         let local_endpoint = inner.local_endpoint.ok_or(LxError::EINVAL)?;
         info!("socket listening on {:?}", local_endpoint);
 
-        let sets = get_sockets();
-        let mut sets = sets.lock();
-        let mut socket = sets.get::<TcpSocket>(inner.handle.0);
-
-        if socket.is_listening() {
-            return Ok(0);
-        }
-        match socket.listen(local_endpoint) {
-            Ok(()) => {
-                inner.is_listening = true;
-                Ok(0)
-            }
-            Err(_) => Err(LxError::EINVAL),
-        }
+        crate::net::LISTEN_TABLE.listen(local_endpoint)?;
+        inner.is_listening = true;
+        Ok(0)
     }
 
     fn shutdown(&self) -> SysResult {
+        let mut inner = self.inner.lock();
+        if inner.is_listening {
+            if let Some(ep) = inner.local_endpoint {
+                crate::net::LISTEN_TABLE.unlisten(ep.port);
+            }
+            inner.is_listening = false;
+        }
         let sets = get_sockets();
         let mut sets = sets.lock();
-        let mut socket = sets.get::<TcpSocket>(self.inner.lock().handle.0);
+        let mut socket = sets.get::<TcpSocket>(inner.handle.0);
         socket.close();
         Ok(0)
     }
 
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
-        let mut inner = self.inner.lock();
+        let inner = self.inner.lock();
         let endpoint = inner.local_endpoint.ok_or(LxError::EINVAL)?;
+        let non_block = inner.flags.contains(OpenFlags::NON_BLOCK);
+        drop(inner);
+        
         loop {
-            //poll_ifaces();
-            let sets = get_sockets();
-            let mut sets = sets.lock();
-            let socket = sets.get::<TcpSocket>(inner.handle.0);
-            if socket.is_active() {
-                let remote_endpoint = socket.remote_endpoint();
-                drop(socket);
-                drop(sets);
-
-                let new_socket = {
-                    let rx_buffer = TcpSocketBuffer::new(vec![0; TCP_RECVBUF]);
-                    let tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SENDBUF]);
-                    let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
-                    socket.listen(endpoint).unwrap();
-
-                    let new_handle = GlobalSocketHandle(get_sockets().lock().add(socket));
-                    let old_handle = ::core::mem::replace(&mut inner.handle, new_handle);
-
-                    Arc::new(TcpSocketState {
-                        base: KObjectBase::new(),
-                        inner: Mutex::new(TcpInner {
-                            handle: old_handle,
-                            local_endpoint: inner.local_endpoint,
-                            is_listening: false,
-                            flags: OpenFlags::RDWR,
-                        }),
-                    })
-                };
-
+            if let Ok((handle, (local, remote))) = crate::net::LISTEN_TABLE.accept(endpoint.port) {
+                let new_handle = GlobalSocketHandle(handle);
+                let new_socket = Arc::new(TcpSocketState {
+                    base: KObjectBase::new(),
+                    inner: Arc::new(Mutex::new(TcpInner {
+                        handle: new_handle,
+                        local_endpoint: Some(local),
+                        is_listening: false,
+                        flags: OpenFlags::RDWR,
+                    })),
+                });
                 return Ok((
                     new_socket as Arc<dyn FileLike>,
-                    Endpoint::Ip(remote_endpoint),
+                    Endpoint::Ip(remote),
                 ));
             } else {
-                drop(socket);
-                drop(sets);
+                if non_block {
+                    return Err(LxError::EAGAIN);
+                }
                 poll_ifaces();
+                kernel_hal::thread::yield_now().await;
             }
         }
     }
@@ -374,20 +360,10 @@ impl FileLike for TcpSocketState {
     }
 
     fn dup(&self) -> Arc<dyn FileLike> {
-        unimplemented!()
-        /*
-        let sockets = get_sockets();
-        let mut set = sockets.lock();
-        let socket = set.get::<TcpSocket>(self.handle.0);
-        let new_handle = GlobalSocketHandle(set.add(*socket));
         Arc::new(Self {
             base: KObjectBase::new(),
-            handle: new_handle,
-            local_endpoint: self.local_endpoint,
-            is_listening: self.is_listening,
-            flags: RwLock::new(*self.flags.read()),
+            inner: self.inner.clone(),
         })
-        */
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {

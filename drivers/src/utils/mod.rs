@@ -3,11 +3,13 @@
 mod event_listener;
 mod id_allocator;
 mod irq_manager;
+pub mod deferred_job;
 
 #[cfg(feature = "graphic")]
 mod graphic_console;
 
 pub mod devicetree;
+pub mod dma;
 
 pub(super) use id_allocator::IdAllocator;
 pub(super) use irq_manager::IrqManager;

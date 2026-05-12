@@ -20,8 +20,12 @@ use smoltcp::wire::*;
 use smoltcp::Result as SmolResult;
 
 use crate::net::get_sockets;
-use crate::scheme::{NetScheme, Scheme};
-use crate::{DeviceError, DeviceResult};
+use crate::scheme::{NetScheme, Scheme, SchemeUpcast};
+use crate::{Device, DeviceError, DeviceResult};
+use crate::bus::pci_drivers::PciDriver;
+use crate::builder::IoMapper;
+use crate::utils::dma::DmaRegion;
+use pci::{PCIDevice, BAR};
 use lock::Mutex;
 
 use super::timer_now_as_micros;
@@ -44,6 +48,9 @@ const E1000E_TIPG: usize = 0x0410 / 4;
 const E1000E_RDBAL: usize = 0x2800 / 4;
 const E1000E_RDBAH: usize = 0x2804 / 4;
 const E1000E_RDLEN: usize = 0x2808 / 4;
+const E1000E_RDTR: usize = 0x2820 / 4; // RX Delay Timer
+const E1000E_RADV: usize = 0x282C / 4; // RX Absolute Delay Timer
+const E1000E_ITR: usize = 0x00C4 / 4; // Interrupt Throttling Rate
 const E1000E_RDH: usize = 0x2810 / 4;
 const E1000E_RDT: usize = 0x2818 / 4;
 // Transmit descriptor ring
@@ -84,8 +91,12 @@ const NVM_POLL_US: u64 = 10_000;
 
 // RCTL bits
 const RCTL_EN: u32 = 1 << 1;
+const RCTL_SBP: u32 = 1 << 2;
+const RCTL_UPE: u32 = 1 << 3;
+const RCTL_MPE: u32 = 1 << 4;
+const RCTL_LPE: u32 = 1 << 5;
 const RCTL_BAM: u32 = 1 << 15; // broadcast accept
-const RCTL_BSIZE_4K: u32 = (3 << 16) | (1 << 25); // BSIZE=3, BSEX=1 → 4096 B
+const RCTL_BSIZE_2K: u32 = (0 << 16);
 const RCTL_SECRC: u32 = 1 << 26; // strip CRC
 
 // TCTL bits
@@ -102,7 +113,7 @@ const RX_STATUS_EOP: u8 = 1 << 1;
 
 const NUM_RX: usize = 256;
 const NUM_TX: usize = 256;
-const BUF_SIZE: usize = 4096;
+const BUF_SIZE: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // Descriptor layouts (§3.2.3 / §3.3.3 of 82574 datasheet)
@@ -171,20 +182,16 @@ unsafe fn mmio_flush(base: usize, reg: usize) {
 // ---------------------------------------------------------------------------
 // E1000eHw — raw hardware state
 // ---------------------------------------------------------------------------
-struct E1000eHw {
+pub struct E1000eHw {
     base: usize, // MMIO virtual base
     mac: [u8; 6],
 
-    rx_ring_va: usize,
-    rx_ring_pa: usize,
-    rx_bufs_va: Vec<usize>,
-    rx_bufs_pa: Vec<usize>,
+    rx_ring: DmaRegion,
+    rx_bufs: Vec<DmaRegion>,
     rx_tail: usize,
 
-    tx_ring_va: usize,
-    tx_ring_pa: usize,
-    tx_bufs_va: Vec<usize>,
-    tx_bufs_pa: Vec<usize>,
+    tx_ring: DmaRegion,
+    tx_bufs: Vec<DmaRegion>,
     tx_tail: usize,
     tx_head_shadow: usize,
     tx_first: bool,
@@ -194,9 +201,9 @@ impl E1000eHw {
     fn recycle_rx_desc(&mut self, idx: usize, desc: &mut RxDesc) {
         desc.status = 0;
         desc.errors = 0;
-        desc.addr = self.rx_bufs_pa[idx] as u64;
         fence(Ordering::SeqCst);
-        self.rx_tail = idx;
+        self.rx_tail = (idx + 1) % NUM_RX;
+        // CRITICAL: Hardware only sees the new descriptors when we update RDT.
         unsafe { mmio_write(self.base, E1000E_RDT, idx as u32) };
     }
 
@@ -277,14 +284,7 @@ impl E1000eHw {
     // Full hardware reset + init
     // -----------------------------------------------------------------------
     unsafe fn reset_and_init(&mut self) -> DeviceResult {
-        // 1. Disable all interrupts before reset
-        mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
-        // Flush with a read (device still alive here)
-        let _ = mmio_read(self.base, E1000E_STATUS);
-
         // 1b. Try reading MAC from hardware (BIOS initialized) before we reset it.
-        // On many modern Intel NICs (I217/I218/I219), the MAC is pre-loaded into
-        // RAL0/RAH0 by the BIOS/firmware and might not be easily readable via EERD.
         self.read_mac_from_hw();
         let mut mac_found = self.is_valid_mac();
         if mac_found {
@@ -367,6 +367,7 @@ impl E1000eHw {
 
         // 6. Set link-up + auto-speed detection
         let ctrl = mmio_read(self.base, E1000E_CTRL);
+        const CTRL_ILOS: u32 = 1 << 7;
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_SLU | CTRL_ASDE);
 
         // 7. Clear MTA (multicast table)
@@ -374,27 +375,30 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_MTA_BASE + i, 0);
         }
 
-        // 8. Program receive address (RAL/RAH)
+        // 6. Set receive address 0 (RAL0/RAH0) to our MAC
         let ral = (self.mac[0] as u32)
             | ((self.mac[1] as u32) << 8)
             | ((self.mac[2] as u32) << 16)
             | ((self.mac[3] as u32) << 24);
-        let rah = (self.mac[4] as u32) | ((self.mac[5] as u32) << 8) | (1u32 << 31); // AV (Address Valid) bit
-        mmio_write(self.base, E1000E_RAL0, ral);
-        mmio_write(self.base, E1000E_RAH0, rah);
+        let rah = (self.mac[4] as u32) | ((self.mac[5] as u32) << 8) | (1u32 << 31); // bit 31 = Address Valid
+        unsafe {
+            mmio_write(self.base, E1000E_RAL0, ral);
+            mmio_write(self.base, E1000E_RAH0, rah);
+        }
 
         // 9. Zero DMA rings and fill RX descriptor buffer pointers
-        let rx_ring = self.rx_ring_va as *mut RxDesc;
-        let tx_ring = self.tx_ring_va as *mut TxDesc;
+        let rx_ring = self.rx_ring.as_ptr::<RxDesc>();
+        let tx_ring = self.tx_ring.as_ptr::<TxDesc>();
         core::ptr::write_bytes(rx_ring, 0, NUM_RX);
         core::ptr::write_bytes(tx_ring, 0, NUM_TX);
         for i in 0..NUM_RX {
-            (*rx_ring.add(i)).addr = self.rx_bufs_pa[i] as u64;
+            (*rx_ring.add(i)).addr = self.rx_bufs[i].paddr() as u64;
         }
 
         // 10. Configure TX ring
-        mmio_write(self.base, E1000E_TDBAL, self.tx_ring_pa as u32);
-        mmio_write(self.base, E1000E_TDBAH, (self.tx_ring_pa >> 32) as u32);
+        let tx_ring_pa = self.tx_ring.paddr();
+        mmio_write(self.base, E1000E_TDBAL, tx_ring_pa as u32);
+        mmio_write(self.base, E1000E_TDBAH, (tx_ring_pa >> 32) as u32);
         mmio_write(
             self.base,
             E1000E_TDLEN,
@@ -411,26 +415,80 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_TIPG, 10u32 | (8 << 10) | (12 << 20));
 
         // 11. Configure RX ring
-        mmio_write(self.base, E1000E_RDBAL, self.rx_ring_pa as u32);
-        mmio_write(self.base, E1000E_RDBAH, (self.rx_ring_pa >> 32) as u32);
+        let rx_ring_pa = self.rx_ring.paddr();
+        mmio_write(self.base, E1000E_RDBAL, rx_ring_pa as u32);
+        mmio_write(self.base, E1000E_RDBAH, (rx_ring_pa >> 32) as u32);
         mmio_write(
             self.base,
             E1000E_RDLEN,
             (NUM_RX * size_of::<RxDesc>()) as u32,
         );
-        mmio_write(self.base, E1000E_RDH, 0);
-        mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32);
-        mmio_write(
-            self.base,
-            E1000E_RCTL,
-            RCTL_EN | RCTL_BAM | RCTL_BSIZE_4K | RCTL_SECRC,
-        );
+        unsafe { mmio_write(self.base, E1000E_RDH, 0) };
+        unsafe { mmio_write(self.base, E1000E_RDT, 0) };
+        self.rx_tail = 0; // rx_tail now tracks the next descriptor to check
 
-        // 12. Clear any pending interrupts, then enable RX (RXT0 = bit 7)
-        mmio_write(self.base, E1000E_ICR, 0xFFFF_FFFF);
-        mmio_write(self.base, E1000E_IMS, 1 << 7);
+        // 6c. Disable RX Delay Timers for immediate write-back
+        unsafe { mmio_write(self.base, E1000E_RDTR, 0) };
+        unsafe { mmio_write(self.base, E1000E_RADV, 0) };
+        unsafe { mmio_write(self.base, E1000E_ITR, 0) }; // Also disable Interrupt Throttling
+        
+        // 6b. Zero Multicast Table Array (MTA)
+        for i in 0..128 {
+            unsafe { mmio_write(self.base, 0x05200 + (i * 4), 0) };
+        }
+        
+        // Set PBA (Packet Buffer Allocation)
+        // 0x100030: 16KB for RX, 48KB for TX
+        unsafe { mmio_write(self.base, 0x01000, 0x00100030) };
+
+        // 7. Enable receiver
+        // 6. Enable RX
+        // EN: bit 1, SBP: bit 2, UPE: bit 3, MPE: bit 4, LPE: bit 5, BAM: bit 15, SECRC: bit 26
+        let rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_LPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
+        warn!("[e1000e] setting RCTL={:#x}", rctl);
+        unsafe { mmio_write(self.base, E1000E_RCTL, rctl) };
+        
+        // Set RXDCTL (RX Descriptor Control)
+        // GRAN=1 (descriptors), WTHRESH=0 (write back immediately)
+        unsafe { mmio_write(self.base, 0x02828, (1 << 24)) };
+        
+        // Wait a bit for the receiver to stabilize
+        for _ in 0..1000 { unsafe { core::arch::x86_64::_mm_pause() }; }
+
+        // CRITICAL: Set RDT *AFTER* RCTL_EN per datasheet §13.4.18
+        unsafe { mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32) };
+
+        // 12. Clear any pending interrupts, then enable all interrupts
+        let _ = mmio_read(self.base, E1000E_ICR);
+        mmio_write(self.base, E1000E_IMS, 0xFFFF_FFFF);
+        
+        // Disable interrupt throttling and delay timers for lower latency/polling
+        mmio_write(self.base, E1000E_ITR, 0);
+        mmio_write(self.base, E1000E_RDTR, 0);
+        mmio_write(self.base, E1000E_RADV, 0);
 
         let status = mmio_read(self.base, E1000E_STATUS);
+        let rctl = mmio_read(self.base, E1000E_RCTL);
+        let tctl = mmio_read(self.base, E1000E_TCTL);
+        let rdbal = mmio_read(self.base, E1000E_RDBAL);
+        let rdbah = mmio_read(self.base, E1000E_RDBAH);
+        let rdlen = mmio_read(self.base, E1000E_RDLEN);
+        let rdh = mmio_read(self.base, E1000E_RDH);
+        let rdt = mmio_read(self.base, E1000E_RDT);
+        
+        warn!(
+            "[e1000e] INIT DUMP: STATUS={:#x}, RCTL={:#x}, TCTL={:#x}",
+            status, rctl, tctl
+        );
+        warn!(
+            "[e1000e] RX DUMP: RDBA={:#x}:{:x}, RDLEN={}, RDH={}, RDT={}",
+            rdbah, rdbal, rdlen, rdh, rdt
+        );
+        warn!(
+            "[e1000e] RX RING PADDR: {:#x}, BUF0 PADDR: {:#x}",
+            self.rx_ring.paddr(), self.rx_bufs[0].paddr()
+        );
+        
         info!(
             "[e1000e] init done. STATUS={:#010x} link={}",
             status,
@@ -447,25 +505,37 @@ impl E1000eHw {
     // Receive one frame (returns owned Vec)
     // -----------------------------------------------------------------------
     fn receive(&mut self) -> Option<Vec<u8>> {
-        let ring = self.rx_ring_va as *mut RxDesc;
-        let next = (self.rx_tail + 1) % NUM_RX;
-        let desc = unsafe { &mut *ring.add(next) };
+        let ring = self.rx_ring.as_ptr::<RxDesc>();
+        let idx = self.rx_tail;
+        let desc = unsafe { &mut *ring.add(idx) };
 
         fence(Ordering::SeqCst);
-        // Status bit 0 = DD (Descriptor Done)
+        unsafe { core::arch::x86_64::_mm_clflush(desc as *const _ as *const u8); }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+
+        let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
+        let rdt = unsafe { mmio_read(self.base, E1000E_RDT) };
+        // trace!("[e1000e] RX check: idx={}, RDH={}, RDT={}, status={:#x}", idx, rdh, rdt, desc.status);
+
         if desc.status & RX_STATUS_DD == 0 {
             return None;
         }
         // Must be a complete frame and fit in our DMA buffer.
         if desc.status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
-            self.recycle_rx_desc(next, desc);
+            self.recycle_rx_desc(idx, desc);
             return None;
         }
         let len = desc.len as usize;
-        let buf = unsafe { core::slice::from_raw_parts(self.rx_bufs_va[next] as *const u8, len) };
+        // Flush the buffer before reading it
+        let buf_vaddr = self.rx_bufs[idx].vaddr();
+        for p in (buf_vaddr..buf_vaddr + len).step_by(64) {
+            unsafe { core::arch::x86_64::_mm_clflush(p as *const u8); }
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        let buf = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
         let pkt = buf.to_vec();
 
-        self.recycle_rx_desc(next, desc);
+        self.recycle_rx_desc(idx, desc);
         Some(pkt)
     }
 
@@ -473,7 +543,7 @@ impl E1000eHw {
     // Check if a TX slot is available
     // -----------------------------------------------------------------------
     fn can_send(&self) -> bool {
-        let ring = self.tx_ring_va as *mut TxDesc;
+        let ring = self.tx_ring.as_ptr::<TxDesc>();
         let desc = unsafe { &*ring.add(self.tx_tail) };
         fence(Ordering::SeqCst);
         self.tx_first || (desc.status & 0x01 != 0) // DD bit
@@ -483,6 +553,7 @@ impl E1000eHw {
     // Send one frame
     // -----------------------------------------------------------------------
     fn send(&mut self, data: &[u8]) -> DeviceResult {
+        warn!("[e1000e] hardware sending {} bytes: {:02x?}", data.len(), &data[..data.len().min(32)]);
         if !self.can_send() {
             return Err(DeviceError::NotReady);
         }
@@ -490,15 +561,15 @@ impl E1000eHw {
             return Err(DeviceError::InvalidParam);
         }
 
-        let ring = self.tx_ring_va as *mut TxDesc;
+        let ring = self.tx_ring.as_ptr::<TxDesc>();
         let idx = self.tx_tail;
         let desc = unsafe { &mut *ring.add(idx) };
 
         let buf =
-            unsafe { core::slice::from_raw_parts_mut(self.tx_bufs_va[idx] as *mut u8, data.len()) };
+            unsafe { core::slice::from_raw_parts_mut(self.tx_bufs[idx].vaddr() as *mut u8, data.len()) };
         buf.copy_from_slice(data);
 
-        desc.addr = self.tx_bufs_pa[idx] as u64;
+        desc.addr = self.tx_bufs[idx].paddr() as u64;
         desc.len = data.len() as u16;
         desc.cmd = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
         desc.status = 0;
@@ -507,6 +578,12 @@ impl E1000eHw {
         self.tx_tail = (idx + 1) % NUM_TX;
         unsafe { mmio_write(self.base, E1000E_TDT, self.tx_tail as u32) };
         fence(Ordering::SeqCst);
+
+        let tdh = unsafe { mmio_read(self.base, E1000E_TDH) };
+        let tdt = unsafe { mmio_read(self.base, E1000E_TDT) };
+        let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
+        warn!("[e1000e] TX check: idx={}, TDH={}, TDT={}, STATUS={:#x}, desc0_status={:#x}", 
+            idx, tdh, tdt, status, unsafe { (*self.tx_ring.as_ptr::<TxDesc>()).status });
 
         if self.tx_tail == 0 {
             self.tx_first = false;
@@ -517,29 +594,20 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     // Handle interrupt — returns true if there was something pending
     // -----------------------------------------------------------------------
-    fn handle_interrupt(&mut self) -> bool {
+    pub fn handle_interrupt(&mut self) -> bool {
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr != 0 {
+            warn!("[e1000e] ICR={:#x}", icr);
             unsafe { mmio_write(self.base, E1000E_ICR, icr) };
-            true
-        } else {
-            false
+            return true;
         }
+        false
     }
 }
 
 impl Drop for E1000eHw {
     fn drop(&mut self) {
-        let rx_pages = (NUM_RX * size_of::<RxDesc>() + 4095) / 4096;
-        let tx_pages = (NUM_TX * size_of::<TxDesc>() + 4095) / 4096;
-        dealloc_dma_pages(self.rx_ring_va, rx_pages);
-        dealloc_dma_pages(self.tx_ring_va, tx_pages);
-        for v in &self.rx_bufs_va {
-            dealloc_dma_pages(*v, 1);
-        }
-        for v in &self.tx_bufs_va {
-            dealloc_dma_pages(*v, 1);
-        }
+        // DmaRegion handles its own deallocation
     }
 }
 
@@ -548,19 +616,15 @@ impl Drop for E1000eHw {
 // ---------------------------------------------------------------------------
 #[derive(Clone)]
 pub struct E1000eDriver {
-    hw: Arc<Mutex<E1000eHw>>,
-    /// Queue for smoltcp (kernel stack)
-    stack_rx_queue: Arc<Mutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>>>,
+    pub hw: Arc<Mutex<E1000eHw>>,
 }
 
 #[derive(Clone)]
 pub struct E1000eInterface {
-    iface: Arc<Mutex<Interface<'static, E1000eDriver>>>,
-    driver: E1000eDriver,
-    name: String,
-    irq: usize,
-    /// Raw frames received from the NIC for AF_PACKET sockets.
-    raw_rx_queue: Arc<Mutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>>>,
+    pub iface: Arc<Mutex<Interface<'static, E1000eDriver>>>,
+    pub driver: E1000eDriver,
+    pub name: String,
+    pub irq: usize,
 }
 
 impl Scheme for E1000eInterface {
@@ -569,31 +633,21 @@ impl Scheme for E1000eInterface {
     }
 
     fn handle_irq(&self, irq: usize) {
+        error!("e1000e: handle_irq {}", irq);
         if irq != self.irq {
             return;
         }
-        let had_data = self.driver.hw.lock().handle_interrupt();
-        if had_data {
-            // Duplicate all pending frames into both queues.
-            loop {
-                let frame = self.driver.hw.lock().receive();
-                match frame {
-                    Some(pkt) => {
-                        // Push to AF_PACKET queue
-                        self.raw_rx_queue.lock().push_back(pkt.clone());
-                        // Push to kernel stack queue
-                        self.driver.stack_rx_queue.lock().push_back(pkt);
-                    }
-                    None => break,
+        let mut hw = self.driver.hw.lock();
+        if hw.handle_interrupt() {
+            let self_clone = self.clone();
+            crate::utils::deferred_job::push_deferred_job(move || {
+                let ts = Instant::from_micros(timer_now_as_micros() as i64);
+                let sockets = get_sockets();
+                let mut sockets = sockets.lock();
+                if let Err(e) = self_clone.iface.lock().poll(&mut sockets, ts) {
+                    warn!("[e1000e] poll error: {}", e);
                 }
-            }
-            // Also let smoltcp poll for TX completion / ARP / TCP state.
-            let ts = Instant::from_micros(timer_now_as_micros() as i64);
-            let sockets = get_sockets();
-            let mut sockets = sockets.lock();
-            if let Err(e) = self.iface.lock().poll(&mut sockets, ts) {
-                warn!("[e1000e] poll error: {}", e);
-            }
+            });
         }
     }
 }
@@ -622,6 +676,11 @@ impl NetScheme for E1000eInterface {
         Ok(())
     }
     fn poll(&self) -> DeviceResult {
+        let status = unsafe { mmio_read(self.driver.hw.lock().base, E1000E_STATUS) };
+        let rctl = unsafe { mmio_read(self.driver.hw.lock().base, E1000E_RCTL) };
+        if self.driver.hw.lock().rx_tail == 0 {
+            warn!("[e1000e] poll() called, STATUS={:#x}, RCTL={:#x}", status, rctl);
+        }
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
         let mut sockets = sockets.lock();
@@ -632,13 +691,7 @@ impl NetScheme for E1000eInterface {
             .map_err(|_| DeviceError::IoError)
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
-        // Check raw_rx_queue first (filled by handle_irq before smoltcp poll).
-        if let Some(pkt) = self.raw_rx_queue.lock().pop_front() {
-            let n = pkt.len().min(buf.len());
-            buf[..n].copy_from_slice(&pkt[..n]);
-            return Ok(n);
-        }
-        // Fallback: try direct DMA ring read (for polling without IRQ).
+        // Try to read directly from hardware.
         if let Some(pkt) = self.driver.hw.lock().receive() {
             let n = pkt.len().min(buf.len());
             buf[..n].copy_from_slice(&pkt[..n]);
@@ -648,13 +701,17 @@ impl NetScheme for E1000eInterface {
         }
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        let mut hw = self.driver.hw.lock();
-        hw.send(data)?;
-        Ok(data.len())
+        if self.driver.hw.lock().can_send() {
+            let mut hw = self.driver.hw.lock();
+            hw.send(data)?;
+            Ok(data.len())
+        } else {
+            Err(DeviceError::NotReady)
+        }
     }
 
     fn can_recv(&self) -> bool {
-        // Cannot peek without consuming; callers must attempt recv().
+        // Return true so callers always attempt recv(); actual receive will return NotReady if nothing.
         true
     }
 
@@ -677,7 +734,10 @@ impl NetScheme for E1000eInterface {
 // ---------------------------------------------------------------------------
 // smoltcp Device impl
 // ---------------------------------------------------------------------------
-pub struct E1000eRxToken(Vec<u8>);
+pub struct E1000eRxToken {
+    data: Vec<u8>,
+}
+
 pub struct E1000eTxToken(E1000eDriver);
 
 impl phy::Device<'_> for E1000eDriver {
@@ -685,11 +745,15 @@ impl phy::Device<'_> for E1000eDriver {
     type TxToken = E1000eTxToken;
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        // smoltcp now pulls from the stack-specific queue filled by handle_irq.
-        self.stack_rx_queue
-            .lock()
-            .pop_front()
-            .map(|pkt| (E1000eRxToken(pkt), E1000eTxToken(self.clone())))
+        let mut hw = self.hw.lock();
+        if let Some(pkt) = hw.receive() {
+            Some((
+                E1000eRxToken { data: pkt },
+                E1000eTxToken(self.clone()),
+            ))
+        } else {
+            None
+        }
     }
     fn transmit(&mut self) -> Option<Self::TxToken> {
         if self.hw.lock().can_send() {
@@ -707,11 +771,14 @@ impl phy::Device<'_> for E1000eDriver {
 }
 
 impl phy::RxToken for E1000eRxToken {
-    fn consume<R, F>(mut self, _ts: Instant, f: F) -> SmolResult<R>
+    fn consume<R, F>(self, _ts: Instant, f: F) -> SmolResult<R>
     where
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
-        f(&mut self.0)
+        // Dispatch to global packet tapping (AF_PACKET sockets)
+        super::net_dispatch_packet(&self.data);
+        let mut data = self.data;
+        f(&mut data)
     }
 }
 
@@ -743,39 +810,27 @@ pub fn init(
     );
 
     // Allocate DMA rings
-    let rx_ring_pages = (NUM_RX * size_of::<RxDesc>() + 4095) / 4096;
-    let tx_ring_pages = (NUM_TX * size_of::<TxDesc>() + 4095) / 4096;
-    let (rx_ring_va, rx_ring_pa) = alloc_dma_pages(rx_ring_pages);
-    let (tx_ring_va, tx_ring_pa) = alloc_dma_pages(tx_ring_pages);
+    let rx_ring = DmaRegion::alloc(NUM_RX * size_of::<RxDesc>()).ok_or(DeviceError::DmaError)?;
+    let tx_ring = DmaRegion::alloc(NUM_TX * size_of::<TxDesc>()).ok_or(DeviceError::DmaError)?;
 
-    let mut rx_bufs_va = Vec::with_capacity(NUM_RX);
-    let mut rx_bufs_pa = Vec::with_capacity(NUM_RX);
-    let mut tx_bufs_va = Vec::with_capacity(NUM_TX);
-    let mut tx_bufs_pa = Vec::with_capacity(NUM_TX);
+    let mut rx_bufs = Vec::with_capacity(NUM_RX);
+    let mut tx_bufs = Vec::with_capacity(NUM_TX);
 
     for _ in 0..NUM_RX {
-        let (v, p) = alloc_dma_pages(BUF_SIZE / 4096);
-        rx_bufs_va.push(v);
-        rx_bufs_pa.push(p);
+        rx_bufs.push(DmaRegion::alloc(BUF_SIZE).ok_or(DeviceError::DmaError)?);
     }
     for _ in 0..NUM_TX {
-        let (v, p) = alloc_dma_pages(BUF_SIZE / 4096);
-        tx_bufs_va.push(v);
-        tx_bufs_pa.push(p);
+        tx_bufs.push(DmaRegion::alloc(BUF_SIZE).ok_or(DeviceError::DmaError)?);
     }
 
     let mut hw = E1000eHw {
         base: vaddr,
-        mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], // Default early-init MAC (QEMU style)
-        rx_ring_va,
-        rx_ring_pa,
-        rx_bufs_va,
-        rx_bufs_pa,
-        rx_tail: NUM_RX - 1,
-        tx_ring_va,
-        tx_ring_pa,
-        tx_bufs_va,
-        tx_bufs_pa,
+        mac: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+        rx_ring,
+        rx_bufs,
+        rx_tail: 0,
+        tx_ring,
+        tx_bufs,
         tx_tail: 0,
         tx_head_shadow: 0,
         tx_first: true,
@@ -790,35 +845,80 @@ pub fn init(
         "[e1000e] finalized MAC for smoltcp: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
     );
-    let hw = Arc::new(Mutex::new(hw));
-    let stack_rx_queue = Arc::new(Mutex::new(alloc::collections::VecDeque::new()));
-    let driver = E1000eDriver {
-        hw,
-        stack_rx_queue,
-    };
+    let hw_arc = Arc::new(Mutex::new(hw));
+    let driver = E1000eDriver { hw: hw_arc.clone() };
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac_bytes);
-    let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)];
-    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 1] = [None; 1];
-    let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
+    let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 24)];
+    let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
+    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
+    let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
+    routes.add_default_ipv4_route(default_v4_gw).unwrap();
+    let neighbor_cache = NeighborCache::new(BTreeMap::new());
 
     let iface = InterfaceBuilder::new(driver.clone())
         .ethernet_addr(ethernet_addr)
-        .neighbor_cache(NeighborCache::new(BTreeMap::new()))
+        .neighbor_cache(neighbor_cache)
         .ip_addrs(ip_addrs)
         .routes(routes)
         .finalize();
 
-    info!(
-        "[e1000e] interface {} up, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, awaiting IPv4 configuration",
-        name, mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
-    );
-
-    Ok(E1000eInterface {
+    let e1000e_iface = E1000eInterface {
         iface: Arc::new(Mutex::new(iface)),
         driver,
         name,
         irq,
-        raw_rx_queue: Arc::new(Mutex::new(alloc::collections::VecDeque::new())),
-    })
+    };
+
+    Ok(e1000e_iface)
+}
+
+pub struct E1000eDriverPci;
+
+impl PciDriver for E1000eDriverPci {
+    fn name(&self) -> &str {
+        "e1000e"
+    }
+
+    fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
+        vendor_id == 0x8086 && matches!(device_id,
+            0x10bf | 0x10cb | 0x10cc | 0x10cd | 0x10ce |
+            0x10de | 0x10df | 0x10e5 | 0x10f5 |
+            0x10ea | 0x10eb | 0x10ef | 0x10f0 |
+            0x1502 | 0x1503 |
+            0x153a | 0x153b |
+            0x155a | 0x1559 | 0x15a0 | 0x15a1 | 0x15a2 | 0x15a3 |
+            0x10d3 |
+            0x15b7 | 0x15b8 | 0x15b9 |
+            0x15bc | 0x15bd | 0x15be |
+            0x15d6 | 0x15d7 | 0x15d8 |
+            0x15e3 | 0x15d9 | 0x15bb | 0x15da |
+            0x15df | 0x15e0 | 0x15e1 | 0x15e2 |
+            0x15f4 | 0x15f5 | 0x15f9 | 0x15fa | 0x15fb | 0x15fc |
+            0x0d4c | 0x0d4d | 0x0d4e | 0x0d4f |
+            0x1a1c | 0x1a1d | 0x1a1e | 0x1a1f |
+            0x550a | 0x550b | 0x550c | 0x550d | 0x550e | 0x550f |
+            0x5502 | 0x5503 |
+            0x57a0 | 0x57a1 | 0x57b3
+        )
+    }
+
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+        info!("[e1000e] PCI ID: vendor={:#x}, device={:#x}", dev.id.vendor_id, dev.id.device_id);
+        let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
+            a as usize
+        } else {
+            return Err(DeviceError::IoError);
+        };
+        
+        if let Some(m) = mapper {
+            m.query_or_map(bar0_addr, 128 * 1024);
+        }
+        
+        let vaddr = crate::net::phys_to_virt(bar0_addr);
+        let name = alloc::format!("eth{}", dev.loc.bus);
+        let vector = irq.map(|idx| idx + 32).unwrap_or(0);
+        let iface = init(name, vector, vaddr, 0)?;
+        Ok(Device::Net(Arc::new(iface)))
+    }
 }

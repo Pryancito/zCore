@@ -6,7 +6,10 @@ use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::scheme::{BlockScheme, Scheme};
-use crate::DeviceResult;
+use crate::{Device, DeviceResult};
+use crate::bus::pci_drivers::PciDriver;
+use crate::builder::IoMapper;
+use pci::{PCIDevice, BAR};
 
 use lock::Mutex;
 
@@ -654,3 +657,29 @@ pub const NVME_FEAT_IRQ_CONFIG: u32 = 0x09;
 pub const NVME_FEAT_WRITE_ATOMIC: u32 = 0x0a;
 pub const NVME_FEAT_ASYNC_EVENT: u32 = 0x0b;
 pub const NVME_FEAT_SW_PROGRESS: u32 = 0x0c;
+
+pub struct NvmeDriverPci;
+
+impl PciDriver for NvmeDriverPci {
+    fn name(&self) -> &str {
+        "nvme"
+    }
+
+    fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
+        vendor_id == 0x1b36 && device_id == 0x10
+    }
+
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+        if let Some(BAR::Memory(addr, _len, _, _)) = dev.bars[0] {
+            if let Some(m) = mapper {
+                m.query_or_map(addr as usize, 4096 * 8);
+            }
+            let vaddr = crate::bus::phys_to_virt(addr as usize);
+            let vector = irq.map(|idx| idx + 32).unwrap_or(33);
+            let blk = Arc::new(NvmeInterface::new(vaddr, vector)?);
+            Ok(Device::Block(blk))
+        } else {
+            Err(crate::DeviceError::NotSupported)
+        }
+    }
+}

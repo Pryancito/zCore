@@ -600,6 +600,24 @@ impl VmAddressRegion {
         inner.fork_from(src, &self.page_table)
     }
 
+    /// Dump VMAR tree (for debugging).
+    pub fn dump(&self) {
+        self.dump_impl(0);
+    }
+
+    fn dump_impl(&self, depth: usize) {
+        let guard = self.inner.lock();
+        if let Some(inner) = guard.as_ref() {
+            info!("VMAR depth {}: {:#x} - {:#x} (size={:#x})", depth, self.addr, self.addr + self.size, self.size);
+            for map in inner.mappings.iter() {
+                info!("  Map depth {}: {:#x} - {:#x} (size={:#x}) VMO: {}", depth, map.addr(), map.addr() + map.size(), map.size(), map.vmo.name());
+            }
+            for child in inner.children.iter() {
+                child.dump_impl(depth + 1);
+            }
+        }
+    }
+
     /// Returns statistics about memory used by a task.
     pub fn get_task_stats(&self) -> TaskStatsInfo {
         let mut task_stats = TaskStatsInfo::default();

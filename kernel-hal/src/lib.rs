@@ -6,6 +6,7 @@
 // #![feature(core_intrinsics)]
 #![allow(clippy::uninit_vec)]
 #![deny(warnings)]
+#![allow(unsafe_code)]
 // JUST FOR DEBUG
 #![allow(dead_code)]
 
@@ -50,4 +51,4 @@ pub use imp::{
     *,
 };
 pub use kernel_handler::KernelHandler;
-pub use utils::{lazy_init::LazyInit, mpsc_queue::MpscQueue};
+pub use utils::{deferred_job, lazy_init::LazyInit, mpsc_queue::MpscQueue};
