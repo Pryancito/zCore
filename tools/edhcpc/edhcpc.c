@@ -403,19 +403,36 @@ static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
     }
-    if ((size_t)n < sizeof(struct ether_header) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr)) return 1;
+    const uint8_t *ip_data = NULL;
+    size_t ip_data_len = 0;
 
-    const struct ether_header *eth = (const struct ether_header *)buf;
-    if (ntohs(eth->ether_type) != ETHERTYPE_IP) return 1;
+    // Normal AF_PACKET/SOCK_RAW path: Ethernet frame.
+    if ((size_t)n >= sizeof(struct ether_header) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr)) {
+        const struct ether_header *eth = (const struct ether_header *)buf;
+        if (ntohs(eth->ether_type) == ETHERTYPE_IP) {
+            ip_data = buf + sizeof(*eth);
+            ip_data_len = (size_t)n - sizeof(*eth);
+        }
+    }
 
-    const struct ipv4_hdr *ip = (const struct ipv4_hdr *)(buf + sizeof(*eth));
+    // Some drivers may deliver L3 payload directly to packet taps.
+    if (!ip_data && (size_t)n >= sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr)) {
+        const uint8_t ver = (uint8_t)(buf[0] >> 4);
+        if (ver == 4) {
+            ip_data = buf;
+            ip_data_len = (size_t)n;
+        }
+    }
+    if (!ip_data) return 1;
+
+    const struct ipv4_hdr *ip = (const struct ipv4_hdr *)ip_data;
     const uint8_t ihl = (uint8_t)((ip->ver_ihl & 0x0f) * 4);
     if ((ip->ver_ihl >> 4) != 4) return 1;
     if (ihl < sizeof(struct ipv4_hdr)) return 1;
     if (ip->proto != 17) return 1;
 
-    if ((size_t)n < sizeof(*eth) + ihl + sizeof(struct udp_hdr)) return 1;
-    const struct udp_hdr *udp = (const struct udp_hdr *)(buf + sizeof(*eth) + ihl);
+    if (ip_data_len < (size_t)ihl + sizeof(struct udp_hdr)) return 1;
+    const struct udp_hdr *udp = (const struct udp_hdr *)(ip_data + ihl);
     if (ntohs(udp->dport) != DHCP_CLIENT_PORT) return 1;
     if (ntohs(udp->sport) != DHCP_SERVER_PORT) return 1;
 
@@ -423,7 +440,7 @@ static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer
     if (ulen < sizeof(struct udp_hdr)) return 1;
     const size_t payload_len = (size_t)ulen - sizeof(struct udp_hdr);
     const uint8_t *payload = (const uint8_t *)udp + sizeof(struct udp_hdr);
-    if ((const uint8_t *)payload + payload_len > buf + n) return 1;
+    if ((const uint8_t *)payload + payload_len > ip_data + ip_data_len) return 1;
 
     if (parse_dhcp_payload(payload, payload_len, xid_be, offer_out, msg_type_out) == 0) return 0;
     return 1;
