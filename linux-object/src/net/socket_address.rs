@@ -122,7 +122,7 @@ pub struct LinkLevelEndpoint {
     pub addr: [u8; 8],
     /// Hardware address length
     pub halen: u8,
-    /// Protocol (big-endian)
+    /// Protocol (host-endian)
     pub protocol: u16,
 }
 
