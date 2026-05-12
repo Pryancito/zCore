@@ -151,6 +151,8 @@ impl phy::RxToken for RTLxRxToken {
     where
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
+        // Dispatch to global packet tapping (AF_PACKET sockets)
+        super::net_dispatch_packet(&self.0);
         f(&mut self.0)
     }
 }

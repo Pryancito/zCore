@@ -100,7 +100,7 @@ impl PacketSocketState {
                 flags: Mutex::new(OpenFlags::RDWR),
                 ifindex: Mutex::new(0),
                 socket_type,
-                protocol: Mutex::new(u16::from_be(protocol)),
+                protocol: Mutex::new(protocol),
                 packet_queue: Mutex::new(VecDeque::new()),
             }),
         });
@@ -201,7 +201,7 @@ impl Socket for PacketSocketState {
     fn bind(&self, endpoint: Endpoint) -> SysResult {
         if let Endpoint::LinkLevel(ll) = endpoint {
             *self.inner.ifindex.lock() = ll.interface_index as u32;
-            let proto = if ll.protocol != 0 { u16::from_be(ll.protocol) } else { 0 };
+            let proto = ll.protocol;
             *self.inner.protocol.lock() = proto;
             info!("PacketSocket: bound to ifindex {}, proto={:#x} (host={:#x})", ll.interface_index, ll.protocol, proto);
             Ok(0)
