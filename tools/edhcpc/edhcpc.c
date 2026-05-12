@@ -372,7 +372,19 @@ static int send_dhcp_packet(int pfd, const uint8_t mac[6], const uint8_t *dhcp, 
     const size_t frame_len = sizeof(*eth) + ip_len;
     fprintf(stderr, "edhcpc: sending packet (%zu bytes)\n", frame_len);
     ssize_t n = send(pfd, frame, frame_len, 0);
-    return (n < 0) ? -1 : 0;
+    if (n < 0) return -1;
+    return ((size_t)n == frame_len) ? 0 : -1;
+}
+
+static int send_dhcp_udp_broadcast(int udp_fd, const uint8_t *dhcp, size_t dhcp_len) {
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(DHCP_SERVER_PORT);
+    dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    ssize_t n = sendto(udp_fd, dhcp, dhcp_len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    if (n < 0) return -1;
+    return ((size_t)n == dhcp_len) ? 0 : -1;
 }
 
 static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32_t xid_be,
@@ -742,10 +754,20 @@ int main(int argc, char **argv) {
 
     while (attempts < max_attempts) {
         fprintf(stderr, "edhcpc: sending DISCOVER (attempt %d/%d)...\n", ++attempts, max_attempts);
-        if (send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len) < 0) {
-            warnx("send(packet:discover) failed");
+        int sent_packet = send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len);
+        int sent_udp = send_dhcp_udp_broadcast(fd, dhcp_buf, dhcp_len);
+        if (sent_packet < 0) warnx("send(packet:discover) failed");
+        if (sent_udp < 0) warnx("send(udp:discover) failed");
+        if (sent_packet < 0 && sent_udp < 0) {
             usleep(1000 * 1000);
             continue;
+        }
+        if (sent_packet == 0 && sent_udp == 0) {
+            fprintf(stderr, "edhcpc: discover sent via packet+udp\n");
+        } else if (sent_packet == 0) {
+            fprintf(stderr, "edhcpc: discover sent via packet only\n");
+        } else {
+            fprintf(stderr, "edhcpc: discover sent via udp only\n");
         }
 
         fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
@@ -779,7 +801,18 @@ got_offer:
 
     dhcp_len = build_dhcp_request(dhcp_buf, sizeof(dhcp_buf), mac, xid_be, offer.yiaddr, offer.server_id);
     if (dhcp_len == 0) die("build_dhcp_request");
-    if (send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len) < 0) die("send(packet:request)");
+    int sent_packet = send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len);
+    int sent_udp = send_dhcp_udp_broadcast(fd, dhcp_buf, dhcp_len);
+    if (sent_packet < 0) warnx("send(packet:request) failed");
+    if (sent_udp < 0) warnx("send(udp:request) failed");
+    if (sent_packet < 0 && sent_udp < 0) die("send(request)");
+    if (sent_packet == 0 && sent_udp == 0) {
+        fprintf(stderr, "edhcpc: request sent via packet+udp\n");
+    } else if (sent_packet == 0) {
+        fprintf(stderr, "edhcpc: request sent via packet only\n");
+    } else {
+        fprintf(stderr, "edhcpc: request sent via udp only\n");
+    }
 
     struct dhcp_offer ack;
     int mt2 = 0;
