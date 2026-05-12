@@ -116,6 +116,7 @@ pub fn pci_finish_msi_registrations() -> DeviceResult<()> {
     let mut q = MSI_PENDING.lock();
     for (v, d) in q.drain(..) {
         host.register_device(v, d)?;
+        host.unmask(v)?;
     }
     Ok(())
 }
@@ -699,6 +700,7 @@ const HID_PROTO_KEY: u8 = 1;
 const HID_PROTO_MOUSE: u8 = 2;
 const HID_PROTO_TABLET: u8 = 3;
 const TABLET_RANGE: u32 = 32767;
+const NO_MSI_VECTOR: usize = 0;
 
 pub struct XhciInner {
     pub mmio: XhciMmio,
@@ -2309,11 +2311,14 @@ impl PciDriver for XhciDriverPci {
 
         let vaddr = crate::bus::phys_to_virt(addr as usize);
         
-        let vector = irq.map(|idx| idx + 32).unwrap_or(0);
+        let vector = irq.map(|idx| idx + 32).unwrap_or(NO_MSI_VECTOR);
 
         // Handle xHCI
         if dev.id.prog_if == 0x30 {
             let input = XhciUsbHid::probe(dev, vaddr, map_len, vector)?;
+            if vector != NO_MSI_VECTOR {
+                pci_note_pending_msi(vector, input.clone());
+            }
             Ok(Device::Input(input))
         } else {
             // Legacy USB
