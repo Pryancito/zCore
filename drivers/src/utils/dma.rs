@@ -11,7 +11,6 @@ extern "C" {
     fn drivers_dma_alloc(pages: usize) -> usize;
     fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: usize) -> usize;
-    fn drivers_virt_to_phys(vaddr: usize) -> usize;
 }
 
 /// A contiguous, page-aligned DMA memory region.
@@ -62,8 +61,7 @@ impl DmaRegion {
 impl Drop for DmaRegion {
     fn drop(&mut self) {
         if self.phys != 0 {
-            let phys = unsafe { drivers_virt_to_phys(self.virt) };
-            unsafe { drivers_dma_dealloc(phys, self.pages) };
+            unsafe { drivers_dma_dealloc(self.phys, self.pages) };
         }
     }
 }
