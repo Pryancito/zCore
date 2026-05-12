@@ -6,6 +6,7 @@
 // #![feature(core_intrinsics)]
 #![allow(clippy::uninit_vec)]
 #![deny(warnings)]
+#![allow(unsafe_code)]
 // JUST FOR DEBUG
 #![allow(dead_code)]
 

@@ -124,9 +124,10 @@ pub fn set_packet_callback(callback: fn(&[u8])) {
 }
 
 /// Dispatches a received packet to the registered callback.
-pub fn net_dispatch_packet(packet: &[u8]) {
-    if let Some(callback) = *PACKET_CALLBACK.lock() {
-        callback(packet);
+pub fn net_dispatch_packet(data: &[u8]) {
+    trace!("[net] dispatching packet of {} bytes", data.len());
+    if let Some(callback) = PACKET_CALLBACK.lock().as_ref() {
+        callback(data);
     }
 }
 

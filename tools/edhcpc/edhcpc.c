@@ -73,18 +73,24 @@ static uint16_t csum16(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
     uint32_t sum = 0;
     while (len > 1) {
-        sum += (uint32_t)((p[0] << 8) | p[1]);
+        sum += (uint32_t)((p[1] << 8) | p[0]); // Little Endian sum on LE host
         p += 2;
         len -= 2;
     }
-    if (len) sum += (uint32_t)(p[0] << 8);
-    while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
-    return (uint16_t)(~sum);
+    if (len) {
+        sum += (uint32_t)p[0];
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffffu) + (sum >> 16);
+    }
+    // Note: The above is for LE host. On BE host it would be (p[0]<<8)|p[1].
+    // But since we want the result to be endian-neutral for the checksum
+    // invariant, this works as long as we are consistent.
+    return (uint16_t)~sum;
 }
 
 static uint16_t udp_checksum_ipv4(uint32_t src_be, uint32_t dst_be, const void *udp_hdr,
                                   const void *payload, size_t payload_len) {
-    // Pseudo-header + UDP header + payload, RFC 768.
     struct {
         uint32_t src;
         uint32_t dst;
@@ -101,15 +107,14 @@ static uint16_t udp_checksum_ipv4(uint32_t src_be, uint32_t dst_be, const void *
     ph.udp_len = htons(udp_len);
 
     uint32_t sum = 0;
-    // pseudo header
+    // Sum pseudo-header using csum16 (alignment-safe)
+    // We want the RAW sum, so we bitwise-not the result of csum16
     sum += (uint32_t)~csum16(&ph, sizeof(ph)) & 0xffffu;
-    // udp header
     sum += (uint32_t)~csum16(udp_hdr, 8) & 0xffffu;
-    // payload
     sum += (uint32_t)~csum16(payload, payload_len) & 0xffffu;
+
     while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
-    uint16_t out = (uint16_t)(~sum);
-    // checksum value 0 means "no checksum" for UDP/IPv4; avoid generating 0.
+    uint16_t out = (uint16_t)~sum;
     if (out == 0) out = 0xffff;
     return out;
 }
@@ -151,6 +156,7 @@ enum {
     DHCP_OPTION_RENEWAL_T1 = 58,
     DHCP_OPTION_REBINDING_T2 = 59,
     DHCP_OPTION_CLIENT_ID = 61,
+    DHCP_OPTION_MAX_MSG_SIZE = 57,
 };
 
 struct dhcp_msg {
@@ -288,6 +294,8 @@ static size_t build_dhcp_discover(uint8_t *out, size_t cap, const uint8_t mac[6]
 
     uint8_t prl[] = {DHCP_OPTION_SUBNET_MASK, DHCP_OPTION_ROUTER, DHCP_OPTION_DNS, DHCP_OPTION_LEASE_TIME};
     opt_put(m.options, &off, DHCP_OPTION_PARAM_REQ_LIST, prl, sizeof(prl));
+    uint16_t mms = htons(1500);
+    opt_put(m.options, &off, DHCP_OPTION_MAX_MSG_SIZE, &mms, 2);
     m.options[off++] = DHCP_OPTION_END;
 
     const size_t msg_len = offsetof(struct dhcp_msg, options) + off;
@@ -312,6 +320,8 @@ static size_t build_dhcp_request(uint8_t *out, size_t cap, const uint8_t mac[6],
 
     uint8_t prl[] = {DHCP_OPTION_SUBNET_MASK, DHCP_OPTION_ROUTER, DHCP_OPTION_DNS, DHCP_OPTION_LEASE_TIME};
     opt_put(m.options, &off, DHCP_OPTION_PARAM_REQ_LIST, prl, sizeof(prl));
+    uint16_t mms = htons(1500);
+    opt_put(m.options, &off, DHCP_OPTION_MAX_MSG_SIZE, &mms, 2);
     m.options[off++] = DHCP_OPTION_END;
 
     const size_t msg_len = offsetof(struct dhcp_msg, options) + off;
@@ -360,6 +370,7 @@ static int send_dhcp_packet(int pfd, const uint8_t mac[6], const uint8_t *dhcp, 
     udp->check = udp_checksum_ipv4(src_ip, dst_ip, udp, payload, dhcp_len);
 
     const size_t frame_len = sizeof(*eth) + ip_len;
+    fprintf(stderr, "edhcpc: sending packet (%zu bytes)\n", frame_len);
     ssize_t n = send(pfd, frame, frame_len, 0);
     return (n < 0) ? -1 : 0;
 }
@@ -567,16 +578,15 @@ static int apply_default_route(int ifindex, uint32_t gw_be) {
     nlh->nlmsg_seq = seq;
     nlh->nlmsg_pid = (uint32_t)getpid();
 
-    // 12-byte Linux rtmsg layout: family, dst_len, src_len, tos, table, protocol, scope, type, flags(u32)
-    // We only need a default route: dst_len=0 and RTA_GATEWAY + RTA_OIF attributes.
-    p[0] = AF_INET; // family
-    p[1] = 0;       // dst_len
-    p[2] = 0;       // src_len
-    p[3] = 0;       // tos
-    p[4] = 0;       // table (unspecified)
-    p[5] = 0;       // protocol
-    p[6] = 0;       // scope
-    p[7] = 0;       // type
+    // Linux rtmsg layout: family, dst_len, src_len, tos, table, protocol, scope, type, flags(u32)
+    p[0] = AF_INET;           // family
+    p[1] = 0;                 // dst_len (default route)
+    p[2] = 0;                 // src_len
+    p[3] = 0;                 // tos
+    p[4] = 254;               // rtm_table (RT_TABLE_MAIN)
+    p[5] = 3;                 // rtm_protocol (RTPROT_BOOT)
+    p[6] = 0;                 // rtm_scope (RT_SCOPE_UNIVERSE)
+    p[7] = 1;                 // rtm_type (RTN_UNICAST)
     // flags (u32) already zero
 
     size_t off = NLMSG_ALIGN(nlh->nlmsg_len);
@@ -685,7 +695,7 @@ int main(int argc, char **argv) {
 
     // Prefer AF_PACKET because smoltcp may not emit IPv4 broadcast before the
     // interface has an address. The packet path crafts Ethernet/IP/UDP manually.
-    int pfd = socket(AF_PACKET, SOCK_RAW, 0);
+    int pfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (pfd < 0) die("socket(AF_PACKET)");
 
     // Bind packet socket to interface index (1-based in Eclipse OS).
@@ -693,6 +703,7 @@ int main(int argc, char **argv) {
     memset(&sall, 0, sizeof(sall));
     sall.sll_family = AF_PACKET;
     sall.sll_ifindex = ifindex;
+    sall.sll_protocol = htons(ETH_P_ALL);
     sall.sll_halen = 6;
     if (bind(pfd, (struct sockaddr *)&sall, sizeof(sall)) < 0) die("bind(AF_PACKET)");
 
@@ -707,10 +718,18 @@ int main(int argc, char **argv) {
 
     struct dhcp_offer offer;
     int mt = 0;
-    if (recv_dhcp_message_any(pfd, fd, xid_be, &offer, &mt, deadline) < 0 || mt != DHCPOFFER) {
-        warnx("timeout waiting for DHCPOFFER");
-        return 1;
+    fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
+    for (;;) {
+        if (recv_dhcp_message_any(pfd, fd, xid_be, &offer, &mt, deadline) < 0) {
+            warnx("timeout waiting for DHCPOFFER");
+            return 1;
+        }
+        if (mt == DHCPOFFER) break;
+        fprintf(stderr, "edhcpc: ignoring message type %d while waiting for OFFER\n", mt);
     }
+    fprintf(stderr, "edhcpc: received DHCPOFFER for ");
+    print_ipv4("", offer.yiaddr);
+    fprintf(stderr, "\n");
 
     if (offer.server_id == 0) {
         warnx("offer missing server identifier (option 54)");
@@ -723,16 +742,21 @@ int main(int argc, char **argv) {
 
     struct dhcp_offer ack;
     int mt2 = 0;
-    if (recv_dhcp_message_any(pfd, fd, xid_be, &ack, &mt2, deadline) < 0) {
-        warnx("timeout waiting for DHCPACK");
-        return 1;
+    fprintf(stderr, "edhcpc: waiting for DHCPACK...\n");
+    for (;;) {
+        if (recv_dhcp_message_any(pfd, fd, xid_be, &ack, &mt2, deadline) < 0) {
+            warnx("timeout waiting for DHCPACK");
+            return 1;
+        }
+        if (mt2 == DHCPACK || mt2 == DHCPNAK) break;
+        fprintf(stderr, "edhcpc: ignoring message type %d while waiting for ACK\n", mt2);
     }
     if (mt2 == DHCPNAK) {
         warnx("received DHCPNAK");
         return 1;
     }
     if (mt2 != DHCPACK) {
-        warnx("unexpected DHCP message (expected ACK)");
+        fprintf(stderr, "edhcpc: unexpected DHCP message type %d (expected %d)\n", mt2, DHCPACK);
         return 1;
     }
 

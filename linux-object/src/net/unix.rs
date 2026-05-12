@@ -23,7 +23,7 @@ lazy_static! {
 
 /// Unix domain socket (AF_UNIX / AF_LOCAL) implementation.
 ///
-/// Supports the full dhcpcd workflow:
+/// Supports the full AF_UNIX workflow (as used by many DHCP clients and daemons):
 /// - Server: socket → bind → listen → accept
 /// - Client: socket → connect  (→ ECONNREFUSED if no listener)
 pub struct UnixSocketState {

@@ -299,6 +299,7 @@ impl Socket for UdpSocketState {
 
     /// manipulate file descriptor
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
+        warn!("UdpSocket: ioctl request={:#x}, arg1={:#x}", request, arg1);
         match request {
             // SIOCGIFCONF: get list of interfaces
             //
@@ -357,7 +358,6 @@ impl Socket for UdpSocketState {
                 Ok(0)
             }
 
-            // SIOCGIFINDEX: get interface index
             SIOCGIFINDEX => {
                 #[allow(unsafe_code)]
                 let ifr = unsafe { &mut *(arg1 as *mut IfReq) };

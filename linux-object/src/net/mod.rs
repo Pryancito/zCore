@@ -15,6 +15,11 @@ pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
     core::str::from_utf8(&raw[..len]).map_err(|_| LxError::EINVAL)
 }
 
+/// Global initialization for the network stack.
+pub fn init() {
+    zcore_drivers::net::set_packet_callback(packet::push_packet);
+}
+
 
 /// missing documentation
 pub mod tcp;

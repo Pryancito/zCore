@@ -76,51 +76,6 @@ impl LinuxRootfs {
 
         // 拷贝 busybox
         fs::copy(busybox, bin.join("busybox")).unwrap();
-        // 拷贝 dhcpcd
-        let dhcpcd = self.dhcpcd(&musl);
-        if dhcpcd.is_file() {
-            fs::copy(&dhcpcd, bin.join("dhcpcd")).unwrap();
-            
-            // 拷贝 dhcpcd 配置和 hooks
-            let dhcpcd_dir = PROJECT_DIR.join("tools").join("dhcpcd");
-            let etc = dir.join("etc");
-            fs::copy(dhcpcd_dir.join("src/dhcpcd.conf"), etc.join("dhcpcd.conf")).unwrap();
-            
-            let lib_dhcpcd = dir.join("lib").join("dhcpcd");
-            let hooks_dir = lib_dhcpcd.join("dhcpcd-hooks");
-            fs::create_dir_all(&hooks_dir).unwrap();
-            fs::copy(dhcpcd_dir.join("hooks/dhcpcd-run-hooks"), lib_dhcpcd.join("dhcpcd-run-hooks")).unwrap();
-            // Do NOT install hook scripts into dhcpcd-hooks/ — they depend on sysctl,
-            // resolvconf, hostname, and /proc/sys/kernel/hostname which are not yet
-            // implemented in Eclipse OS. When hooks fail with exit 127 dhcpcd reports
-            // a script error and times out.  The empty hook directory means
-            // dhcpcd-run-hooks sources nothing and exits cleanly.
-
-            // Create directories for dhcpcd runtime files
-            let var_run_dhcpcd = dir.join("var/run/dhcpcd");
-            fs::create_dir_all(&var_run_dhcpcd).unwrap();
-            let var_lib_dhcpcd = dir.join("var/lib/dhcpcd");
-            fs::create_dir_all(&var_lib_dhcpcd).unwrap();
-
-            // /run/dhcpcd — dhcpcd control socket lives here by default
-            let run_dhcpcd = dir.join("run/dhcpcd");
-            fs::create_dir_all(&run_dhcpcd).unwrap();
-
-            // Write a minimal dhcpcd.conf — always overwrite to ensure hooks are disabled.
-            // This lets us test if dhcpcd progresses past PREINIT without the hook layer.
-            let etc = dir.join("etc");
-            fs::create_dir_all(&etc).unwrap();
-            let dhcpcd_conf = etc.join("dhcpcd.conf");
-            fs::write(&dhcpcd_conf,
-                b"# Eclipse OS dhcpcd configuration\n\
-                  # Disable ALL hooks -- Eclipse OS does not support the full hook layer yet\n\
-                  nohook *\n\
-                  nodev\n\
-                  broadcast\n\
-                  timeout 30\n\
-                  reboot 5\n"
-            ).unwrap();
-        }
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
         let machine_id = dir.join("etc/machine-id");
@@ -401,50 +356,6 @@ cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz'
         );
         fs::write(&path, content).unwrap();
         path
-    }
-
-    /// 编译 dhcpcd。
-    fn dhcpcd(&self, musl: &Path) -> PathBuf {
-        let dhcpcd_dir = PROJECT_DIR.join("tools").join("dhcpcd");
-        let executable = dhcpcd_dir.join("src/dhcpcd");
-
-        if executable.is_file() {
-            return executable;
-        }
-
-        println!("Compiling dhcpcd...");
-        let musl = musl.canonicalize().unwrap();
-        let bin = musl.join("bin");
-        let arch = self.0.name();
-
-        // 尝试编译
-        let mut res = Ext::new("./configure")
-            .current_dir(&dhcpcd_dir)
-            .env("CC", format!("{}/{}-linux-musl-gcc", bin.display(), arch))
-            .arg("--prefix=")
-            .arg("--sbindir=/bin")
-            .arg("--sysconfdir=/etc")
-            .arg("--dbdir=/var/lib/dhcpcd")
-            .arg("--libexecdir=/lib/dhcpcd")
-            .arg("--disable-privsep")
-            .arg("--without-dev")
-            .status();
-
-        if res.success() {
-            res = Make::new().current_dir(&dhcpcd_dir).status();
-        }
-
-        if !res.success() {
-            println!("Failed to compile dhcpcd");
-        } else {
-            // 裁剪
-            Ext::new(self.strip(&musl))
-                .arg("-s")
-                .arg(&executable)
-                .invoke();
-        }
-
-        executable
     }
 
     /// 编译 nl_dump (static netlink dump helper).

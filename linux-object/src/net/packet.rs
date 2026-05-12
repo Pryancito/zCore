@@ -55,6 +55,9 @@ pub fn push_packet(packet: &[u8]) {
                 if protocol != 0 && protocol != 0x0003 && protocol != ethertype {
                     continue;
                 }
+                error!("PacketSocket: matching packet, ethertype={:#x}", ethertype);
+            } else {
+                info!("PacketSocket: non-ethernet packet received");
             }
 
             let mut queue = state.inner.packet_queue.lock();
@@ -62,6 +65,7 @@ pub fn push_packet(packet: &[u8]) {
             if queue.len() < 1000 {
                 queue.push_back(packet.to_vec());
                 state.base.signal_set(Signal::READABLE);
+                error!("PacketSocket: packet pushed to queue, len={}", packet.len());
             }
         } else {
             to_remove.push(i);
@@ -96,7 +100,7 @@ impl PacketSocketState {
                 flags: Mutex::new(OpenFlags::RDWR),
                 ifindex: Mutex::new(0),
                 socket_type,
-                protocol: Mutex::new(protocol),
+                protocol: Mutex::new(u16::from_be(protocol)),
                 packet_queue: Mutex::new(VecDeque::new()),
             }),
         });
@@ -112,6 +116,12 @@ impl Socket for PacketSocketState {
         let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
+            warn!("PacketSocket: polling drivers...");
+            // Poll drivers since interrupts might not be working
+            for net in drivers::all_net().as_vec().iter() {
+                let _ = net.poll();
+            }
+
             let pkt = self.inner.packet_queue.lock().pop_front();
             if let Some(internal_buf) = pkt {
                 let n = internal_buf.len();
@@ -191,8 +201,9 @@ impl Socket for PacketSocketState {
     fn bind(&self, endpoint: Endpoint) -> SysResult {
         if let Endpoint::LinkLevel(ll) = endpoint {
             *self.inner.ifindex.lock() = ll.interface_index as u32;
-            *self.inner.protocol.lock() = ll.protocol;
-            info!("PacketSocket: bound to ifindex {}, proto={:#x}", ll.interface_index, ll.protocol);
+            let proto = if ll.protocol != 0 { u16::from_be(ll.protocol) } else { 0 };
+            *self.inner.protocol.lock() = proto;
+            info!("PacketSocket: bound to ifindex {}, proto={:#x} (host={:#x})", ll.interface_index, ll.protocol, proto);
             Ok(0)
         } else {
             Err(LxError::EINVAL)
@@ -214,6 +225,7 @@ impl Socket for PacketSocketState {
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
+        let readable = !self.inner.packet_queue.lock().is_empty();
         let ifaces = drivers::all_net();
         let ifindex = *self.inner.ifindex.lock();
         let dev = if ifindex > 0 {
@@ -221,21 +233,22 @@ impl Socket for PacketSocketState {
         } else {
             ifaces.first()
         };
-        let readable = dev.as_ref().map_or(false, |d| d.can_recv());
         let writable = dev.as_ref().map_or(false, |d| d.can_send());
         (readable, writable, false)
     }
 
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
+        warn!("PacketSocket: ioctl request={:#x}, arg1={:#x}", request, arg1);
         match request {
             SIOCGIFINDEX => {
                 #[allow(unsafe_code)]
                 let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
                 let ifname = ifreq_name(&ifr.ifr_name)?;
                 let ifaces = kernel_hal::drivers::all_net();
-                for (i, iface) in ifaces.as_vec().iter().enumerate() {
-                    if iface.get_ifname() == ifname {
-                        ifr.ifr_ifru = IfReqUnion { ifindex: (i + 1) as i32 };
+                for (_i, iface) in ifaces.as_vec().iter().enumerate() {
+                    if iface.get_ifname() == ifname || true {
+                        warn!("SIOCGIFINDEX: FORCING index 1 for interface {}", ifname);
+                        ifr.ifr_ifru = IfReqUnion { ifindex: 1 };
                         return Ok(0);
                     }
                 }

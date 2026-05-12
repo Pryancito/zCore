@@ -33,7 +33,8 @@ impl Syscall<'_> {
         let protocol_num = protocol;
         let protocol = Protocol::try_from(protocol_num).ok();
 
-        warn!("sys_socket: domain={:?}, type={:?}, protocol={:#x}", domain, socket_type, protocol_num);
+        info!("sys_socket: domain:{:?}, type:{:?}, protocol:{:?}", domain, socket_type, protocol);
+
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
             (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {

@@ -18,6 +18,8 @@ use zircon_object::{object::KernelObject, vm::USER_STACK_PAGES, ZxError, ZxResul
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
     info!("Run Linux process: args={:?}, envs={:?}", args, envs);
 
+    linux_object::net::init();
+
     let job = Job::root();
     let proc = Process::create_linux(&job, rootfs.clone()).unwrap();
     let thread = Thread::create_linux(&proc).unwrap();

@@ -256,6 +256,7 @@ impl Syscall<'_> {
             Sys::GETPID => self.sys_getpid(),
             Sys::GETTID => self.sys_gettid(),
             Sys::UNAME => self.sys_uname(a0.into()),
+            Sys::SYSLOG => self.sys_syslog(a0 as i32, a1.into(), a2 as i32),
             Sys::UMASK => self.unimplemented("umask", Ok(0o777)),
             //            Sys::GETRLIMIT => self.sys_getrlimit(),
             //            Sys::SETRLIMIT => self.sys_setrlimit(),
