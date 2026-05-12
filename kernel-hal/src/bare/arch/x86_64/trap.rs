@@ -40,7 +40,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             if vector == X86_INT_APIC_TIMER {
                 executor::handle_timeout();
             }
-            crate::deferred_job::run_deferred_jobs();
+            crate::deferred_job::drain_deferred_jobs();
         }
         other => panic!("Unhandled trap {:x?} {:#x?}", other, tf),
     }
