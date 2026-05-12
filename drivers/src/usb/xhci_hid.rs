@@ -700,7 +700,7 @@ const HID_PROTO_KEY: u8 = 1;
 const HID_PROTO_MOUSE: u8 = 2;
 const HID_PROTO_TABLET: u8 = 3;
 const TABLET_RANGE: u32 = 32767;
-const INVALID_MSI_VECTOR: usize = 0;
+const NO_MSI_VECTOR: usize = 0;
 
 pub struct XhciInner {
     pub mmio: XhciMmio,
@@ -2311,12 +2311,12 @@ impl PciDriver for XhciDriverPci {
 
         let vaddr = crate::bus::phys_to_virt(addr as usize);
         
-        let vector = irq.map(|idx| idx + 32).unwrap_or(INVALID_MSI_VECTOR);
+        let vector = irq.map(|idx| idx + 32).unwrap_or(NO_MSI_VECTOR);
 
         // Handle xHCI
         if dev.id.prog_if == 0x30 {
             let input = XhciUsbHid::probe(dev, vaddr, map_len, vector)?;
-            if vector != INVALID_MSI_VECTOR {
+            if vector != NO_MSI_VECTOR {
                 pci_note_pending_msi(vector, input.clone());
             }
             Ok(Device::Input(input))
