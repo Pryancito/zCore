@@ -664,7 +664,7 @@ impl PciDriver for NvidiaGpuDriverPci {
         dev.id.vendor_id == 0x10DE && dev.id.class == 0x03
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, _irq: Option<usize>) -> DeviceResult<Device> {
         use crate::bus::pci::{read_bar_addr, probe_bar_size, PortOpsImpl, PCI_ACCESS};
         use crate::bus::phys_to_virt;
         use crate::bus::PAGE_SIZE;

@@ -255,10 +255,10 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
 
 pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
     // Enable Memory Space and Bus Mastering
-    unsafe { enable(dev.loc, 0); }
+    let irq = unsafe { enable(dev.loc, 0) };
 
     // Try modular PCI drivers (ArceOS style)
-    if let Ok(device) = super::pci_drivers::probe_pci_device(dev, mapper) {
+    if let Ok(device) = super::pci_drivers::probe_pci_device(dev, mapper, irq) {
         return Ok(device);
     }
 

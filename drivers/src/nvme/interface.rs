@@ -669,13 +669,14 @@ impl PciDriver for NvmeDriverPci {
         vendor_id == 0x1b36 && device_id == 0x10
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
         if let Some(BAR::Memory(addr, _len, _, _)) = dev.bars[0] {
             if let Some(m) = mapper {
                 m.query_or_map(addr as usize, 4096 * 8);
             }
             let vaddr = crate::bus::phys_to_virt(addr as usize);
-            let blk = Arc::new(NvmeInterface::new(vaddr, 33)?);
+            let vector = irq.map(|idx| idx + 32).unwrap_or(33);
+            let blk = Arc::new(NvmeInterface::new(vaddr, vector)?);
             Ok(Device::Block(blk))
         } else {
             Err(crate::DeviceError::NotSupported)

@@ -2288,7 +2288,7 @@ impl PciDriver for XhciDriverPci {
         dev.id.class == 0x0c && dev.id.subclass == 0x03
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
         let (addr, len) = if let Some(BAR::Memory(ba, bl, _, _)) = dev.bars[0] {
             (ba, bl as u64)
         } else {
@@ -2309,12 +2309,11 @@ impl PciDriver for XhciDriverPci {
 
         let vaddr = crate::bus::phys_to_virt(addr as usize);
         
+        let vector = irq.map(|idx| idx + 32).unwrap_or(0);
+
         // Handle xHCI
         if dev.id.prog_if == 0x30 {
-            // Note: we'd need to call pci::enable which is not easily accessible here.
-            // For now, assume it's handled or we'll need to move enable logic too.
-            // Actually, we can just use vector 0 (poll) for now or find a way to get MSI.
-            let input = XhciUsbHid::probe(dev, vaddr, map_len, 0)?;
+            let input = XhciUsbHid::probe(dev, vaddr, map_len, vector)?;
             Ok(Device::Input(input))
         } else {
             // Legacy USB
@@ -2326,7 +2325,7 @@ impl PciDriver for XhciDriverPci {
                     0x00 => LegacyUsbKind::Uhci,
                     _ => return Err(DeviceError::NotSupported),
                 };
-                let input = LegacyUsbHid::probe(kind, dev, vaddr, map_len, 0)?;
+                let input = LegacyUsbHid::probe(kind, dev, vaddr, map_len, vector)?;
                 Ok(Device::Input(input))
             }
             #[cfg(not(feature = "legacy-usb-hid"))]

@@ -905,7 +905,7 @@ impl PciDriver for E1000eDriverPci {
         )
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
         info!("[e1000e] PCI ID: vendor={:#x}, device={:#x}", dev.id.vendor_id, dev.id.device_id);
         let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
             a as usize
@@ -919,7 +919,8 @@ impl PciDriver for E1000eDriverPci {
         
         let vaddr = crate::net::phys_to_virt(bar0_addr);
         let name = alloc::format!("eth{}", dev.loc.bus);
-        let iface = init(name, 0, vaddr, 0)?;
+        let vector = irq.map(|idx| idx + 32).unwrap_or(0);
+        let iface = init(name, vector, vaddr, 0)?;
         Ok(Device::Net(Arc::new(iface)))
     }
 }

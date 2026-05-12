@@ -260,14 +260,15 @@ impl PciDriver for E1000DriverPci {
         vendor_id == 0x8086 && (device_id == 0x100e || device_id == 0x100f)
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
         if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
             if let Some(m) = mapper {
                 m.query_or_map(addr as usize, 4096 * 8);
             }
             let vaddr = crate::bus::phys_to_virt(addr as usize);
             let name = alloc::format!("eth{}", dev.loc.bus);
-            let iface = init(name, 0, vaddr, len as usize, 0)?;
+            let vector = irq.map(|idx| idx + 32).unwrap_or(0);
+            let iface = init(name, vector, vaddr, len as usize, 0)?;
             Ok(Device::Net(Arc::new(iface)))
         } else {
             Err(crate::DeviceError::NotSupported)

@@ -478,7 +478,7 @@ impl PciDriver for AhciDriverPci {
         dev.id.class == 0x01 && dev.id.subclass == 0x06 && dev.id.prog_if == 0x01
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
+    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
         let (addr, len) = if let Some(BAR::Memory(a, l, _, _)) = dev.bars[5] {
             (a as usize, l as usize)
         } else {
@@ -496,10 +496,8 @@ impl PciDriver for AhciDriverPci {
         }
 
         let vaddr = phys_to_virt(addr);
-        // Note: we don't have access to pci::enable here, so we assume IRQ is either not used or handled elsewhere,
-        // or we use a default. In the original code, `enable` was called. 
-        // For AHCI, irq handling is currently a no-op anyway (`fn handle_irq(&self, _irq: usize) {}`).
-        let blk = Arc::new(AhciInterface::new(vaddr, 0)?);
+        let vector = irq.map(|idx| idx + 32).unwrap_or(33);
+        let blk = Arc::new(AhciInterface::new(vaddr, vector)?);
         Ok(Device::Block(blk))
     }
 }
