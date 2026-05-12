@@ -762,7 +762,13 @@ int main(int argc, char **argv) {
             usleep(1000 * 1000);
             continue;
         }
-        if (sent_packet == 0 && sent_udp == 0) fprintf(stderr, "edhcpc: discover sent via packet+udp\n");
+        if (sent_packet == 0 && sent_udp == 0) {
+            fprintf(stderr, "edhcpc: discover sent via packet+udp\n");
+        } else if (sent_packet == 0) {
+            fprintf(stderr, "edhcpc: discover sent via packet only\n");
+        } else {
+            fprintf(stderr, "edhcpc: discover sent via udp only\n");
+        }
 
         fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
         uint32_t sub_deadline = now_ms() + 3000; // 3 seconds per attempt
@@ -800,6 +806,13 @@ got_offer:
     if (sent_packet < 0) warnx("send(packet:request) failed");
     if (sent_udp < 0) warnx("send(udp:request) failed");
     if (sent_packet < 0 && sent_udp < 0) die("send(request)");
+    if (sent_packet == 0 && sent_udp == 0) {
+        fprintf(stderr, "edhcpc: request sent via packet+udp\n");
+    } else if (sent_packet == 0) {
+        fprintf(stderr, "edhcpc: request sent via packet only\n");
+    } else {
+        fprintf(stderr, "edhcpc: request sent via udp only\n");
+    }
 
     struct dhcp_offer ack;
     int mt2 = 0;
