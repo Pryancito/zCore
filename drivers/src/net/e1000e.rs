@@ -515,9 +515,7 @@ impl E1000eHw {
 
         let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
         let rdt = unsafe { mmio_read(self.base, E1000E_RDT) };
-        if desc.status != 0 || rdh as usize != idx {
-            warn!("[e1000e] RX check: idx={}, RDH={}, RDT={}, status={:#x}", idx, rdh, rdt, desc.status);
-        }
+        // trace!("[e1000e] RX check: idx={}, RDH={}, RDT={}, status={:#x}", idx, rdh, rdt, desc.status);
 
         if desc.status & RX_STATUS_DD == 0 {
             return None;

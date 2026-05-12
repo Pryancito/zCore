@@ -714,19 +714,43 @@ int main(int argc, char **argv) {
     uint8_t dhcp_buf[600];
     size_t dhcp_len = build_dhcp_discover(dhcp_buf, sizeof(dhcp_buf), mac, xid_be);
     if (dhcp_len == 0) die("build_dhcp_discover");
-    if (send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len) < 0) die("send(packet:discover)");
 
     struct dhcp_offer offer;
     int mt = 0;
-    fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
-    for (;;) {
-        if (recv_dhcp_message_any(pfd, fd, xid_be, &offer, &mt, deadline) < 0) {
-            warnx("timeout waiting for DHCPOFFER");
-            return 1;
+    int attempts = 0;
+    const int max_attempts = 5;
+
+    fprintf(stderr, "edhcpc: starting DHCP negotiation on %s (MAC %02x:%02x:%02x:%02x:%02x:%02x)\n",
+            ifname, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    while (attempts < max_attempts) {
+        fprintf(stderr, "edhcpc: sending DISCOVER (attempt %d/%d)...\n", ++attempts, max_attempts);
+        if (send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len) < 0) {
+            warnx("send(packet:discover) failed");
+            usleep(1000 * 1000);
+            continue;
         }
-        if (mt == DHCPOFFER) break;
-        fprintf(stderr, "edhcpc: ignoring message type %d while waiting for OFFER\n", mt);
+
+        fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
+        uint32_t sub_deadline = now_ms() + 3000; // 3 seconds per attempt
+        while (now_ms() < sub_deadline) {
+            int r = recv_dhcp_message_any(pfd, fd, xid_be, &offer, &mt, sub_deadline);
+            if (r == 0) {
+                if (mt == DHCPOFFER) goto got_offer;
+                fprintf(stderr, "edhcpc: ignoring DHCP message type %d while waiting for OFFER\n", mt);
+            } else if (r < 0) {
+                // error or timeout inside recv_dhcp_message_any
+                break;
+            }
+            // else r == 1 (no packet yet), continue looping until sub_deadline
+        }
+        if (now_ms() >= deadline) break;
     }
+
+    warnx("timeout waiting for DHCPOFFER");
+    return 1;
+
+got_offer:
     fprintf(stderr, "edhcpc: received DHCPOFFER for ");
     print_ipv4("", offer.yiaddr);
     fprintf(stderr, "\n");
