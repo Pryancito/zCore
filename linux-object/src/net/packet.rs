@@ -55,7 +55,6 @@ pub fn push_packet(packet: &[u8]) {
                 if protocol != 0 && protocol != 0x0003 && protocol != ethertype {
                     continue;
                 }
-                error!("PacketSocket: matching packet, ethertype={:#x}", ethertype);
             } else {
                 info!("PacketSocket: non-ethernet packet received");
             }
@@ -65,7 +64,6 @@ pub fn push_packet(packet: &[u8]) {
             if queue.len() < 1000 {
                 queue.push_back(packet.to_vec());
                 state.base.signal_set(Signal::READABLE);
-                error!("PacketSocket: packet pushed to queue, len={}", packet.len());
             }
         } else {
             to_remove.push(i);
