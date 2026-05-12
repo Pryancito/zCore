@@ -372,7 +372,8 @@ static int send_dhcp_packet(int pfd, const uint8_t mac[6], const uint8_t *dhcp, 
     const size_t frame_len = sizeof(*eth) + ip_len;
     fprintf(stderr, "edhcpc: sending packet (%zu bytes)\n", frame_len);
     ssize_t n = send(pfd, frame, frame_len, 0);
-    return (n < 0) ? -1 : 0;
+    if (n < 0) return -1;
+    return ((size_t)n == frame_len) ? 0 : -1;
 }
 
 static int send_dhcp_udp_broadcast(int udp_fd, const uint8_t *dhcp, size_t dhcp_len) {
@@ -382,7 +383,8 @@ static int send_dhcp_udp_broadcast(int udp_fd, const uint8_t *dhcp, size_t dhcp_
     dst.sin_port = htons(DHCP_SERVER_PORT);
     dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
     ssize_t n = sendto(udp_fd, dhcp, dhcp_len, 0, (struct sockaddr *)&dst, sizeof(dst));
-    return (n < 0) ? -1 : 0;
+    if (n < 0) return -1;
+    return ((size_t)n == dhcp_len) ? 0 : -1;
 }
 
 static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32_t xid_be,
@@ -760,6 +762,7 @@ int main(int argc, char **argv) {
             usleep(1000 * 1000);
             continue;
         }
+        if (sent_packet == 0 && sent_udp == 0) fprintf(stderr, "edhcpc: discover sent via packet+udp\n");
 
         fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
         uint32_t sub_deadline = now_ms() + 3000; // 3 seconds per attempt
