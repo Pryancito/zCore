@@ -116,6 +116,7 @@ pub fn pci_finish_msi_registrations() -> DeviceResult<()> {
     let mut q = MSI_PENDING.lock();
     for (v, d) in q.drain(..) {
         host.register_device(v, d)?;
+        let _ = host.unmask(v);
     }
     Ok(())
 }
@@ -2314,6 +2315,9 @@ impl PciDriver for XhciDriverPci {
         // Handle xHCI
         if dev.id.prog_if == 0x30 {
             let input = XhciUsbHid::probe(dev, vaddr, map_len, vector)?;
+            if vector > 0 {
+                pci_note_pending_msi(vector, input.clone());
+            }
             Ok(Device::Input(input))
         } else {
             // Legacy USB
