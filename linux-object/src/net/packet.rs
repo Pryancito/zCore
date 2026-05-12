@@ -100,7 +100,7 @@ impl PacketSocketState {
                 flags: Mutex::new(OpenFlags::RDWR),
                 ifindex: Mutex::new(0),
                 socket_type,
-                protocol: Mutex::new(u16::from_be(protocol)),
+                protocol: Mutex::new(protocol),
                 packet_queue: Mutex::new(VecDeque::new()),
             }),
         });
