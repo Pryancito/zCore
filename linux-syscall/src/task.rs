@@ -159,7 +159,11 @@ impl Syscall<'_> {
         new_ctx.set_field(UserContextField::StackPointer, newsp);
         new_ctx.set_field(UserContextField::ThreadPointer, newtls);
         new_ctx.set_field(UserContextField::ReturnValue, 0);
-        info!("clone: tid_parent={} context={:#x?}", self.thread.id(), new_ctx);
+        info!(
+            "clone: tid_parent={} context={:#x?}",
+            self.thread.id(),
+            new_ctx
+        );
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
 
@@ -348,9 +352,9 @@ impl Syscall<'_> {
         proc.set_execute_path(&execute_path);
         proc.set_brk(initial_brk);
 
-        self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
+        self.zircon_process().signal_set(Signal::SIGNALED);
         self.thread.with_context(|ctx| {
-            *ctx = UserContext::new();
+            *ctx = Box::new(UserContext::new());
             ctx.setup_uspace(entry, sp, &[0, 0, 0]);
         })?;
         Ok(0)
