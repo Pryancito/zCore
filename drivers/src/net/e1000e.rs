@@ -560,46 +560,52 @@ impl E1000eHw {
     // Receive one frame (returns owned Vec)
     // -----------------------------------------------------------------------
     fn receive(&mut self) -> Option<Vec<u8>> {
-        let ring = self.rx_ring.as_ptr::<RxDesc>();
-        let idx = self.rx_tail;
-        let desc = unsafe { &mut *ring.add(idx) };
+        // Loop so that a single bad descriptor (no EOP / oversized multi-segment
+        // frame) does not stop smoltcp's receive drain and cause subsequent valid
+        // frames — including DHCPOFFER — to be missed until the next poll cycle.
+        loop {
+            let ring = self.rx_ring.as_ptr::<RxDesc>();
+            let idx = self.rx_tail;
+            let desc = unsafe { &mut *ring.add(idx) };
 
-        // Flush the descriptor cache line before reading status
-        unsafe { core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8); }
-        fence(Ordering::SeqCst);
-        let status = unsafe { read_volatile(&desc.status) };
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            // Flush the descriptor cache line before reading status so we always
+            // see the hardware-written value on real hardware.
+            unsafe { core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8); }
+            fence(Ordering::SeqCst);
+            let status = unsafe { read_volatile(&desc.status) };
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
 
-        let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
-        let rdt = unsafe { mmio_read(self.base, E1000E_RDT) };
-        // warn!("[e1000e] RX check: idx={}, RDH={}, RDT={}, status={:#x}", idx, rdh, rdt, status);
+            if status & RX_STATUS_DD == 0 {
+                // No more descriptors owned by software; stop the drain.
+                return None;
+            }
+            let errors = unsafe { read_volatile(&desc.errors) };
+            // Check for hardware reported errors
+            if errors != 0 {
+                warn!("[e1000e] RX packet error: status={:#x}, errors={:#x}, len={}", status, errors, desc.len);
+            }
 
-        if status & RX_STATUS_DD == 0 {
-            return None;
-        }
-        let errors = unsafe { read_volatile(&desc.errors) };
-        // Check for hardware reported errors
-        if errors != 0 {
-            warn!("[e1000e] RX packet error: status={:#x}, errors={:#x}, len={}", status, errors, desc.len);
-        }
+            // Must be a complete frame and fit in our DMA buffer.
+            // If not, recycle (advancing rx_tail + writing RDT) and keep looping
+            // so the next descriptor is checked in the same call rather than
+            // making the caller retry after the next poll_ifaces() (≥50 ms delay).
+            if status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
+                self.recycle_rx_desc(idx, desc);
+                continue;
+            }
+            let len = desc.len as usize;
+            // Flush the buffer before reading it
+            let buf_vaddr = self.rx_bufs[idx].vaddr();
+            for p in (buf_vaddr..buf_vaddr + len).step_by(64) {
+                unsafe { core::arch::x86_64::_mm_clflush(p as *const u8); }
+            }
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            let buf = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
+            let pkt = buf.to_vec();
 
-        // Must be a complete frame and fit in our DMA buffer.
-        if status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
             self.recycle_rx_desc(idx, desc);
-            return None;
+            return Some(pkt);
         }
-        let len = desc.len as usize;
-        // Flush the buffer before reading it
-        let buf_vaddr = self.rx_bufs[idx].vaddr();
-        for p in (buf_vaddr..buf_vaddr + len).step_by(64) {
-            unsafe { core::arch::x86_64::_mm_clflush(p as *const u8); }
-        }
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        let buf = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
-        let pkt = buf.to_vec();
-
-        self.recycle_rx_desc(idx, desc);
-        Some(pkt)
     }
 
     // -----------------------------------------------------------------------
