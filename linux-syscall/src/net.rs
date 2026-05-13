@@ -59,7 +59,11 @@ impl Syscall<'_> {
             // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
             (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
             | (Domain::AF_PACKET, SocketType::SOCK_DGRAM, _) => {
-                PacketSocketState::new(socket_type, protocol_num as u16)
+                // Protocol is passed in network byte order (big-endian), convert to host byte order
+                // for storage and filtering. Without this conversion, packet filtering fails on
+                // little-endian systems because ETH_P_ALL (0x0003) becomes 0x0300 after htons().
+                let protocol_host = u16::from_be(protocol_num as u16);
+                PacketSocketState::new(socket_type, protocol_host)
             }
             // AF_UNIX sockets
             (Domain::AF_UNIX, _, _) => UnixSocketState::new(),
