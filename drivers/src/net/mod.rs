@@ -20,14 +20,23 @@ static MSI_IRQ_HOST: Mutex<Option<Arc<dyn IrqScheme>>> = Mutex::new(None);
 static MSI_PENDING: Mutex<Vec<(usize, Arc<dyn Scheme>)>> = Mutex::new(Vec::new());
 
 pub fn pci_set_irq_host(irq: Arc<dyn IrqScheme>) {
+    let flag = intr_get();
+    if flag { intr_off(); }
     *MSI_IRQ_HOST.lock() = Some(irq);
+    if flag { intr_on(); }
 }
 
 pub fn pci_note_pending_msi(vector: usize, dev: Arc<dyn Scheme>) {
+    let flag = intr_get();
+    if flag { intr_off(); }
     MSI_PENDING.lock().push((vector, dev));
+    if flag { intr_on(); }
 }
 
 pub fn pci_finish_msi_registrations() -> DeviceResult {
+    let flag = intr_get();
+    if flag { intr_off(); }
+    
     let host = MSI_IRQ_HOST.lock().clone();
     if let Some(host) = host {
         let mut q = MSI_PENDING.lock();
@@ -41,6 +50,8 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
             }
         }
     }
+    
+    if flag { intr_on(); }
     Ok(())
 }
 
@@ -98,12 +109,27 @@ pub fn timer_now_as_micros() -> u64 {
     unsafe { drivers_timer_now_as_micros() }
 }
 
+pub fn intr_on() {
+    unsafe { drivers_intr_on() }
+}
+
+pub fn intr_off() {
+    unsafe { drivers_intr_off() }
+}
+
+pub fn intr_get() -> bool {
+    unsafe { drivers_intr_get() }
+}
+
 extern "C" {
     fn drivers_dma_alloc(pages: usize) -> PhysAddr;
     fn drivers_dma_dealloc(paddr: PhysAddr, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: PhysAddr) -> VirtAddr;
     fn drivers_virt_to_phys(vaddr: VirtAddr) -> PhysAddr;
     fn drivers_timer_now_as_micros() -> u64;
+    fn drivers_intr_on();
+    fn drivers_intr_off();
+    fn drivers_intr_get() -> bool;
 }
 
 pub const PAGE_SIZE: usize = 4096;
@@ -120,15 +146,23 @@ lazy_static::lazy_static! {
 
 /// Sets a callback for every received packet (raw).
 pub fn set_packet_callback(callback: fn(&[u8])) {
+    let flag = intr_get();
+    if flag { intr_off(); }
     *PACKET_CALLBACK.lock() = Some(callback);
+    if flag { intr_on(); }
 }
 
 /// Dispatches a received packet to the registered callback.
 pub fn net_dispatch_packet(data: &[u8]) {
     trace!("[net] dispatching packet of {} bytes", data.len());
+    let flag = intr_get();
+    if flag { intr_off(); }
+    
     if let Some(callback) = PACKET_CALLBACK.lock().as_ref() {
         callback(data);
     }
+    
+    if flag { intr_on(); }
 }
 
 // 注意！这个容易出现死锁

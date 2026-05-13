@@ -209,4 +209,18 @@ mod drivers_ffi {
     extern "C" fn drivers_timer_now_as_micros() -> u64 {
         timer_now().as_micros() as _
     }
+
+    use crate::hal_fn::interrupt::{intr_on, intr_off, intr_get};
+    #[no_mangle]
+    extern "C" fn drivers_intr_on() {
+        intr_on();
+    }
+    #[no_mangle]
+    extern "C" fn drivers_intr_off() {
+        intr_off();
+    }
+    #[no_mangle]
+    extern "C" fn drivers_intr_get() -> bool {
+        intr_get()
+    }
 }

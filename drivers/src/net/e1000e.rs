@@ -28,7 +28,7 @@ use crate::utils::dma::DmaRegion;
 use pci::{PCIDevice, BAR};
 use lock::Mutex;
 
-use super::timer_now_as_micros;
+use super::{timer_now_as_micros, intr_on, intr_off, intr_get};
 
 // ---------------------------------------------------------------------------
 // Register offsets (byte addresses / 4 → u32 index)
@@ -625,6 +625,7 @@ pub struct E1000eInterface {
     pub driver: E1000eDriver,
     pub name: String,
     pub irq: usize,
+    pub poll_pending: Arc<core::sync::atomic::AtomicBool>,
 }
 
 impl Scheme for E1000eInterface {
@@ -636,18 +637,30 @@ impl Scheme for E1000eInterface {
         if irq != self.irq {
             return;
         }
-        // Use try_lock to avoid deadlock in IRQ context
+        // Use try_lock to avoid deadlock if the main thread is currently polling.
+        // On real hardware (especially single-core), if we spin here, we deadlock.
         if let Some(mut hw) = self.driver.hw.try_lock() {
             if hw.handle_interrupt() {
-                let self_clone = self.clone();
-                crate::utils::deferred_job::push_deferred_job(move || {
-                    let ts = Instant::from_micros(timer_now_as_micros() as i64);
-                    let sockets = get_sockets();
-                    let mut sockets = sockets.lock();
-                    if let Err(e) = self_clone.iface.lock().poll(&mut sockets, ts) {
-                        // poll error is common when no packet, ignore
-                    }
-                });
+                if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+                    self.poll_pending.store(true, core::sync::atomic::Ordering::SeqCst);
+                    let poll_pending = self.poll_pending.clone();
+                    let self_clone = self.clone();
+                    crate::utils::deferred_job::push_deferred_job(move || {
+                        let ts = Instant::from_micros(timer_now_as_micros() as i64);
+                        let sockets = get_sockets();
+                        // Disable interrupts while polling to avoid re-entering from IRQ
+                        let flag = intr_get();
+                        if flag { intr_off(); }
+                        
+                        {
+                            let mut sockets = sockets.lock();
+                            let _ = self_clone.iface.lock().poll(&mut sockets, ts);
+                        }
+                        
+                        if flag { intr_on(); }
+                        poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
+                    });
+                }
             }
         }
     }
@@ -682,28 +695,44 @@ impl NetScheme for E1000eInterface {
     fn poll(&self) -> DeviceResult {
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
-        let mut sockets = sockets.lock();
-        let _ = self.iface.lock().poll(&mut sockets, ts);
+        
+        // Disable interrupts while polling to avoid re-entering from IRQ
+        let flag = intr_get();
+        if flag { intr_off(); }
+        
+        {
+            let mut sockets = sockets.lock();
+            let _ = self.iface.lock().poll(&mut sockets, ts);
+        }
+        
+        if flag { intr_on(); }
         Ok(())
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
-        // Try to read directly from hardware.
-        if let Some(pkt) = self.driver.hw.lock().receive() {
+        let flag = intr_get();
+        if flag { intr_off(); }
+        let res = if let Some(pkt) = self.driver.hw.lock().receive() {
             let n = pkt.len().min(buf.len());
             buf[..n].copy_from_slice(&pkt[..n]);
             Ok(n)
         } else {
             Err(DeviceError::NotReady)
-        }
+        };
+        if flag { intr_on(); }
+        res
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        if self.driver.hw.lock().can_send() {
+        let flag = intr_get();
+        if flag { intr_off(); }
+        let res = if self.driver.hw.lock().can_send() {
             let mut hw = self.driver.hw.lock();
             hw.send(data)?;
             Ok(data.len())
         } else {
             Err(DeviceError::NotReady)
-        }
+        };
+        if flag { intr_on(); }
+        res
     }
 
     fn can_recv(&self) -> bool {
@@ -866,6 +895,7 @@ pub fn init(
         driver,
         name,
         irq,
+        poll_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
     };
 
     Ok(e1000e_iface)

@@ -21,6 +21,8 @@ lazy_static! {
 
 /// Dispatches a received packet to all registered AF_PACKET sockets.
 pub fn push_packet(packet: &[u8]) {
+    let flag = kernel_hal::interrupt::intr_get();
+    if flag { kernel_hal::interrupt::intr_off(); }
     let mut sockets = PACKET_SOCKETS.lock();
     let mut to_remove = Vec::new();
 
@@ -74,6 +76,8 @@ pub fn push_packet(packet: &[u8]) {
     for i in to_remove.into_iter().rev() {
         sockets.swap_remove(i);
     }
+    
+    if flag { kernel_hal::interrupt::intr_on(); }
 }
 
 pub struct PacketSocketState {
@@ -102,7 +106,10 @@ impl PacketSocketState {
                 packet_queue: Mutex::new(VecDeque::new()),
             }),
         });
+        let flag = kernel_hal::interrupt::intr_get();
+        if flag { kernel_hal::interrupt::intr_off(); }
         PACKET_SOCKETS.lock().push(Arc::downgrade(&state));
+        if flag { kernel_hal::interrupt::intr_on(); }
         state
     }
 }
@@ -161,10 +168,9 @@ impl Socket for PacketSocketState {
             }
 
             // Wait for new packets
-            thread::yield_now().await;
+            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10)).await;
         }
     }
-
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
         let ifaces = drivers::all_net();
         let ifindex = *self.inner.ifindex.lock();
