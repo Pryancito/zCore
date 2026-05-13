@@ -189,7 +189,8 @@ impl Syscall<'_> {
         );
         let val = new_value.read()?;
         if val.value.sec != 0 || val.value.usec != 0 {
-            let deadline = Duration::from_secs(val.value.sec as u64) + Duration::from_micros(val.value.usec as u64);
+            let duration = Duration::from_secs(val.value.sec as u64) + Duration::from_micros(val.value.usec as u64);
+            let deadline = kernel_hal::timer::timer_now() + duration;
             let proc = self.zircon_process().clone();
             kernel_hal::timer::timer_set(deadline, Box::new(move |_| {
                 let tids = proc.thread_ids();
@@ -197,6 +198,7 @@ impl Syscall<'_> {
                     if let Ok(obj) = proc.get_child(tid) {
                         if let Ok(thread) = obj.downcast_arc::<Thread>() {
                             thread.lock_linux().signals.insert(Signal::SIGALRM);
+                            thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
                         }
                     }
                 }

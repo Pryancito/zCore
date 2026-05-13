@@ -360,7 +360,7 @@ impl Drop for GlobalSocketHandle {
 use kernel_hal::net::get_net_device;
 
 /// miss doc
-fn poll_ifaces() {
+pub fn poll_ifaces() {
     for iface in get_net_device().iter() {
         match iface.poll() {
             Ok(_) => {}

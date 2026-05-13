@@ -93,18 +93,18 @@ impl Syscall<'_> {
 
     /// syscall entry function
     pub async fn syscall(&mut self, num: u32, args: [usize; 6]) -> isize {
-        /*
         if let Err(err) = self.maybe_handle_tty_intr() {
             return -(err as isize);
         }
-        */
-        trace!(
-            "pid: {} syscall: num={}, args={:x?}",
+        let sys_type = Sys::try_from(num);
+        debug!(
+            "pid: {} syscall: num={} ({:?}), args={:x?}",
             self.zircon_process().id(),
             num,
+            sys_type,
             args
         );
-        let sys_type = match Sys::try_from(num) {
+        let sys_type = match sys_type {
             Ok(t) => t,
             Err(_) => {
                 error!("invalid syscall number: {}", num);
@@ -234,7 +234,7 @@ impl Syscall<'_> {
             // time
             Sys::NANOSLEEP => self.sys_nanosleep(a0.into()).await,
             Sys::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a0, a1, a2.into(), a3.into()).await,
-            Sys::SETITIMER => self.unimplemented("setitimer", Ok(0)),
+            Sys::SETITIMER => self.sys_setitimer(a0, a1.into(), a2.into()),
             Sys::GETTIMEOFDAY => self.sys_gettimeofday(a0.into(), a1.into()),
             Sys::CLOCK_GETTIME => self.sys_clock_gettime(a0, a1.into()),
             Sys::CLOCK_GETRES => self.unimplemented("clock_getres", Ok(0)),

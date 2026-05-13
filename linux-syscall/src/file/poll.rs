@@ -43,11 +43,15 @@ impl Syscall<'_> {
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
                 use PollEvents as PE;
+                if let Err(e) = linux_object::process::check_signals() {
+                    return Poll::Ready(Err(e));
+                }
+                linux_object::net::poll_ifaces();
                 let proc = self.syscall.linux_process();
                 let mut events = 0;
 
                 // iterate each poll to check whether it is ready
-                for poll in self.as_mut().polls.iter_mut() {
+                for poll in self.polls.iter_mut() {
                     poll.revents = PE::empty();
 
                     /* To speed up the socket
@@ -118,6 +122,7 @@ impl Syscall<'_> {
                         let current_time_ms = TimeVal::now().to_msec();
                         let deadline = current_time_ms + 500;
                         let waker = cx.waker().clone();
+                        warn!("PollFuture::poll Pending (-1), setting timer for deadline {}", deadline);
                         timer::timer_set(
                             Duration::from_millis(deadline as u64),
                             Box::new(move |_| waker.wake_by_ref()),
@@ -194,9 +199,10 @@ impl Syscall<'_> {
             "select: nfds: {}, read: {:?}, write: {:?}, err: {:?}, timeout: {:?}",
             nfds, read, write, err, timeout
         );
+        /* nfds = 0 is a valid way to sleep in POSIX
         if nfds as u64 == 0 {
             return Ok(0);
-        }
+        } */
         let mut read_fds = FdSet::new(read, nfds)?;
         let mut write_fds = FdSet::new(write, nfds)?;
         let mut err_fds = FdSet::new(err, nfds)?;
@@ -224,6 +230,10 @@ impl Syscall<'_> {
             type Output = SysResult;
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                if let Err(e) = linux_object::process::check_signals() {
+                    return Poll::Ready(Err(e));
+                }
+                linux_object::net::poll_ifaces();
                 let files = self.syscall.linux_process().get_files()?;
 
                 let mut events = 0;
@@ -335,7 +345,7 @@ impl Syscall<'_> {
         let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;
         
         // TODO: handle timeout
-        let res_events = epoll.wait(maxevents, proc).await?;
+        let res_events = epoll.wait(maxevents, proc, timeout).await?;
         events.write_array(&res_events)?;
         Ok(res_events.len())
     }

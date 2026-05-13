@@ -272,7 +272,7 @@ impl E1000eHw {
     unsafe fn read_mac_from_hw(&mut self) {
         let ral = mmio_read(self.base, E1000E_RAL0);
         let rah = mmio_read(self.base, E1000E_RAH0);
-        info!("[e1000e] hardware registers: RAL0={:#010x}, RAH0={:#010x}", ral, rah);
+        warn!("[e1000e] hardware registers: RAL0={:#010x}, RAH0={:#010x}", ral, rah);
         if ral == 0 && (rah & 0xFFFF) == 0 {
             return;
         }
@@ -561,13 +561,15 @@ impl E1000eHw {
         let idx = self.rx_tail;
         let desc = unsafe { &mut *ring.add(idx) };
 
+        // Flush the descriptor cache line before reading status
+        unsafe { core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8); }
         fence(Ordering::SeqCst);
         let status = unsafe { read_volatile(&desc.status) };
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
 
         let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
         let rdt = unsafe { mmio_read(self.base, E1000E_RDT) };
-        // trace!("[e1000e] RX check: idx={}, RDH={}, RDT={}, status={:#x}", idx, rdh, rdt, desc.status);
+        // warn!("[e1000e] RX check: idx={}, RDH={}, RDT={}, status={:#x}", idx, rdh, rdt, status);
 
         if status & RX_STATUS_DD == 0 {
             return None;
@@ -626,11 +628,19 @@ impl E1000eHw {
         let buf =
             unsafe { core::slice::from_raw_parts_mut(self.tx_bufs[idx].vaddr() as *mut u8, data.len()) };
         buf.copy_from_slice(data);
+        // warn!("[e1000e] Driver sending packet of {} bytes: {:02x?}", data.len(), &data[..data.len().min(64)]);
 
         desc.addr = self.tx_bufs[idx].paddr() as u64;
         desc.len = data.len() as u16;
         desc.cmd = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
         desc.status = 0;
+        fence(Ordering::SeqCst);
+
+        // Flush the data buffer and the descriptor before hardware reads it
+        for p in (self.tx_bufs[idx].vaddr()..self.tx_bufs[idx].vaddr() + data.len()).step_by(64) {
+            unsafe { core::arch::x86_64::_mm_clflush(p as *const u8); }
+        }
+        unsafe { core::arch::x86_64::_mm_clflush(desc as *const TxDesc as *const u8); }
         fence(Ordering::SeqCst);
 
         self.tx_tail = (idx + 1) % NUM_TX;
@@ -640,8 +650,10 @@ impl E1000eHw {
         let tdh = unsafe { mmio_read(self.base, E1000E_TDH) };
         let tdt = unsafe { mmio_read(self.base, E1000E_TDT) };
         let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
+        /*
         warn!("[e1000e] TX check: idx={}, TDH={}, TDT={}, STATUS={:#x}, desc0_status={:#x}", 
             idx, tdh, tdt, status, unsafe { (*self.tx_ring.as_ptr::<TxDesc>()).status });
+        */
 
         if self.tx_tail == 0 {
             self.tx_first = false;
@@ -655,7 +667,7 @@ impl E1000eHw {
     pub fn handle_interrupt(&mut self) -> bool {
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr != 0 {
-            warn!("[e1000e] ICR={:#x}", icr);
+            // warn!("[e1000e] ICR={:#x}", icr);
             unsafe { mmio_write(self.base, E1000E_ICR, icr) };
             return true;
         }
@@ -832,6 +844,7 @@ impl phy::Device<'_> for E1000eDriver {
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         let mut hw = self.hw.lock();
         if let Some(pkt) = hw.receive() {
+            // warn!("[e1000e] Driver received packet of {} bytes: {:02x?}", pkt.len(), &pkt[..pkt.len().min(64)]);
             super::net_dispatch_packet(&pkt);
             Some((
                 E1000eRxToken { data: pkt },

@@ -433,9 +433,16 @@ impl Syscall<'_> {
     pub async fn sys_nanosleep(&self, req: UserInPtr<TimeSpec>) -> SysResult {
         info!("nanosleep: deadline={:?}", req);
         let duration = req.read()?.into();
-        use kernel_hal::{thread, timer};
-        thread::sleep_until(timer::deadline_after(duration)).await;
-        Ok(0)
+        let deadline = kernel_hal::timer::deadline_after(duration);
+        loop {
+            if let Err(e) = linux_object::process::check_signals() {
+                return Err(e);
+            }
+            if kernel_hal::timer::timer_now() >= deadline {
+                return Ok(0);
+            }
+            kernel_hal::thread::yield_now().await;
+        }
     }
 
     //    pub fn sys_set_priority(&self, priority: usize) -> SysResult {

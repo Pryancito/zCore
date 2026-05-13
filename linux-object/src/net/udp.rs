@@ -7,6 +7,7 @@ use alloc::{boxed::Box, sync::Arc, vec};
 use async_trait::async_trait;
 use core::{mem::size_of, slice};
 use kernel_hal::net::get_net_device;
+use kernel_hal::thread;
 use lock::Mutex;
 use smoltcp::socket::{UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
 use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
@@ -156,6 +157,10 @@ impl Socket for UdpSocketState {
                     );
                 }
             }
+            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
+            thread::yield_now().await;
         }
     }
     /// write from buffer
@@ -176,12 +181,12 @@ impl Socket for UdpSocketState {
         let mut sets = sets.lock();
         let mut socket = sets.get::<UdpSocket>(inner.handle.0);
         if socket.endpoint().port == 0 {
-            socket
-                .bind(IpEndpoint::new(
-                    IpAddress::Unspecified,
-                    get_ephemeral_port(),
-                ))
-                .unwrap();
+            if let Err(e) = socket.bind(IpEndpoint::new(IpAddress::Unspecified, get_ephemeral_port())) {
+                warn!("udp bind failed: {:?}", e);
+                drop(socket);
+                drop(sets);
+                return Err(LxError::EINVAL);
+            }
         }
 
         let _len = socket.send_slice(data, *remote_endpoint);

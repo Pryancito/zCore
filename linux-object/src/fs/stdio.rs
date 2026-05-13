@@ -54,6 +54,7 @@ lazy_static! {
             uart.clone().subscribe(
                 Box::new(move |_| {
                     while let Some(c) = uart.try_recv().unwrap_or(None) {
+                        warn!("UART received byte: 0x{:02x}", c);
                         cloned.push(c as char);
                     }
                 }),

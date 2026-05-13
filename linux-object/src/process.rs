@@ -22,7 +22,7 @@ use rcore_fs::vfs::{FileSystem, INode};
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
     signal::Futex,
-    task::{Job, Process, Status},
+    task::{Job, Process, Status, Thread},
     ZxResult,
 };
 
@@ -75,10 +75,9 @@ impl ProcessExt for Process {
         let parent = parent.clone();
         new_proc.add_signal_callback(Box::new({
             let parent = parent.clone();
-            let pid = new_proc.id();
+            let _pid = new_proc.id();
             move |signal| {
                 if signal.contains(Signal::PROCESS_TERMINATED) {
-                    warn!("Child {} terminated, signaling parent SIGCHLD", pid);
                     parent.signal_set(Signal::SIGCHLD);
                 }
                 false
@@ -543,4 +542,31 @@ impl LinuxProcessInner {
             .find(|fd| !self.files.contains_key(fd))
             .unwrap()
     }
+}
+pub fn check_and_deliver_tty_interrupt() -> LxResult<()> {
+    if crate::fs::stdio::ctrl_c_pending_take() {
+        if let Some(arc) = kernel_hal::thread::get_current_thread() {
+            if let Ok(thread) = arc.downcast::<Thread>() {
+                use crate::thread::ThreadExt;
+                thread.lock_linux().signals.insert(LinuxSignal::SIGINT);
+            }
+        }
+        return Err(LxError::EINTR);
+    }
+    check_signals()
+}
+
+/// Check for pending signals and return EINTR if any.
+pub fn check_signals() -> LxResult<()> {
+    if let Some(arc) = kernel_hal::thread::get_current_thread() {
+        if let Ok(thread) = arc.downcast::<Thread>() {
+            use crate::thread::ThreadExt;
+            let linux_thread = thread.lock_linux();
+            let pending = linux_thread.signals.mask_with(&linux_thread.signal_mask);
+            if pending.is_not_empty() {
+                return Err(LxError::EINTR);
+            }
+        }
+    }
+    Ok(())
 }

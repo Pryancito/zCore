@@ -5,6 +5,7 @@ use crate::error::{LxError, LxResult};
 use crate::fs::{FileLike, OpenFlags, PollStatus};
 use crate::net::*;
 use alloc::sync::Arc;
+use kernel_hal::thread;
 use lock::Mutex;
 
 // alloc
@@ -111,6 +112,10 @@ impl Socket for TcpSocketState {
                     );
                 }
             }
+            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
+            thread::yield_now().await;
         }
     }
     /// write from buffer

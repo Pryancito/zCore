@@ -6,7 +6,6 @@ use crate::{
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use async_trait::async_trait;
-use kernel_hal::thread;
 use lock::Mutex;
 use smoltcp::{
     socket::{RawPacketMetadata, RawSocket, RawSocketBuffer},
@@ -63,16 +62,19 @@ impl RawSocketState {
 #[async_trait]
 impl Socket for RawSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        info!("raw read");
         loop {
-            info!("raw read loop");
             poll_ifaces();
+            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
             let net_sockets = get_sockets();
             let mut sockets = net_sockets.lock();
             let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
             if socket.can_recv() {
                 if let Ok(size) = socket.recv_slice(data) {
+                    warn!("raw socket received {} bytes", size);
                     let packet = Ipv4Packet::new_unchecked(data);
+                    warn!("raw socket received {} bytes from {}", size, packet.src_addr());
                     // avoid deadlock
                     drop(socket);
                     drop(sockets);
@@ -95,12 +97,13 @@ impl Socket for RawSocketState {
                     Endpoint::Ip(IpEndpoint::UNSPECIFIED),
                 );
             }
-            thread::yield_now().await;
+            // Wait for new packets to avoid 100% CPU usage
+            kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10)).await;
         }
     }
 
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
-        info!("raw write");
+        warn!("raw write, data len: {}", data.len());
         let net_sockets = get_sockets();
         let mut sockets = net_sockets.lock();
         let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
@@ -122,7 +125,17 @@ impl Socket for RawSocketState {
                 Ipv4Address::new(127, 0, 0, 1)
             };
 
-            if let IpAddress::Ipv4(v4_dst) = endpoint.addr {
+            if let IpAddress::Ipv4(mut v4_dst) = endpoint.addr {
+                if v4_dst.is_unspecified() {
+                    v4_dst = Ipv4Address::new(127, 0, 0, 1);
+                }
+                
+                // smoltcp might panic if we try to route to non-unicast addresses in some contexts
+                if !v4_dst.is_unicast() && !v4_dst.is_broadcast() && !v4_dst.is_multicast() {
+                    warn!("raw socket: invalid destination address {:?}", v4_dst);
+                    return Err(LxError::EINVAL);
+                }
+
                 let len = data.len();
                 // using 20-byte IPv4 header
                 let mut buffer = vec![0u8; len + 20];
@@ -133,11 +146,18 @@ impl Socket for RawSocketState {
                 packet.set_protocol(socket.ip_protocol());
                 packet.set_src_addr(v4_src);
                 packet.set_dst_addr(v4_dst);
+                packet.set_hop_limit(64);
                 let payload = packet.payload_mut();
                 payload.copy_from_slice(data);
                 packet.fill_checksum();
 
-                socket.send_slice(&buffer).unwrap();
+                if let Err(e) = socket.send_slice(&buffer) {
+                    warn!("raw socket send_slice failed: {:?}", e);
+                    // avoid deadlock
+                    drop(socket);
+                    drop(sockets);
+                    return Err(LxError::ENOBUFS);
+                }
 
                 // avoid deadlock
                 drop(socket);

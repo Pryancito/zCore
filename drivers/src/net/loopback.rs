@@ -36,7 +36,7 @@ impl NetScheme for LoopbackInterface {
         unimplemented!()
     }
     fn poll(&self) -> DeviceResult {
-        let timestamp = Instant::from_millis(0);
+        let timestamp = Instant::from_micros(crate::net::timer_now_as_micros() as i64);
         let sockets = get_sockets();
         let mut sockets = sockets.lock();
         match self.iface.lock().poll(&mut sockets, timestamp) {

@@ -109,8 +109,13 @@ impl FileLike for Epoll {
 
 impl Epoll {
     /// wait for events on the interest list
-    pub async fn wait(&self, maxevents: usize, process: &crate::process::LinuxProcess) -> LxResult<Vec<EpollEvent>> {
+    pub async fn wait(&self, maxevents: usize, process: &crate::process::LinuxProcess, timeout_msecs: isize) -> LxResult<Vec<EpollEvent>> {
+        let begin_time_ms = crate::time::TimeVal::now().to_msec();
         loop {
+            if let Err(e) = crate::process::check_signals() {
+                return Err(e);
+            }
+            crate::net::poll_ifaces();
             let mut events = Vec::new();
             let interest_list = self.inner.lock().interest_list.clone();
             for (fd, event) in interest_list {
@@ -142,6 +147,13 @@ impl Epoll {
             
             if !events.is_empty() {
                 return Ok(events);
+            }
+
+            if timeout_msecs >= 0 {
+                let current_time_ms = crate::time::TimeVal::now().to_msec();
+                if current_time_ms >= begin_time_ms + timeout_msecs as usize {
+                    return Ok(Vec::new());
+                }
             }
             
             // TODO: properly wait for ANY of the files to become ready.
