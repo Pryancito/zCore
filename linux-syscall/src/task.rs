@@ -352,7 +352,10 @@ impl Syscall<'_> {
         proc.set_execute_path(&execute_path);
         proc.set_brk(initial_brk);
 
-        self.zircon_process().signal_set(Signal::SIGNALED);
+        // Notify vfork parent that execve has completed loading the new image.
+        // Do not use SIGNALED/PROCESS_TERMINATED here, or waitpid(wait4) on this
+        // child can observe a false "terminated" signal and spin forever.
+        self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
         self.thread.with_context(|ctx| {
             *ctx = UserContext::new();
             ctx.setup_uspace(entry, sp, &[0, 0, 0]);
