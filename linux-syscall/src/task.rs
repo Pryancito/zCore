@@ -352,7 +352,7 @@ impl Syscall<'_> {
         proc.set_execute_path(&execute_path);
         proc.set_brk(initial_brk);
 
-        self.zircon_process().signal_set(Signal::SIGNALED);
+        self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
         self.thread.with_context(|ctx| {
             *ctx = UserContext::new();
             ctx.setup_uspace(entry, sp, &[0, 0, 0]);
