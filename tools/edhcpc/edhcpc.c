@@ -409,14 +409,12 @@ static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32
 }
 
 static int fd_readable_now(int fd) {
-    struct pollfd pfd;
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = fd;
-    pfd.events = POLLIN;
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
     int rc = poll(&pfd, 1, 0);
     if (rc < 0) return -1;
     if (rc == 0) return 0;
-    if (pfd.revents & (POLLIN | POLLERR | POLLHUP)) return 1;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    if (pfd.revents & POLLIN) return 1;
     return 0;
 }
 
