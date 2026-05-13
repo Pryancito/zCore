@@ -10,6 +10,7 @@
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <netpacket/packet.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -407,10 +408,26 @@ static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32
     return 0;
 }
 
+static int fd_readable_now(int fd) {
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int rc = poll(&pfd, 1, 0);
+    if (rc < 0) return -1;
+    if (rc == 0) return 0;
+    if (pfd.revents & (POLLIN | POLLERR | POLLHUP)) return 1;
+    return 0;
+}
+
 static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                      int *msg_type_out) {
+    int ready = fd_readable_now(pfd);
+    if (ready == 0) return 1;
+    if (ready < 0) return -1;
+
     uint8_t buf[2048];
-    ssize_t n = recv(pfd, buf, sizeof(buf), MSG_DONTWAIT);
+    ssize_t n = recv(pfd, buf, sizeof(buf), 0);
     if (n > 0) fprintf(stderr, "edhcpc: packet received, len=%zd\n", n);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
@@ -461,8 +478,12 @@ static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer
 
 static int try_recv_dhcp_udp_once(int udp_fd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                   int *msg_type_out) {
+    int ready = fd_readable_now(udp_fd);
+    if (ready == 0) return 1;
+    if (ready < 0) return -1;
+
     uint8_t buf[2048];
-    ssize_t n = recv(udp_fd, buf, sizeof(buf), MSG_DONTWAIT);
+    ssize_t n = recv(udp_fd, buf, sizeof(buf), 0);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
@@ -698,7 +719,7 @@ int main(int argc, char **argv) {
     close(s);
 
     // DHCP UDP socket
-    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
     if (fd < 0) die("socket(udp)");
 
     int yes = 1;
@@ -725,7 +746,7 @@ int main(int argc, char **argv) {
 
     // Prefer AF_PACKET because smoltcp may not emit IPv4 broadcast before the
     // interface has an address. The packet path crafts Ethernet/IP/UDP manually.
-    int pfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    int pfd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
     if (pfd < 0) die("socket(AF_PACKET)");
 
     // Bind packet socket to interface index (1-based in Eclipse OS).
