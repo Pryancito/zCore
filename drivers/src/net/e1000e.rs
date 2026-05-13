@@ -499,8 +499,6 @@ impl E1000eHw {
             unsafe { mmio_write(self.base, E1000E_MTA_BASE + i, 0) };
         }
         
-        // 6d. Disable all hardware offloads and filtering that might block DHCP
-        warn!("[e1000e] disabling hardware offloads (RXCSUM, RFCTL, MRQC, VLAN)");
         unsafe {
             mmio_write(self.base, E1000E_RXCSUM, 0); // Disable RX checksum offload
             mmio_write(self.base, E1000E_RFCTL, 0);  // Disable advanced filtering
@@ -509,10 +507,8 @@ impl E1000eHw {
         }
 
         // 7. Enable receiver
-        // EN: bit 1, SBP: bit 2, UPE: bit 3, MPE: bit 4, BAM: bit 15, SECRC: bit 26
-        // NOTE: We REMOVED RCTL_LPE (Long Packet Enable) as it can cause broadcast drops on I219 if not needed.
-        let rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
-        warn!("[e1000e] setting RCTL={:#x}", rctl);
+        // EN: bit 1, SBP: bit 2, MPE: bit 4, BAM: bit 15, SECRC: bit 26
+        let rctl = RCTL_EN | RCTL_SBP | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
         unsafe { mmio_write(self.base, E1000E_RCTL, rctl) };
         
         // Set RXDCTL (RX Descriptor Control)
@@ -543,18 +539,7 @@ impl E1000eHw {
         let rdh = mmio_read(self.base, E1000E_RDH);
         let rdt = mmio_read(self.base, E1000E_RDT);
         
-        warn!(
-            "[e1000e] INIT DUMP: STATUS={:#x}, RCTL={:#x}, TCTL={:#x}",
-            status, rctl, tctl
-        );
-        warn!(
-            "[e1000e] RX DUMP: RDBA={:#x}:{:x}, RDLEN={}, RDH={}, RDT={}",
-            rdbah, rdbal, rdlen, rdh, rdt
-        );
-        warn!(
-            "[e1000e] RX RING PADDR: {:#x}, BUF0 PADDR: {:#x}",
-            self.rx_ring.paddr(), self.rx_bufs[0].paddr()
-        );
+        
         
         info!(
             "[e1000e] init done. STATUS={:#010x} link={}",
@@ -577,23 +562,24 @@ impl E1000eHw {
         let desc = unsafe { &mut *ring.add(idx) };
 
         fence(Ordering::SeqCst);
-        unsafe { core::arch::x86_64::_mm_clflush(desc as *const _ as *const u8); }
+        let status = unsafe { read_volatile(&desc.status) };
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
 
         let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
         let rdt = unsafe { mmio_read(self.base, E1000E_RDT) };
         // trace!("[e1000e] RX check: idx={}, RDH={}, RDT={}, status={:#x}", idx, rdh, rdt, desc.status);
 
-        if desc.status & RX_STATUS_DD == 0 {
+        if status & RX_STATUS_DD == 0 {
             return None;
         }
+        let errors = unsafe { read_volatile(&desc.errors) };
         // Check for hardware reported errors
-        if desc.errors != 0 {
-            warn!("[e1000e] RX packet error: status={:#x}, errors={:#x}, len={}", desc.status, desc.errors, desc.len);
+        if errors != 0 {
+            warn!("[e1000e] RX packet error: status={:#x}, errors={:#x}, len={}", status, errors, desc.len);
         }
 
         // Must be a complete frame and fit in our DMA buffer.
-        if desc.status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
+        if status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
             self.recycle_rx_desc(idx, desc);
             return None;
         }
@@ -618,14 +604,14 @@ impl E1000eHw {
         let ring = self.tx_ring.as_ptr::<TxDesc>();
         let desc = unsafe { &*ring.add(self.tx_tail) };
         fence(Ordering::SeqCst);
-        self.tx_first || (desc.status & 0x01 != 0) // DD bit
+        let status = unsafe { read_volatile(&desc.status) };
+        self.tx_first || (status & 0x01 != 0) // DD bit
     }
 
     // -----------------------------------------------------------------------
     // Send one frame
     // -----------------------------------------------------------------------
     fn send(&mut self, data: &[u8]) -> DeviceResult {
-        warn!("[e1000e] hardware sending {} bytes: {:02x?}", data.len(), &data[..data.len().min(32)]);
         if !self.can_send() {
             return Err(DeviceError::NotReady);
         }
@@ -950,8 +936,8 @@ pub fn init(
     let driver = E1000eDriver { hw: hw_arc.clone() };
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac_bytes);
-    let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 24)];
-    let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
+    let ip_addrs = [IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)];
+    let default_v4_gw = Ipv4Address::new(10, 0, 2, 2);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
     routes.add_default_ipv4_route(default_v4_gw).unwrap();
@@ -1021,6 +1007,10 @@ impl PciDriver for E1000eDriverPci {
         let name = alloc::format!("eth{}", dev.loc.bus);
         let vector = irq.map(|idx| idx + 32).unwrap_or(0);
         let iface = init(name, dev.id.device_id, vector, vaddr, 0)?;
-        Ok(Device::Net(Arc::new(iface)))
+        let iface_arc = Arc::new(iface);
+        if vector != 0 {
+            crate::net::pci_note_pending_msi(vector, iface_arc.clone());
+        }
+        Ok(Device::Net(iface_arc))
     }
 }

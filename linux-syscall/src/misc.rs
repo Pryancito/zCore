@@ -223,6 +223,67 @@ impl Syscall<'_> {
     ///   - GRND_RANDOM
     ///   - GRND_NONBLOCK
     /// - returns the number of bytes that were copied to the buffer buf.
+    /// reboot() reboots the system, or enables/disables the reboot keystroke.
+    pub fn sys_reboot(
+        &mut self,
+        magic1: u32,
+        magic2: u32,
+        cmd: u32,
+        _arg: UserInPtr<u8>,
+    ) -> SysResult {
+        info!(
+            "reboot: magic1={:#x}, magic2={:#x}, cmd={:#x}",
+            magic1, magic2, cmd
+        );
+        if magic1 != 0xfee1dead
+            || (magic2 != 0x28121969
+                && magic2 != 0x05121996
+                && magic2 != 0x16041998
+                && magic2 != 0x20112000)
+        {
+            return Err(LxError::EINVAL);
+        }
+        match cmd {
+            0x4321fedc => {
+                // LINUX_REBOOT_CMD_RESTART
+                info!("rebooting...");
+                kernel_hal::cpu::reset();
+            }
+            0x89abcdef => {
+                // LINUX_REBOOT_CMD_CAD_ON
+                Ok(0)
+            }
+            0x00000000 => {
+                // LINUX_REBOOT_CMD_CAD_OFF
+                Ok(0)
+            }
+            0xCDEF0123 => {
+                // LINUX_REBOOT_CMD_HALT
+                info!("halt...");
+                kernel_hal::cpu::reset();
+            }
+            0x456789ab => {
+                // LINUX_REBOOT_CMD_POWER_OFF
+                info!("poweroff...");
+                kernel_hal::cpu::reset();
+            }
+            0x01234567 => {
+                // LINUX_REBOOT_CMD_RESTART2
+                info!("rebooting...");
+                kernel_hal::cpu::reset();
+            }
+            _ => Err(LxError::EINVAL),
+        }
+    }
+
+    #[allow(unsafe_code)]
+    /// fills the buffer pointed to by `buf` with up to `buflen` random bytes.
+    /// - `buf` - buffer that needed to fill
+    /// - `buflen` - length of buffer
+    /// - `flag` - a bit mask that can contain zero or more of the following values ORed together:
+    ///   - GRND_RANDOM
+    ///   - GRND_NONBLOCK
+    /// - returns the number of bytes that were copied to the buffer buf.
     pub fn sys_getrandom(&mut self, mut buf: UserOutPtr<u8>, len: usize, flag: u32) -> SysResult {
         info!("getrandom: buf: {:?}, len: {:?}, flag {:?}", buf, len, flag);
         let mut buffer = vec![0u8; len];

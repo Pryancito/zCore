@@ -3,9 +3,14 @@
 //!
 use crate::Syscall;
 use kernel_hal::{user::UserInPtr, user::UserOutPtr};
-use linux_object::error::LxError;
-use linux_object::error::SysResult;
+use linux_object::error::{LxError, SysResult};
 use linux_object::time::*;
+use linux_object::signal::Signal;
+use linux_object::thread::ThreadExt;
+use core::time::Duration;
+use alloc::boxed::Box;
+use zircon_object::object::KernelObject;
+use zircon_object::task::Thread;
 
 const USEC_PER_TICK: usize = 10000;
 
@@ -165,6 +170,40 @@ impl Syscall<'_> {
             ClockId::ClockBootTime => {}
             ClockId::ClockRealTimeAlarm => {}
             ClockId::ClockBootTimeAlarm => {}
+        }
+        Ok(0)
+    }
+
+    /// set value of an interval timer
+    pub fn sys_setitimer(
+        &mut self,
+        which: usize,
+        new_value: UserInPtr<ITimerVal>,
+        mut old_value: UserOutPtr<ITimerVal>,
+    ) -> SysResult {
+        info!(
+            "setitimer: which={}, new_value={:?}, old_value={:?}",
+            which,
+            new_value.read_if_not_null()?,
+            old_value
+        );
+        let val = new_value.read()?;
+        if val.value.sec != 0 || val.value.usec != 0 {
+            let deadline = Duration::from_secs(val.value.sec as u64) + Duration::from_micros(val.value.usec as u64);
+            let proc = self.zircon_process().clone();
+            kernel_hal::timer::timer_set(deadline, Box::new(move |_| {
+                let tids = proc.thread_ids();
+                for tid in tids {
+                    if let Ok(obj) = proc.get_child(tid) {
+                        if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                            thread.lock_linux().signals.insert(Signal::SIGALRM);
+                        }
+                    }
+                }
+            }));
+        }
+        if !old_value.is_null() {
+            old_value.write(ITimerVal::default())?;
         }
         Ok(0)
     }

@@ -24,6 +24,16 @@ pub struct TimeVal {
     pub usec: usize,
 }
 
+/// ITimerVal struct for setitimer/getitimer
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct ITimerVal {
+    /// timer interval
+    pub interval: TimeVal,
+    /// current value
+    pub value: TimeVal,
+}
+
 impl TimeVal {
     /// create TimeVal
     pub fn now() -> TimeVal {

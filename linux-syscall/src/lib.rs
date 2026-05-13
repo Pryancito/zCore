@@ -93,6 +93,11 @@ impl Syscall<'_> {
 
     /// syscall entry function
     pub async fn syscall(&mut self, num: u32, args: [usize; 6]) -> isize {
+        /*
+        if let Err(err) = self.maybe_handle_tty_intr() {
+            return -(err as isize);
+        }
+        */
         trace!(
             "pid: {} syscall: num={}, args={:x?}",
             self.zircon_process().id(),

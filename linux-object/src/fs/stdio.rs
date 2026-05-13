@@ -22,6 +22,14 @@ use zircon_object::task::Thread;
 // This is a minimal job-control hook for Ctrl+C / SIGINT delivery.
 static TTY_FG_PGRP: AtomicI32 = AtomicI32::new(0);
 
+pub fn get_foreground_pgrp() -> i32 {
+    TTY_FG_PGRP.load(Ordering::Relaxed)
+}
+
+pub fn set_foreground_pgrp(pgid: i32) {
+    TTY_FG_PGRP.store(pgid, Ordering::Relaxed);
+}
+
 // Global Ctrl+C latch. Since many programs (e.g. udhcpc) never read stdin while running,
 // we need a way for syscalls like recvfrom/poll to observe a pending terminal interrupt.
 static CTRL_C_PENDING: AtomicBool = AtomicBool::new(false);
