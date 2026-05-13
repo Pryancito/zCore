@@ -409,6 +409,7 @@ static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32
 }
 
 static int fd_readable_now(int fd) {
+    // Return convention: 1=data ready, 0=not ready, -1=socket/poll error.
     struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
     int rc = poll(&pfd, 1, 0);
     if (rc < 0) return -1;
@@ -420,6 +421,7 @@ static int fd_readable_now(int fd) {
 static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                      int *msg_type_out) {
     int ready = fd_readable_now(pfd);
+    // In this helper: 1 means "no packet yet, retry loop", -1 means error.
     if (ready == 0) return 1;
     if (ready < 0) return -1;
 
