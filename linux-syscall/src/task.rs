@@ -354,7 +354,7 @@ impl Syscall<'_> {
 
         self.zircon_process().signal_set(Signal::SIGNALED);
         self.thread.with_context(|ctx| {
-            *ctx = Box::new(UserContext::new());
+            *ctx = UserContext::new();
             ctx.setup_uspace(entry, sp, &[0, 0, 0]);
         })?;
         Ok(0)

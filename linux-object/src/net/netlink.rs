@@ -58,7 +58,7 @@ impl Socket for NetlinkSocketState {
                     None
                 } else {
                     let msg = buffer.remove(0);
-                    info!("Netlink read: msg_type={:?}, len={}", NetlinkMessageType::from(u16::from_le_bytes([msg[4], msg[5]])), msg.len());
+                    info!("[netlink] read: type={}, len={}", u16::from_le_bytes([msg[4], msg[5]]), msg.len());
                     Some(msg)
                 }
             };
@@ -400,6 +400,8 @@ impl Socket for NetlinkSocketState {
         msg.align4();
         msg.set_ext(0, msg.len() as u32);
         buffer.push(msg);
+        self.base.signal_set(Signal::READABLE);
+        info!("[netlink] write: pushed DONE, buffer len now {}", buffer.len());
         Ok(data.len())
     }
 
@@ -712,6 +714,7 @@ fn push_ack(buffer: &mut Vec<Vec<u8>>, seq: u32) {
     msg.push_ext(0i32); // error = 0 means success
     msg.align4();
     msg.set_ext(0, msg.len() as u32);
+    info!("[netlink] push_ack: seq={}, len={}", seq, msg.len());
     buffer.push(msg);
 }
 

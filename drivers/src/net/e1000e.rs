@@ -633,21 +633,22 @@ impl Scheme for E1000eInterface {
     }
 
     fn handle_irq(&self, irq: usize) {
-        error!("e1000e: handle_irq {}", irq);
         if irq != self.irq {
             return;
         }
-        let mut hw = self.driver.hw.lock();
-        if hw.handle_interrupt() {
-            let self_clone = self.clone();
-            crate::utils::deferred_job::push_deferred_job(move || {
-                let ts = Instant::from_micros(timer_now_as_micros() as i64);
-                let sockets = get_sockets();
-                let mut sockets = sockets.lock();
-                if let Err(e) = self_clone.iface.lock().poll(&mut sockets, ts) {
-                    warn!("[e1000e] poll error: {}", e);
-                }
-            });
+        // Use try_lock to avoid deadlock in IRQ context
+        if let Some(mut hw) = self.driver.hw.try_lock() {
+            if hw.handle_interrupt() {
+                let self_clone = self.clone();
+                crate::utils::deferred_job::push_deferred_job(move || {
+                    let ts = Instant::from_micros(timer_now_as_micros() as i64);
+                    let sockets = get_sockets();
+                    let mut sockets = sockets.lock();
+                    if let Err(e) = self_clone.iface.lock().poll(&mut sockets, ts) {
+                        // poll error is common when no packet, ignore
+                    }
+                });
+            }
         }
     }
 }
@@ -663,6 +664,7 @@ impl NetScheme for E1000eInterface {
         Vec::from(self.iface.lock().ip_addrs())
     }
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
+        info!("[e1000e] setting IPv4 address to {}", cidr);
         self.iface.lock().update_ip_addrs(|addrs| {
             if let Some(addr) = addrs
                 .iter_mut()
@@ -673,22 +675,16 @@ impl NetScheme for E1000eInterface {
                 *addr = IpCidr::Ipv4(cidr);
             }
         });
+        info!("[e1000e] IPv4 address set");
         Ok(())
     }
+    
     fn poll(&self) -> DeviceResult {
-        let status = unsafe { mmio_read(self.driver.hw.lock().base, E1000E_STATUS) };
-        let rctl = unsafe { mmio_read(self.driver.hw.lock().base, E1000E_RCTL) };
-        if self.driver.hw.lock().rx_tail == 0 {
-            warn!("[e1000e] poll() called, STATUS={:#x}, RCTL={:#x}", status, rctl);
-        }
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
         let mut sockets = sockets.lock();
-        self.iface
-            .lock()
-            .poll(&mut sockets, ts)
-            .map(|_| ())
-            .map_err(|_| DeviceError::IoError)
+        let _ = self.iface.lock().poll(&mut sockets, ts);
+        Ok(())
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
         // Try to read directly from hardware.
@@ -720,6 +716,7 @@ impl NetScheme for E1000eInterface {
     }
 
     fn add_route(&self, _cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+        info!("[e1000e] adding default route via {:?}", gateway);
         let mut iface = self.iface.lock();
         if let Some(IpAddress::Ipv4(gw)) = gateway {
             iface
@@ -727,6 +724,7 @@ impl NetScheme for E1000eInterface {
                 .add_default_ipv4_route(gw)
                 .map_err(|_| DeviceError::IoError)?;
         }
+        info!("[e1000e] default route added");
         Ok(())
     }
 }
@@ -747,6 +745,7 @@ impl phy::Device<'_> for E1000eDriver {
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         let mut hw = self.hw.lock();
         if let Some(pkt) = hw.receive() {
+            super::net_dispatch_packet(&pkt);
             Some((
                 E1000eRxToken { data: pkt },
                 E1000eTxToken(self.clone()),
@@ -775,8 +774,6 @@ impl phy::RxToken for E1000eRxToken {
     where
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
-        // Dispatch to global packet tapping (AF_PACKET sockets)
-        super::net_dispatch_packet(&self.data);
         let mut data = self.data;
         f(&mut data)
     }
@@ -788,6 +785,7 @@ impl phy::TxToken for E1000eTxToken {
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
         let mut buf = vec![0u8; len];
+        super::net_dispatch_packet(&buf);
         let result = f(&mut buf)?;
         let mut hw = self.0.hw.lock();
         hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;

@@ -42,9 +42,9 @@ pub fn push_packet(packet: &[u8]) {
                                     let src_addr = IpEndpoint::new(IpAddress::Ipv4(ipv4_packet.src_addr()), tcp_packet.src_port());
                                     let dst_addr = IpEndpoint::new(IpAddress::Ipv4(ipv4_packet.dst_addr()), tcp_packet.dst_port());
                                     
-                                    let sockets_arc = zcore_drivers::net::get_sockets();
-                                    let mut sockets = sockets_arc.lock();
+                                    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
                                     crate::net::LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, &mut sockets);
+                                    }
                                 }
                             }
                         }
@@ -114,10 +114,18 @@ impl Socket for PacketSocketState {
         let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
-            warn!("PacketSocket: polling drivers...");
-            // Poll drivers since interrupts might not be working
-            for net in drivers::all_net().as_vec().iter() {
-                let _ = net.poll();
+            let ifindex = *self.inner.ifindex.lock();
+            if self.inner.packet_queue.lock().is_empty() {
+                let ifaces = drivers::all_net();
+                if ifindex > 0 {
+                    if let Some(net) = ifaces.try_get(ifindex as usize - 1) {
+                        let _ = net.poll();
+                    }
+                } else {
+                    for net in ifaces.as_vec().iter() {
+                        let _ = net.poll();
+                    }
+                }
             }
 
             let pkt = self.inner.packet_queue.lock().pop_front();
@@ -243,10 +251,10 @@ impl Socket for PacketSocketState {
                 let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
                 let ifname = ifreq_name(&ifr.ifr_name)?;
                 let ifaces = kernel_hal::drivers::all_net();
-                for (_i, iface) in ifaces.as_vec().iter().enumerate() {
-                    if iface.get_ifname() == ifname || true {
-                        warn!("SIOCGIFINDEX: FORCING index 1 for interface {}", ifname);
-                        ifr.ifr_ifru = IfReqUnion { ifindex: 1 };
+                for (i, iface) in ifaces.as_vec().iter().enumerate() {
+                    if iface.get_ifname() == ifname {
+                        warn!("SIOCGIFINDEX: interface {}", ifname);
+                        ifr.ifr_ifru = IfReqUnion { ifindex: (i + 1) as i32 };
                         return Ok(0);
                     }
                 }

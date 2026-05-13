@@ -37,10 +37,10 @@ static void warnx(const char *msg) {
     fprintf(stderr, "edhcpc: %s\n", msg);
 }
 
-static uint32_t now_ms(void) {
+static uint64_t now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return (uint32_t)(tv.tv_sec * 1000u + (uint32_t)(tv.tv_usec / 1000u));
+    return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000ULL);
 }
 
 static uint32_t weak_xid(void) {
@@ -410,7 +410,8 @@ static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32
 static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                      int *msg_type_out) {
     uint8_t buf[2048];
-    ssize_t n = recv(pfd, buf, sizeof(buf), 0);
+    ssize_t n = recv(pfd, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n > 0) fprintf(stderr, "edhcpc: packet received, len=%zd\n", n);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
@@ -461,7 +462,7 @@ static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer
 static int try_recv_dhcp_udp_once(int udp_fd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                   int *msg_type_out) {
     uint8_t buf[2048];
-    ssize_t n = recv(udp_fd, buf, sizeof(buf), 0);
+    ssize_t n = recv(udp_fd, buf, sizeof(buf), MSG_DONTWAIT);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
@@ -472,10 +473,10 @@ static int try_recv_dhcp_udp_once(int udp_fd, uint32_t xid_be, struct dhcp_offer
 }
 
 static int recv_dhcp_message_any(int packet_fd, int udp_fd, uint32_t xid_be, struct dhcp_offer *offer_out,
-                                 int *msg_type_out, uint32_t deadline_ms) {
+                                 int *msg_type_out, uint64_t deadline) {
     for (;;) {
-        uint32_t t = now_ms();
-        if (t >= deadline_ms) return -1;
+        uint64_t t = now_ms();
+        if (t >= deadline) return -1;
 
         int packet_result = try_recv_dhcp_packet_once(packet_fd, xid_be, offer_out, msg_type_out);
         if (packet_result == 0) return 0;
@@ -576,7 +577,7 @@ static int apply_ipv4_addr(int ifindex, const char *ifname, uint32_t ip_be, int 
 
     int rc = 0;
     if (nl_send(fd, req_buf, nlh->nlmsg_len) < 0) rc = -1;
-    if (rc == 0 && nl_recv_ack(fd, seq) < 0) rc = -1;
+    if (rc >= 0 && nl_recv_ack(fd, seq) < 0) rc = -1;
     close(fd);
     return rc;
 }
@@ -718,9 +719,8 @@ int main(int argc, char **argv) {
     if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) die("fcntl(F_SETFL,O_NONBLOCK)");
 
     uint32_t xid = weak_xid();
-    uint32_t xid_be = htonl(xid);
-
-    uint32_t deadline = now_ms() + (uint32_t)timeout_sec * 1000u;
+    uint64_t now_ms_val = now_ms();
+    uint64_t deadline = now_ms_val + (uint64_t)timeout_sec * 1000u;
 
     // Prefer AF_PACKET because smoltcp may not emit IPv4 broadcast before the
     // interface has an address. The packet path crafts Ethernet/IP/UDP manually.
@@ -771,7 +771,7 @@ int main(int argc, char **argv) {
         }
 
         fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
-        uint32_t sub_deadline = now_ms() + 3000; // 3 seconds per attempt
+        uint64_t sub_deadline = now_ms() + 3000; // 3 seconds per attempt
         while (now_ms() < sub_deadline) {
             int r = recv_dhcp_message_any(pfd, fd, xid_be, &offer, &mt, sub_deadline);
             if (r == 0) {
@@ -865,13 +865,26 @@ got_offer:
     }
     fprintf(stderr, "\n");
 
+    fprintf(stderr, "edhcpc: applying address via netlink...\n");
     if (apply_ipv4_addr(ifindex, ifname, ip_be, prefix_len) < 0) die("netlink(RTM_NEWADDR)");
+    fprintf(stderr, "edhcpc: address applied\n");
+    fflush(stderr);
     if (gw_be) {
+        fprintf(stderr, "edhcpc: applying route via netlink...\n");
+    fflush(stderr);
         if (apply_default_route(ifindex, gw_be) < 0) die("netlink(RTM_NEWROUTE)");
+    fflush(stderr);
+        fprintf(stderr, "edhcpc: route applied\n");
     }
     if (dns_count) write_resolv_conf(dns, dns_count);
+    fflush(stderr);
 
+    fflush(stderr);
+    fprintf(stderr, "edhcpc: closing pfd...\n");
+    fflush(stderr);
     close(pfd);
+    fprintf(stderr, "edhcpc: closing fd...\n");
     close(fd);
+    fprintf(stderr, "edhcpc: exiting...\n");
     return 0;
 }
