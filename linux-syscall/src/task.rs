@@ -105,7 +105,7 @@ impl Syscall<'_> {
 
         let new_proc: Arc<dyn KernelObject> = new_proc;
         info!(
-            "vfork: {} -> {}. Waiting for execve SIGNALED",
+            "vfork: {} -> {}. Waiting for execve USER_SIGNAL_0",
             self.zircon_process().id(),
             new_proc.id()
         );
