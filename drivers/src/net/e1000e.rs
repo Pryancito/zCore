@@ -507,8 +507,11 @@ impl E1000eHw {
         }
 
         // 7. Enable receiver
-        // EN: bit 1, SBP: bit 2, MPE: bit 4, BAM: bit 15, SECRC: bit 26
-        let rctl = RCTL_EN | RCTL_SBP | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
+        // EN: bit 1, SBP: bit 2, UPE: bit 3 (unicast promisc, accept directed frames),
+        // MPE: bit 4, BAM: bit 15, SECRC: bit 26
+        // RCTL_UPE is critical: DHCPOFFER is unicast-to-our-MAC; without UPE the hardware
+        // may silently drop it if RAL0/RAH0 initialisation races or address is wrong.
+        let rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
         unsafe { mmio_write(self.base, E1000E_RCTL, rctl) };
         
         // Set RXDCTL (RX Descriptor Control)
@@ -885,7 +888,9 @@ impl phy::TxToken for E1000eTxToken {
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
         let mut buf = vec![0u8; len];
-        super::net_dispatch_packet(&buf);
+        // NOTE: do NOT call net_dispatch_packet here. The buffer is empty at this point
+        // (smoltcp fills it via the closure below). Dispatching it as a received packet
+        // would inject garbage frames into AF_PACKET sockets.
         let result = f(&mut buf)?;
         let mut hw = self.0.hw.lock();
         hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;

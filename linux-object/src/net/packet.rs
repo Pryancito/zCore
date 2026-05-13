@@ -121,6 +121,9 @@ impl Socket for PacketSocketState {
         let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
+            // Drain any deferred jobs first (IRQ handlers queue iface.poll here on real hardware)
+            kernel_hal::deferred_job::drain_deferred_jobs();
+
             let ifindex = *self.inner.ifindex.lock();
             if self.inner.packet_queue.lock().is_empty() {
                 let ifaces = drivers::all_net();
@@ -167,8 +170,11 @@ impl Socket for PacketSocketState {
                 return (Err(LxError::EAGAIN), endpoint);
             }
 
-            // Wait for new packets
-            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10)).await;
+            // Drain deferred jobs (IRQ → iface.poll → push_packet) and then sleep a short
+            // interval. On real hardware the NIC IRQ enqueues a deferred_job; draining here
+            // ensures we don't miss a packet that arrived just before we slept.
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
         }
     }
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
@@ -363,6 +369,10 @@ impl FileLike for PacketSocketState {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+        // Drain deferred jobs so IRQ-delivered packets are visible before reporting
+        // readability. Without this, select/epoll can miss a DHCPOFFER that arrived
+        // via the NIC interrupt while we were waiting.
+        kernel_hal::deferred_job::drain_deferred_jobs();
         let (read, write, error) = Socket::poll(self, events);
         Ok(PollStatus { read, write, error })
     }
