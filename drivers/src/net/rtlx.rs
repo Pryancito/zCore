@@ -78,9 +78,30 @@ impl NetScheme for RTLxInterface {
 
     fn poll(&self) -> DeviceResult {
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
+        // Disable interrupts while holding the SOCKETS and iface locks.
+        // On real hardware the NIC fires a hardware interrupt as soon as a
+        // frame lands in the DMA ring.  If that interrupt is delivered while
+        // this thread already holds SOCKETS, handle_irq() will try to acquire
+        // the same lock and spin forever, dead-locking the single-CPU system.
+        // Keeping interrupts off for the duration of iface.poll() avoids the
+        // race; any pending NIC interrupt fires safely after we release the
+        // locks and re-enable interrupts.
+        let intr_was_on = super::intr_get();
+        if intr_was_on {
+            super::intr_off();
+        }
         let sockets = get_sockets();
         let mut sockets = sockets.lock();
-        match self.iface.lock().poll(&mut sockets, timestamp) {
+        let result = self.iface.lock().poll(&mut sockets, timestamp);
+        // Explicitly release the SOCKETS guard here, before re-enabling
+        // interrupts.  Without this drop the guard would live until the end
+        // of the function (after intr_on), which would re-introduce the
+        // deadlock we are fixing.
+        drop(sockets);
+        if intr_was_on {
+            super::intr_on();
+        }
+        match result {
             Ok(b) => {
                 debug!("nic poll, is changed ?: {}", b);
                 Ok(())
