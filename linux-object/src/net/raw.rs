@@ -72,9 +72,7 @@ impl Socket for RawSocketState {
             let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
             if socket.can_recv() {
                 if let Ok(size) = socket.recv_slice(data) {
-                    warn!("raw socket received {} bytes", size);
                     let packet = Ipv4Packet::new_unchecked(data);
-                    warn!("raw socket received {} bytes from {}", size, packet.src_addr());
                     // avoid deadlock
                     drop(socket);
                     drop(sockets);
@@ -103,7 +101,6 @@ impl Socket for RawSocketState {
     }
 
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
-        warn!("raw write, data len: {}", data.len());
         let net_sockets = get_sockets();
         let mut sockets = net_sockets.lock();
         let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);

@@ -122,7 +122,6 @@ impl Syscall<'_> {
                         let current_time_ms = TimeVal::now().to_msec();
                         let deadline = current_time_ms + 500;
                         let waker = cx.waker().clone();
-                        warn!("PollFuture::poll Pending (-1), setting timer for deadline {}", deadline);
                         timer::timer_set(
                             Duration::from_millis(deadline as u64),
                             Box::new(move |_| waker.wake_by_ref()),
