@@ -807,14 +807,17 @@ got_offer:
     fprintf(stderr, "edhcpc: waiting for DHCPACK...\n");
     int request_attempts = 0;
     const int max_request_attempts = 5;
+    const useconds_t request_retry_delay_us = 200 * 1000;
+    const uint64_t ack_wait_window_ms = 1000;
     while (request_attempts < max_request_attempts && now_ms() < deadline) {
-        fprintf(stderr, "edhcpc: sending REQUEST (attempt %d/%d)...\n", ++request_attempts, max_request_attempts);
+        request_attempts++;
+        fprintf(stderr, "edhcpc: sending REQUEST (attempt %d/%d)...\n", request_attempts, max_request_attempts);
         int sent_packet = send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len);
         int sent_udp = send_dhcp_udp_broadcast(fd, dhcp_buf, dhcp_len);
         if (sent_packet < 0) warnx("send(packet:request) failed");
         if (sent_udp < 0) warnx("send(udp:request) failed");
         if (sent_packet < 0 && sent_udp < 0) {
-            usleep(200 * 1000);
+            usleep(request_retry_delay_us);
             continue;
         }
         if (sent_packet == 0 && sent_udp == 0) {
@@ -825,7 +828,7 @@ got_offer:
             fprintf(stderr, "edhcpc: request sent via udp only\n");
         }
 
-        uint64_t ack_deadline = now_ms() + 1000;
+        uint64_t ack_deadline = now_ms() + ack_wait_window_ms;
         if (ack_deadline > deadline) ack_deadline = deadline;
         while (now_ms() < ack_deadline) {
             int r = recv_dhcp_message_any(pfd, fd, xid_be, &ack, &mt2, ack_deadline);
