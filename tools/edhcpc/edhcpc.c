@@ -427,7 +427,7 @@ static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer
     if (ready < 0) return -1;
 
     uint8_t buf[2048];
-    ssize_t n = recv(pfd, buf, sizeof(buf), 0);
+    ssize_t n = recv(pfd, buf, sizeof(buf), MSG_DONTWAIT);
     if (n > 0) fprintf(stderr, "edhcpc: packet received, len=%zd\n", n);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
@@ -483,7 +483,7 @@ static int try_recv_dhcp_udp_once(int udp_fd, uint32_t xid_be, struct dhcp_offer
     if (ready < 0) return -1;
 
     uint8_t buf[2048];
-    ssize_t n = recv(udp_fd, buf, sizeof(buf), 0);
+    ssize_t n = recv(udp_fd, buf, sizeof(buf), MSG_DONTWAIT);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
