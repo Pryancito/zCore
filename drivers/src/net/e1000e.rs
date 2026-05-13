@@ -66,10 +66,37 @@ const E1000E_RAH0: usize = 0x5404 / 4;
 const E1000E_MTA_BASE: usize = 0x5200 / 4;
 const E1000E_MTA_LEN: usize = 128;
 
+// Additional registers for offloading/filtering
+const E1000E_VET: usize = 0x0038 / 4;
+const E1000E_RXCSUM: usize = 0x5000 / 4;
+const E1000E_RFCTL: usize = 0x5008 / 4;
+const E1000E_MRQC: usize = 0x5818 / 4;
+const E1000E_FEXTNVM6: usize = 0x0010 / 4;
+const E1000E_FEXTNVM7: usize = 0x0014 / 4;
+const E1000E_FEXTNVM11: usize = 0x05BBC / 4;
+const E1000E_KMRNCTRLSTA: usize = 0x00034 / 4;
+const E1000E_PBA: usize = 0x01000 / 4;
+
+// FEXTNVM6 bits
+const FEXTNVM6_K1_OFF_EN: u32 = 1 << 31;
+const FEXTNVM6_DIS_ELDW: u32 = 1 << 5; // Disable Early Link Down Window
+
+// FEXTNVM7 bits
+const FEXTNVM7_DIS_LR_PROMISC: u32 = 1 << 28;
+
+// FEXTNVM11 bits
+const FEXTNVM11_DISABLE_L1_2: u32 = 0x00000001;
+
+// KMRNCTRLSTA bits
+const KMRNCTRLSTA_K1_CONFIG: u32 = 1 << 13;
+
 // CTRL bits
-const CTRL_RST: u32 = 1 << 26; // full MAC + PHY reset
 const CTRL_SLU: u32 = 1 << 6; // set link up
 const CTRL_ASDE: u32 = 1 << 5; // auto-speed detection enable
+const CTRL_RST: u32 = 1 << 26; // full MAC + PHY reset
+const CTRL_TFCE: u32 = 1 << 27; // Transmit Flow Control Enable
+const CTRL_RFCE: u32 = 1 << 28; // Receive Flow Control Enable
+const CTRL_VME: u32 = 1 << 30; // VLAN Mode Enable
 
 // STATUS bits
 const STATUS_LU: u32 = 1 << 1; // link up
@@ -96,6 +123,7 @@ const RCTL_UPE: u32 = 1 << 3;
 const RCTL_MPE: u32 = 1 << 4;
 const RCTL_LPE: u32 = 1 << 5;
 const RCTL_BAM: u32 = 1 << 15; // broadcast accept
+const RCTL_VFE: u32 = 1 << 18; // VLAN Filter Enable
 const RCTL_BSIZE_2K: u32 = (0 << 16);
 const RCTL_SECRC: u32 = 1 << 26; // strip CRC
 
@@ -184,6 +212,7 @@ unsafe fn mmio_flush(base: usize, reg: usize) {
 // ---------------------------------------------------------------------------
 pub struct E1000eHw {
     base: usize, // MMIO virtual base
+    device_id: u16,
     mac: [u8; 6],
 
     rx_ring: DmaRegion,
@@ -365,10 +394,14 @@ impl E1000eHw {
             );
         }
 
-        // 6. Set link-up + auto-speed detection
+        // 6. Set link-up + auto-speed detection. 
+        // Also explicitly DISABLE flow control (TFCE/RFCE) and VLAN mode (VME).
         let ctrl = mmio_read(self.base, E1000E_CTRL);
-        const CTRL_ILOS: u32 = 1 << 7;
-        mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_SLU | CTRL_ASDE);
+        mmio_write(
+            self.base,
+            E1000E_CTRL,
+            (ctrl | CTRL_SLU | CTRL_ASDE) & !(CTRL_TFCE | CTRL_RFCE | CTRL_VME),
+        );
 
         // 7. Clear MTA (multicast table)
         for i in 0..E1000E_MTA_LEN {
@@ -414,6 +447,35 @@ impl E1000eHw {
         // TIPG: IPGT=10, IPGR1=8, IPGR2=12 (IEEE 802.3 recommended)
         mmio_write(self.base, E1000E_TIPG, 10u32 | (8 << 10) | (12 << 20));
 
+        // 10b. Apply Linux-style workarounds for PCH-based NICs (I217/I218/I219)
+        // These are critical for fixing broadcast packet drops (DHCP).
+        if matches!(self.device_id, 0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0 | 0x15a1 | 0x15a2 | 0x15a3 | 0x15b7 | 0x15b8 | 0x15b9 | 0x15bc | 0x15bd | 0x15be | 0x15bb | 0x0d4c | 0x0d4d | 0x0d4e | 0x0d4f | 0x1a1c | 0x1a1d | 0x1a1e | 0x1a1f) {
+            warn!("[e1000e] applying I217/I218/I219 broadcast workarounds (K1, ELDW, L1.2)");
+            
+            // Disable K1 in FEXTNVM6
+            let mut fextnvm6 = mmio_read(self.base, E1000E_FEXTNVM6);
+            fextnvm6 |= FEXTNVM6_K1_OFF_EN | FEXTNVM6_DIS_ELDW;
+            mmio_write(self.base, E1000E_FEXTNVM6, fextnvm6);
+            
+            // Disable K1 in KMRNCTRLSTA
+            let mut kmrn = mmio_read(self.base, E1000E_KMRNCTRLSTA);
+            kmrn &= !KMRNCTRLSTA_K1_CONFIG;
+            mmio_write(self.base, E1000E_KMRNCTRLSTA, kmrn);
+            
+            // Disable L1.2 power state in FEXTNVM11
+            let mut fextnvm11 = mmio_read(self.base, E1000E_FEXTNVM11);
+            fextnvm11 |= FEXTNVM11_DISABLE_L1_2;
+            mmio_write(self.base, E1000E_FEXTNVM11, fextnvm11);
+
+            // Set PBA (Packet Buffer Allocation)
+            // Linux uses 18K for RX, 14K for TX on these chips to avoid drops.
+            // 0x000E0012: RX=18, TX=14 (or similar depending on chip)
+            mmio_write(self.base, E1000E_PBA, 0x000E0012);
+        } else {
+            // Default PBA for older e1000e
+            mmio_write(self.base, E1000E_PBA, 0x00100030);
+        }
+
         // 11. Configure RX ring
         let rx_ring_pa = self.rx_ring.paddr();
         mmio_write(self.base, E1000E_RDBAL, rx_ring_pa as u32);
@@ -434,23 +496,28 @@ impl E1000eHw {
         
         // 6b. Zero Multicast Table Array (MTA)
         for i in 0..128 {
-            unsafe { mmio_write(self.base, 0x05200 + (i * 4), 0) };
+            unsafe { mmio_write(self.base, E1000E_MTA_BASE + i, 0) };
         }
         
-        // Set PBA (Packet Buffer Allocation)
-        // 0x100030: 16KB for RX, 48KB for TX
-        unsafe { mmio_write(self.base, 0x01000, 0x00100030) };
+        // 6d. Disable all hardware offloads and filtering that might block DHCP
+        warn!("[e1000e] disabling hardware offloads (RXCSUM, RFCTL, MRQC, VLAN)");
+        unsafe {
+            mmio_write(self.base, E1000E_RXCSUM, 0); // Disable RX checksum offload
+            mmio_write(self.base, E1000E_RFCTL, 0);  // Disable advanced filtering
+            mmio_write(self.base, E1000E_MRQC, 0);   // Disable RSS / multiple queues
+            mmio_write(self.base, E1000E_VET, 0);    // Clear VLAN EtherType
+        }
 
         // 7. Enable receiver
-        // 6. Enable RX
-        // EN: bit 1, SBP: bit 2, UPE: bit 3, MPE: bit 4, LPE: bit 5, BAM: bit 15, SECRC: bit 26
-        let rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_LPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
+        // EN: bit 1, SBP: bit 2, UPE: bit 3, MPE: bit 4, BAM: bit 15, SECRC: bit 26
+        // NOTE: We REMOVED RCTL_LPE (Long Packet Enable) as it can cause broadcast drops on I219 if not needed.
+        let rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
         warn!("[e1000e] setting RCTL={:#x}", rctl);
         unsafe { mmio_write(self.base, E1000E_RCTL, rctl) };
         
         // Set RXDCTL (RX Descriptor Control)
         // GRAN=1 (descriptors), WTHRESH=0 (write back immediately)
-        unsafe { mmio_write(self.base, 0x02828, (1 << 24)) };
+        unsafe { mmio_write(self.base, 0x02828 / 4, (1 << 24)) };
         
         // Wait a bit for the receiver to stabilize
         for _ in 0..1000 { unsafe { core::arch::x86_64::_mm_pause() }; }
@@ -520,6 +587,11 @@ impl E1000eHw {
         if desc.status & RX_STATUS_DD == 0 {
             return None;
         }
+        // Check for hardware reported errors
+        if desc.errors != 0 {
+            warn!("[e1000e] RX packet error: status={:#x}, errors={:#x}, len={}", desc.status, desc.errors, desc.len);
+        }
+
         // Must be a complete frame and fit in our DMA buffer.
         if desc.status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
             self.recycle_rx_desc(idx, desc);
@@ -827,6 +899,7 @@ impl phy::TxToken for E1000eTxToken {
 // ---------------------------------------------------------------------------
 pub fn init(
     name: String,
+    device_id: u16,
     irq: usize,
     vaddr: usize,  // MMIO virtual base
     _index: usize, // card index for IP suffix
@@ -852,6 +925,7 @@ pub fn init(
 
     let mut hw = E1000eHw {
         base: vaddr,
+        device_id,
         mac: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
         rx_ring,
         rx_bufs,
@@ -946,7 +1020,7 @@ impl PciDriver for E1000eDriverPci {
         let vaddr = crate::net::phys_to_virt(bar0_addr);
         let name = alloc::format!("eth{}", dev.loc.bus);
         let vector = irq.map(|idx| idx + 32).unwrap_or(0);
-        let iface = init(name, vector, vaddr, 0)?;
+        let iface = init(name, dev.id.device_id, vector, vaddr, 0)?;
         Ok(Device::Net(Arc::new(iface)))
     }
 }
