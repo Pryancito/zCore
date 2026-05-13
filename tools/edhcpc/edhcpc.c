@@ -414,8 +414,7 @@ static int fd_readable_now(int fd) {
     if (rc < 0) return -1;
     if (rc == 0) return 0;
     if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
-    if (pfd.revents & POLLIN) return 1;
-    return 0;
+    return (pfd.revents & POLLIN) ? 1 : 0;
 }
 
 static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer *offer_out,
