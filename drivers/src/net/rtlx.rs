@@ -85,8 +85,6 @@ impl NetScheme for RTLxInterface {
                 .find(|addr| matches!(addr, IpCidr::Ipv4(_)))
             {
                 *addr = IpCidr::Ipv4(cidr);
-            } else if let Some(addr) = addrs.iter_mut().next() {
-                *addr = IpCidr::Ipv4(cidr);
             }
         });
         Ok(())
@@ -135,6 +133,7 @@ impl NetScheme for RTLxInterface {
         for cidr in iface.ip_addrs() {
             if let IpCidr::Ipv4(v4) = cidr {
                 if v4.prefix_len() > 0 {
+                    // Direct interface routes only; the default route is tracked separately.
                     res.push(RouteInfo {
                         dst: IpCidr::Ipv4(v4.network()),
                         gateway: None,
