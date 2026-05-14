@@ -953,6 +953,11 @@ where
 
             self.rx_clean = (self.rx_clean + 1) % DMA_DESC_RX;
         }
+
+        // If the RX DMA entered "Buffer Unavailable" state (ran out of
+        // descriptors), writing bit 31 of GETH_RX_CTL1 triggers a
+        // re-poll so the DMA resumes processing the newly-refilled ring.
+        self.rx_poll();
     }
 
     pub fn tx_complete(&mut self) {
