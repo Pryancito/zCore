@@ -301,19 +301,29 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     // Kumeran (KMRN) register access (ICH8/PCH specific)
     // -----------------------------------------------------------------------
+
+    /// Busy-wait for `us` microseconds using the driver timer.
+    /// `timer_now_as_micros` is imported from `super` (drivers/src/net/mod.rs).
+    fn udelay(us: u64) {
+        let t0 = timer_now_as_micros();
+        while timer_now_as_micros().wrapping_sub(t0) < us {
+            core::hint::spin_loop();
+        }
+    }
+
     unsafe fn kmrn_read(&self, offset: u16) -> u16 {
         let cmd = ((offset as u32) << KMRNCTRLSTA_OFFSET_SHIFT) | KMRNCTRLSTA_REN;
         mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
-        let _ = mmio_read(self.base, E1000E_KMRNCTRLSTA); // flush
-        core::hint::spin_loop();
+        let _ = mmio_read(self.base, E1000E_KMRNCTRLSTA); // flush write
+        Self::udelay(2); // Linux uses udelay(2) between write and read
         (mmio_read(self.base, E1000E_KMRNCTRLSTA) & 0xFFFF) as u16
     }
 
     unsafe fn kmrn_write(&self, offset: u16, data: u16) {
         let cmd = ((offset as u32) << KMRNCTRLSTA_OFFSET_SHIFT) | KMRNCTRLSTA_WEN | (data as u32);
         mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
-        let _ = mmio_read(self.base, E1000E_KMRNCTRLSTA); // flush
-        core::hint::spin_loop();
+        let _ = mmio_read(self.base, E1000E_KMRNCTRLSTA); // flush write
+        Self::udelay(2); // Linux uses udelay(2) after write
     }
 
     // -----------------------------------------------------------------------
@@ -992,30 +1002,28 @@ impl NetScheme for E1000eInterface {
         Ok(())
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
-        let flag = intr_get();
-        if flag { intr_off(); }
-        let res = if let Some(pkt) = self.driver.hw.lock().receive() {
+        // Receive a pending packet without holding the hw lock during the copy.
+        let pkt = self.driver.hw.lock().receive();
+        if let Some(pkt) = pkt {
             let n = pkt.len().min(buf.len());
             buf[..n].copy_from_slice(&pkt[..n]);
             Ok(n)
         } else {
             Err(DeviceError::NotReady)
-        };
-        if flag { intr_on(); }
-        res
+        }
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        let flag = intr_get();
-        if flag { intr_off(); }
-        let res = if self.driver.hw.lock().can_send() {
-            let mut hw = self.driver.hw.lock();
+        // Acquire the lock once for both the can_send check and the actual send.
+        // Do NOT split into two lock() calls: the temporary guard from the first
+        // lock() in an `if` condition lives through the entire if-body, which
+        // would cause the second lock() to spin forever (deadlock).
+        let mut hw = self.driver.hw.lock();
+        if hw.can_send() {
             hw.send(data)?;
             Ok(data.len())
         } else {
             Err(DeviceError::NotReady)
-        };
-        if flag { intr_on(); }
-        res
+        }
     }
 
     fn can_recv(&self) -> bool {
