@@ -301,15 +301,21 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     // Kumeran (KMRN) register access (ICH8/PCH specific)
     // -----------------------------------------------------------------------
+
+    /// Busy-wait for `us` microseconds using the driver timer.
+    /// `timer_now_as_micros` is imported from `super` (drivers/src/net/mod.rs).
+    fn udelay(us: u64) {
+        let t0 = timer_now_as_micros();
+        while timer_now_as_micros().wrapping_sub(t0) < us {
+            core::hint::spin_loop();
+        }
+    }
+
     unsafe fn kmrn_read(&self, offset: u16) -> u16 {
         let cmd = ((offset as u32) << KMRNCTRLSTA_OFFSET_SHIFT) | KMRNCTRLSTA_REN;
         mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
         let _ = mmio_read(self.base, E1000E_KMRNCTRLSTA); // flush write
-        // Linux uses udelay(2) between write and read — spin ~2 µs via timer
-        let t0 = timer_now_as_micros();
-        while timer_now_as_micros().wrapping_sub(t0) < 2 {
-            core::hint::spin_loop();
-        }
+        Self::udelay(2); // Linux uses udelay(2) between write and read
         (mmio_read(self.base, E1000E_KMRNCTRLSTA) & 0xFFFF) as u16
     }
 
@@ -317,11 +323,7 @@ impl E1000eHw {
         let cmd = ((offset as u32) << KMRNCTRLSTA_OFFSET_SHIFT) | KMRNCTRLSTA_WEN | (data as u32);
         mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
         let _ = mmio_read(self.base, E1000E_KMRNCTRLSTA); // flush write
-        // Linux uses udelay(2) after write
-        let t0 = timer_now_as_micros();
-        while timer_now_as_micros().wrapping_sub(t0) < 2 {
-            core::hint::spin_loop();
-        }
+        Self::udelay(2); // Linux uses udelay(2) after write
     }
 
     // -----------------------------------------------------------------------
