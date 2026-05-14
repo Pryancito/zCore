@@ -231,7 +231,7 @@ impl Syscall<'_> {
         cmd: u32,
         _arg: UserInPtr<u8>,
     ) -> SysResult {
-        info!(
+        warn!(
             "reboot: magic1={:#x}, magic2={:#x}, cmd={:#x}",
             magic1, magic2, cmd
         );
@@ -241,12 +241,13 @@ impl Syscall<'_> {
                 && magic2 != 0x16041998
                 && magic2 != 0x20112000)
         {
+            warn!("reboot: invalid magic!");
             return Err(LxError::EINVAL);
         }
         match cmd {
             0x4321fedc => {
-                // LINUX_REBOOT_CMD_RESTART
-                info!("rebooting...");
+                // LINUX_REBOOT_CMD_POWER_OFF
+                warn!("reboot: poweroff...");
                 kernel_hal::cpu::reset();
             }
             0x89abcdef => {
@@ -257,22 +258,25 @@ impl Syscall<'_> {
                 // LINUX_REBOOT_CMD_CAD_OFF
                 Ok(0)
             }
-            0xCDEF0123 => {
+            0xcdef0123 => {
                 // LINUX_REBOOT_CMD_HALT
-                info!("halt...");
+                warn!("reboot: halt...");
                 kernel_hal::cpu::reset();
             }
             0x456789ab => {
-                // LINUX_REBOOT_CMD_POWER_OFF
-                info!("poweroff...");
-                kernel_hal::cpu::reset();
+                // LINUX_REBOOT_CMD_SW_SUSPEND
+                warn!("reboot: sw_suspend unimplemented");
+                Err(LxError::EINVAL)
             }
             0x01234567 => {
-                // LINUX_REBOOT_CMD_RESTART2
-                info!("rebooting...");
+                // LINUX_REBOOT_CMD_RESTART
+                warn!("reboot: restarting...");
                 kernel_hal::cpu::reset();
             }
-            _ => Err(LxError::EINVAL),
+            _ => {
+                warn!("reboot: unknown command {:#x}", cmd);
+                Err(LxError::EINVAL)
+            }
         }
     }
 

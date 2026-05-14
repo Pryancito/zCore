@@ -394,7 +394,7 @@ impl FileLike for TcpSocketState {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
-        Socket::ioctl(self, request, arg1, arg2, arg3)
+        handle_net_ioctl(request, arg1, arg2, arg3)
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {

@@ -8,7 +8,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use async_trait::async_trait;
 
-use kernel_hal::user::UserInOutPtr;
+// use kernel_hal::user::UserInOutPtr;
 use kernel_hal::{drivers, thread};
 use lock::Mutex;
 use zircon_object::object::*;
@@ -28,7 +28,7 @@ pub fn push_packet(packet: &[u8]) {
 
     for (i, weak) in sockets.iter().enumerate() {
         if let Some(state) = weak.upgrade() {
-            let protocol = *state.inner.protocol.lock();
+            let protocol = u16::from_be(*state.inner.protocol.lock());
             // Try to parse Ethernet header to filter by protocol
             if let Ok(frame) = EthernetFrame::new_checked(packet) {
                 let ethertype: u16 = frame.ethertype().into();
@@ -53,21 +53,18 @@ pub fn push_packet(packet: &[u8]) {
                     }
                 }
 
-                // Filter by protocol if not ETH_P_ALL (0x0003 or 0)
+                // Filter by protocol if not ETH_P_ALL (0x0003 in host order)
                 if protocol != 0 && protocol != 0x0003 && protocol != ethertype {
                     continue;
                 }
-            } else {
-                info!("PacketSocket: non-ethernet packet received");
-            }
-            
-            warn!("PacketSocket: received {} bytes, protocol filter={:#x}", packet.len(), protocol);
 
-            let mut queue = state.inner.packet_queue.lock();
-            // Limit queue size to avoid OOM
-            if queue.len() < 1000 {
-                queue.push_back(packet.to_vec());
-                state.base.signal_set(Signal::READABLE);
+                let mut queue = state.inner.packet_queue.lock();
+                // Limit queue size to avoid OOM
+                if queue.len() < 1000 {
+                    warn!("[packet] pushing packet to socket (type={:#x}, protocol={:#x}, len={})", ethertype, protocol, packet.len());
+                    queue.push_back(packet.to_vec());
+                    state.base.signal_set(Signal::READABLE);
+                }
             }
         } else {
             to_remove.push(i);
@@ -194,15 +191,16 @@ impl Socket for PacketSocketState {
                 let mut frame = EthernetFrame::new_unchecked(&mut buf);
                 frame.set_dst_addr(EthernetAddress::from_bytes(&ll.addr[..6]));
                 frame.set_src_addr(dev.get_mac());
-                let protocol = if ll.protocol != 0 {
+                let protocol_raw = if ll.protocol != 0 {
                     ll.protocol
                 } else {
                     *self.inner.protocol.lock()
                 };
+                let protocol = u16::from_be(protocol_raw);
                 frame.set_ethertype(protocol.into());
                 frame.payload_mut().copy_from_slice(data);
                 dev.send(&buf).map_err(|_| LxError::EIO)?;
-                info!("PacketSocket: sent {} bytes (DGRAM, proto={:#x})", data.len(), protocol);
+                info!("PacketSocket: sent {} bytes (DGRAM, proto (host)={:#x})", data.len(), protocol);
                 return Ok(data.len());
             }
             // If no endpoint, we can't send SOCK_DGRAM (no destination MAC).
@@ -223,7 +221,7 @@ impl Socket for PacketSocketState {
             *self.inner.ifindex.lock() = ll.interface_index as u32;
             let proto = ll.protocol;
             *self.inner.protocol.lock() = proto;
-            info!("PacketSocket: bound to ifindex {}, proto={:#x} (host={:#x})", ll.interface_index, ll.protocol, proto);
+            info!("PacketSocket: bound to ifindex {}, proto (network)={:#x} (host={:#x})", ll.interface_index, proto, u16::from_be(proto));
             Ok(0)
         } else {
             Err(LxError::EINVAL)
@@ -257,72 +255,9 @@ impl Socket for PacketSocketState {
         (readable, writable, false)
     }
 
-    fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
+    fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
         warn!("PacketSocket: ioctl request={:#x}, arg1={:#x}", request, arg1);
-        match request {
-            SIOCGIFINDEX => {
-                #[allow(unsafe_code)]
-                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
-                let ifname = ifreq_name(&ifr.ifr_name)?;
-                let ifaces = kernel_hal::drivers::all_net();
-                for (i, iface) in ifaces.as_vec().iter().enumerate() {
-                    if iface.get_ifname() == ifname {
-                        warn!("SIOCGIFINDEX: interface {}", ifname);
-                        ifr.ifr_ifru = IfReqUnion { ifindex: (i + 1) as i32 };
-                        return Ok(0);
-                    }
-                }
-                Err(LxError::ENODEV)
-            }
-            SIOCGIFADDR => {
-                let mut ifr_ptr = UserInOutPtr::<IfReq>::from(arg1);
-                let mut ifr = ifr_ptr.read()?;
-                let if_name = ifr.name();
-                let ifaces = drivers::all_net();
-                for iface in ifaces.as_vec().iter() {
-                    if iface.get_ifname() == if_name {
-                        let ip = iface.get_ip_address().iter().find_map(|cidr| match cidr {
-                            smoltcp::wire::IpCidr::Ipv4(cidr) => Some(cidr.address()),
-                            _ => None,
-                        }).unwrap_or(smoltcp::wire::Ipv4Address::UNSPECIFIED);
-                        
-                        ifr.ifr_ifru.addr.sin_family = AddressFamily::Internet.into();
-                        ifr.ifr_ifru.addr.sin_port = 0;
-                        ifr.ifr_ifru.addr.sin_addr = u32::from_ne_bytes(ip.0);
-                        
-                        ifr_ptr.write(ifr)?;
-                        return Ok(0);
-                    }
-                }
-                Err(LxError::ENODEV)
-            }
-            SIOCGIFHWADDR => {
-                let mut ifr_ptr = UserInOutPtr::<IfReq>::from(arg1);
-                let mut ifr = ifr_ptr.read()?;
-                let if_name = ifr.name();
-                let ifaces = drivers::all_net();
-                for iface in ifaces.as_vec().iter() {
-                    if iface.get_ifname() == if_name {
-                        let mac = iface.get_mac();
-                        unsafe {
-                            ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_ETHER;
-                            ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
-                        }
-                        ifr_ptr.write(ifr)?;
-                        return Ok(0);
-                    }
-                }
-                Err(LxError::ENODEV)
-            }
-            SIOCGIFMTU => {
-                let mut ifr_ptr = UserInOutPtr::<IfReq>::from(arg1);
-                let mut ifr = ifr_ptr.read()?;
-                ifr.ifr_ifru.ifmtu = 1500;
-                ifr_ptr.write(ifr)?;
-                Ok(0)
-            }
-            _ => Ok(0),
-        }
+        handle_net_ioctl(request, arg1, arg2, arg3)
     }
 
     fn socket_type(&self) -> Option<SocketType> {

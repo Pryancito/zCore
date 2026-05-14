@@ -20,7 +20,7 @@ use smoltcp::wire::*;
 use smoltcp::Result as SmolResult;
 
 use crate::net::get_sockets;
-use crate::scheme::{NetScheme, Scheme, SchemeUpcast};
+use crate::scheme::{NetScheme, Scheme, SchemeUpcast, RouteInfo, NetStats};
 use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
@@ -85,6 +85,7 @@ const E1000E_TARC0: usize = 0x03840 / 4;
 const E1000E_TARC1: usize = 0x03940 / 4;
 const E1000E_TXDCTL: usize = 0x03828 / 4;
 const E1000E_RXDCTL: usize = 0x02828 / 4;
+const E1000E_SRRCTL: usize = 0x02100 / 4;
 const E1000E_FEXTNVM4: usize = 0x000E0 / 4;
 const E1000E_FEXTNVM9: usize = 0x05BB4 / 4;
 const E1000E_PBECCSTS: usize = 0x0100C / 4;
@@ -93,6 +94,8 @@ const E1000E_CRC_OFFSET: usize = 0x05F50 / 4;
 const E1000E_KABGTXD: usize = 0x03004 / 4;
 const E1000E_IOSFPC: usize = 0x00F28 / 4;
 const E1000E_FWSM: usize = 0x05B54 / 4;
+const E1000E_WUFC: usize = 0x05808 / 4;
+const E1000E_WUS: usize = 0x05810 / 4;
 
 // RFCTL bits
 const RFCTL_NFSW_DIS: u32 = 1 << 6;
@@ -115,6 +118,7 @@ const KMRNCTRLSTA_K1_CONFIG: u16 = 0x1F; // Index 0x1F
 const KMRNCTRLSTA_K1_ENABLE: u16 = 1 << 13;
 
 // CTRL bits
+const CTRL_FD: u32 = 1 << 0; // full duplex
 const CTRL_MEHE: u32 = 1 << 19; // ME Hardware Enable
 const CTRL_SLU: u32 = 1 << 6; // set link up
 const CTRL_ASDE: u32 = 1 << 5; // auto-speed detection enable
@@ -207,13 +211,20 @@ const BUF_SIZE: usize = 2048;
 // Descriptor layouts (§3.2.3 / §3.3.3 of 82574 datasheet)
 // ---------------------------------------------------------------------------
 #[repr(C, align(16))]
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug)]
 struct RxDesc {
+    // Legacy Rx Descriptor (Write-Back)
+    // 0: Buffer Address (Read) / [Reserved] (Write-Back)
     addr: u64,
-    len: u16,
-    chksum: u16,
+    // 8: Length (u16)
+    length: u16,
+    // 10: Checksum (u16)
+    checksum: u16,
+    // 12: Status (u8)
     status: u8,
+    // 13: Errors (u8)
     errors: u8,
+    // 14: Special (u16)
     special: u16,
 }
 
@@ -284,18 +295,34 @@ pub struct E1000eHw {
     tx_tail: usize,
     tx_head_shadow: usize,
     tx_first: bool,
+    pub stats: NetStats,
 }
 
 impl E1000eHw {
     fn recycle_rx_desc(&mut self, idx: usize, desc: &mut RxDesc) {
-        desc.status = 0;
-        desc.errors = 0;
-        // Flush the zeroed descriptor to memory so hardware doesn't see old DD=1
-        unsafe { core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8); }
+        unsafe {
+            write_volatile(&mut desc.addr, self.rx_bufs[idx].paddr() as u64);
+            write_volatile(&mut desc.length, 0);
+            write_volatile(&mut desc.checksum, 0);
+            write_volatile(&mut desc.status, 0);
+            write_volatile(&mut desc.errors, 0);
+            write_volatile(&mut desc.special, 0);
+        }
+
+        // Flush the 16-byte descriptor to memory so hardware sees the new addr/status
+        unsafe {
+            core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
+        }
         fence(Ordering::SeqCst);
+        
+        // Update tail pointer. Note: RDT points to the descriptor *after* the last one
+        // available to hardware. By setting RDT to the current index, we make this
+        // descriptor the new tail, giving hardware ownership of everything up to it.
         self.rx_tail = (idx + 1) % NUM_RX;
-        // CRITICAL: Hardware only sees the new descriptors when we update RDT.
-        unsafe { mmio_write(self.base, E1000E_RDT, idx as u32) };
+        unsafe { 
+            mmio_write(self.base, E1000E_RDT, idx as u32);
+            let _ = mmio_read(self.base, E1000E_RDT); // flush write
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -470,10 +497,18 @@ impl E1000eHw {
 
         ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_RST);
+        
+        // Disable Wake-on-LAN
+        mmio_write(self.base, E1000E_WUC, 0);
+        mmio_write(self.base, E1000E_WUFC, 0);
+        mmio_write(self.base, E1000E_WUS, 0);
 
         // Hard silence: spin for at least 10 ms, timed with the kernel clock.
         let t_rst = timer_now_as_micros();
         while timer_now_as_micros().wrapping_sub(t_rst) < POST_RST_US {
+            if mmio_read(self.base, E1000E_CTRL) & CTRL_RST == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
 
@@ -540,7 +575,7 @@ impl E1000eHw {
         mmio_write(
             self.base,
             E1000E_CTRL,
-            (ctrl | CTRL_SLU | CTRL_ASDE) & !(CTRL_TFCE | CTRL_RFCE | CTRL_VME | CTRL_GIO_MASTER_DISABLE),
+            (ctrl | CTRL_SLU | CTRL_ASDE | CTRL_FD) & !(CTRL_TFCE | CTRL_RFCE | CTRL_VME | CTRL_GIO_MASTER_DISABLE),
         );
 
         // 7. Clear MTA (multicast table)
@@ -606,8 +641,23 @@ impl E1000eHw {
         core::ptr::write_bytes(rx_ring, 0, NUM_RX);
         core::ptr::write_bytes(tx_ring, 0, NUM_TX);
         for i in 0..NUM_RX {
-            (*rx_ring.add(i)).addr = self.rx_bufs[i].paddr() as u64;
+            let desc = unsafe { &mut *rx_ring.add(i) };
+            desc.addr = self.rx_bufs[i].paddr() as u64;
+            desc.length = 0;
+            desc.status = 0;
         }
+        
+        // Ensure the zeroed rings and buffer addresses are flushed to memory
+        // so that the NIC DMA engine sees the correct descriptors immediately.
+        for i in 0..NUM_RX {
+            unsafe { 
+                core::arch::x86_64::_mm_clflush(self.rx_ring.as_ptr::<RxDesc>().add(i) as *const u8);
+            };
+        }
+        for i in 0..NUM_TX {
+            unsafe { core::arch::x86_64::_mm_clflush(self.tx_ring.as_ptr::<TxDesc>().add(i) as *const u8) };
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
         // 10. Configure TX ring
         let tx_ring_pa = self.tx_ring.paddr();
@@ -630,10 +680,7 @@ impl E1000eHw {
             TCTL_EN | TCTL_PSP | TCTL_CT_16 | TCTL_COLD_64,
         );
 
-        // 10b. Apply Linux-style workarounds for PCH-based NICs (I217/I218/I219)
-        // These are critical for fixing broadcast packet drops (DHCP).
         if matches!(self.device_id, 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
-            warn!("[e1000e] applying I217/I218/I219 broadcast workarounds (K1, ELDW, L1.2, FEXT)");
             
             // Disable K1 in FEXTNVM6
             let mut fextnvm6 = mmio_read(self.base, E1000E_FEXTNVM6);
@@ -656,9 +703,9 @@ impl E1000eHw {
             fextnvm4 |= FEXTNVM4_BEACON_DURATION_8USEC;
             mmio_write(self.base, E1000E_FEXTNVM4, fextnvm4);
 
-            // Set FEXTNVM7 bits
+            // Set FEXTNVM7 bits (bit 28 is NEED_DESCR_RING_FLUSH for I219)
             let mut fextnvm7 = mmio_read(self.base, E1000E_FEXTNVM7);
-            fextnvm7 |= FEXTNVM7_SIDE_CLK_UNGATE | FEXTNVM7_DISABLE_SMB_PERST;
+            fextnvm7 |= FEXTNVM7_SIDE_CLK_UNGATE | FEXTNVM7_DISABLE_SMB_PERST | FEXTNVM7_DIS_LR_PROMISC;
             mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
 
             // Set FEXTNVM9 bits
@@ -684,8 +731,8 @@ impl E1000eHw {
             (NUM_RX * size_of::<RxDesc>()) as u32,
         );
         unsafe { mmio_write(self.base, E1000E_RDH, 0) };
-        unsafe { mmio_write(self.base, E1000E_RDT, 0) };
-        self.rx_tail = 0; // rx_tail now tracks the next descriptor to check
+        unsafe { mmio_write(self.base, E1000E_RDT, 0) }; // Will be set to NUM_RX-1 after RCTL_EN
+        self.rx_tail = 0; // rx_tail tracks the next descriptor to check
 
         // 6c. Disable RX Delay Timers for immediate write-back
         unsafe { mmio_write(self.base, E1000E_RDTR, 0) };
@@ -712,17 +759,25 @@ impl E1000eHw {
             }
         }
 
+        // Set RXDCTL - write-back thresholds.
+        // On I219, we want immediate write-back (WTHRESH=1) or even better, 
+        // set some thresholds to avoid drops.
+        unsafe {
+            mmio_write(self.base, E1000E_RXDCTL, (1 << 16) | (1 << 24)); // WTHRESH=1, GRAN=1
+        };
+
+        // Initialize SRRCTL for Legacy descriptors and 2KB buffer size
+        // BSIZEPACKET = 2 (units of 1KB = 2048 bytes)
+        // DESCTYPE = 000 (Legacy)
+        unsafe {
+            mmio_write(self.base, E1000E_SRRCTL, 2);
+        }
+
         // 7. Enable receiver
         // EN: bit 1, SBP: bit 2, UPE: bit 3 (unicast promisc, accept directed frames),
         // MPE: bit 4, BAM: bit 15, SECRC: bit 26
-        // RCTL_UPE is critical: DHCPOFFER is unicast-to-our-MAC; without UPE the hardware
-        // may silently drop it if RAL0/RAH0 initialisation races or address is wrong.
-        let rctl = RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
+        let rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
         unsafe { mmio_write(self.base, E1000E_RCTL, rctl) };
-        
-        // Set RXDCTL (RX Descriptor Control)
-        // GRAN=1 (descriptors), WTHRESH=4, HTHRESH=4, PTHRESH=32 (Linux burst defaults)
-        unsafe { mmio_write(self.base, E1000E_RXDCTL, (1 << 24) | (4 << 16) | (4 << 8) | 0x20) };
         
         // Set TXDCTL (TX Descriptor Control)
         // GRAN=1, FULL_TX_DESC_WB=1, PTHRESH=31
@@ -752,15 +807,6 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_RADV, 0);
 
         let status = mmio_read(self.base, E1000E_STATUS);
-        let rctl = mmio_read(self.base, E1000E_RCTL);
-        let tctl = mmio_read(self.base, E1000E_TCTL);
-        let rdbal = mmio_read(self.base, E1000E_RDBAL);
-        let rdbah = mmio_read(self.base, E1000E_RDBAH);
-        let rdlen = mmio_read(self.base, E1000E_RDLEN);
-        let rdh = mmio_read(self.base, E1000E_RDH);
-        let rdt = mmio_read(self.base, E1000E_RDT);
-        
-        
         
         info!(
             "[e1000e] init done. STATUS={:#010x} link={}",
@@ -774,48 +820,52 @@ impl E1000eHw {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Receive one frame (returns owned Vec)
-    // -----------------------------------------------------------------------
     fn receive(&mut self) -> Option<Vec<u8>> {
-        // Loop so that a single bad descriptor (no EOP / oversized multi-segment
-        // frame) does not stop smoltcp's receive drain and cause subsequent valid
-        // frames — including DHCPOFFER — to be missed until the next poll cycle.
         loop {
             let ring = self.rx_ring.as_ptr::<RxDesc>();
             let idx = self.rx_tail;
             let desc = unsafe { &mut *ring.add(idx) };
 
-            // Flush the descriptor cache line before reading status so we always
-            // see the hardware-written value on real hardware.
-            unsafe { core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8); }
-            fence(Ordering::SeqCst);
-            let status = unsafe { read_volatile(&desc.status) };
-            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            // Ensure we see the latest descriptor content from memory.
+            // On x86_64, PCIe DMA is usually coherent, but I219-V has quirks
+            // and clflush ensures the CPU cache doesn't have stale data.
+            unsafe {
+                core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
+            }
+            core::sync::atomic::fence(Ordering::SeqCst);
 
-            if status & RX_STATUS_DD == 0 {
-                // No more descriptors owned by software; stop the drain.
+            // Check DD bit in Legacy format (offset 12, bit 0).
+            let status = unsafe { read_volatile(&desc.status) };
+            if (status & 0x01) == 0 {
                 return None;
             }
-            warn!("[e1000e] RX hardware status={:#x}, errors={:#x}, len={}", status, desc.errors, desc.len);
 
-            // Must be a complete frame and fit in our DMA buffer.
-            // If not, recycle (advancing rx_tail + writing RDT) and keep looping
-            // so the next descriptor is checked in the same call rather than
-            // making the caller retry after the next poll_ifaces() (≥50 ms delay).
-            if status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
+            // Packet is ready!
+            let len = unsafe { read_volatile(&desc.length) };
+            warn!("[e1000e] RX packet: {} bytes (idx={})", len, idx);
+
+            if len == 0 || len as usize > BUF_SIZE {
+                warn!("[e1000e] RX invalid length: {} (idx={})", len, idx);
                 self.recycle_rx_desc(idx, desc);
                 continue;
             }
-            let len = desc.len as usize;
-            // Flush the buffer before reading it
+
+            core::sync::atomic::fence(Ordering::SeqCst);
+
             let buf_vaddr = self.rx_bufs[idx].vaddr();
-            for p in (buf_vaddr..buf_vaddr + len).step_by(64) {
+            
+            // Flush the data buffer before reading it to ensure we see hardware's data
+            for p in (buf_vaddr..buf_vaddr + len as usize).step_by(64) {
                 unsafe { core::arch::x86_64::_mm_clflush(p as *const u8); }
             }
-            core::sync::atomic::compiler_fence(Ordering::SeqCst);
-            let buf = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
+            core::sync::atomic::fence(Ordering::SeqCst);
+
+            let buf = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len as usize) };
             let pkt = buf.to_vec();
+
+            // Track stats
+            self.stats.rx_packets += 1;
+            self.stats.rx_bytes += len as u64;
 
             self.recycle_rx_desc(idx, desc);
             return Some(pkt);
@@ -828,7 +878,13 @@ impl E1000eHw {
     fn can_send(&self) -> bool {
         let ring = self.tx_ring.as_ptr::<TxDesc>();
         let desc = unsafe { &*ring.add(self.tx_tail) };
+        
+        // Flush before reading status
+        unsafe {
+            core::arch::x86_64::_mm_clflush(desc as *const TxDesc as *const u8);
+        }
         fence(Ordering::SeqCst);
+        
         let status = unsafe { read_volatile(&desc.status) };
         self.tx_first || (status & 0x01 != 0) // DD bit
     }
@@ -853,10 +909,16 @@ impl E1000eHw {
         buf.copy_from_slice(data);
         warn!("[e1000e] TX packet: {} bytes", data.len());
 
-        desc.addr = self.tx_bufs[idx].paddr() as u64;
-        desc.len = data.len() as u16;
-        desc.cmd = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
-        desc.status = 0;
+        // Track stats
+        self.stats.tx_packets += 1;
+        self.stats.tx_bytes += data.len() as u64;
+
+        unsafe {
+            write_volatile(&mut desc.addr, self.tx_bufs[idx].paddr() as u64);
+            write_volatile(&mut desc.len, data.len() as u16);
+            write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS);
+            write_volatile(&mut desc.status, 0);
+        }
         fence(Ordering::SeqCst);
 
         // Flush the data buffer and the descriptor before hardware reads it
@@ -867,7 +929,10 @@ impl E1000eHw {
         fence(Ordering::SeqCst);
 
         self.tx_tail = (idx + 1) % NUM_TX;
-        unsafe { mmio_write(self.base, E1000E_TDT, self.tx_tail as u32) };
+        unsafe { 
+            mmio_write(self.base, E1000E_TDT, self.tx_tail as u32);
+            let _ = mmio_read(self.base, E1000E_TDT); // flush write
+        }
         fence(Ordering::SeqCst);
 
         let tdh = unsafe { mmio_read(self.base, E1000E_TDH) };
@@ -889,12 +954,13 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     pub fn handle_interrupt(&mut self) -> bool {
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
+        // ICR is Read-to-Clear. No need to write back unless using MSI-X or specific modes.
         if icr != 0 {
-            warn!("[e1000e] Interrupt! ICR={:#x}", icr);
-            unsafe { mmio_write(self.base, E1000E_ICR, icr) };
-            return true;
+            // warn!("[e1000e] ICR={:#x}", icr);
+            true
+        } else {
+            false
         }
-        false
     }
 }
 
@@ -918,7 +984,9 @@ pub struct E1000eInterface {
     pub driver: E1000eDriver,
     pub name: String,
     pub irq: usize,
+    pub base: usize,
     pub poll_pending: Arc<core::sync::atomic::AtomicBool>,
+    pub routes: Arc<Mutex<Vec<RouteInfo>>>,
 }
 
 impl Scheme for E1000eInterface {
@@ -930,31 +998,35 @@ impl Scheme for E1000eInterface {
         if irq != self.irq {
             return;
         }
-        // Use try_lock to avoid deadlock if the main thread is currently polling.
-        // On real hardware (especially single-core), if we spin here, we deadlock.
-        if let Some(mut hw) = self.driver.hw.try_lock() {
-            if hw.handle_interrupt() {
-                if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
-                    self.poll_pending.store(true, core::sync::atomic::Ordering::SeqCst);
-                    let poll_pending = self.poll_pending.clone();
-                    let self_clone = self.clone();
-                    crate::utils::deferred_job::push_deferred_job(move || {
-                        let ts = Instant::from_micros(timer_now_as_micros() as i64);
-                        let sockets = get_sockets();
-                        // Disable interrupts while polling to avoid re-entering from IRQ
-                        let flag = intr_get();
-                        if flag { intr_off(); }
-                        
-                        {
-                            let mut sockets = sockets.lock();
-                            let _ = self_clone.iface.lock().poll(&mut sockets, ts);
-                        }
-                        
-                        if flag { intr_on(); }
-                        poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
-                    });
+
+        // Fast check of ICR without holding the main hardware lock.
+        // Reading ICR is Read-to-Clear, effectively acknowledging the interrupt at the source.
+        // This prevents IRQ storms on single-core systems while we wait for the lock.
+        let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
+        if icr == 0 {
+            return;
+        }
+
+        if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+            self.poll_pending.store(true, core::sync::atomic::Ordering::SeqCst);
+            let poll_pending = self.poll_pending.clone();
+            let self_clone = self.clone();
+            crate::utils::deferred_job::push_deferred_job(move || {
+                let ts = Instant::from_micros(timer_now_as_micros() as i64);
+                let sockets = get_sockets();
+                
+                // Disable interrupts while polling to avoid re-entering from IRQ
+                let flag = intr_get();
+                if flag { intr_off(); }
+                
+                {
+                    let mut sockets = sockets.lock();
+                    let _ = self_clone.iface.lock().poll(&mut sockets, ts);
                 }
-            }
+                
+                if flag { intr_on(); }
+                poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
+            });
         }
     }
 }
@@ -986,8 +1058,12 @@ impl NetScheme for E1000eInterface {
     }
     
     fn poll(&self) -> DeviceResult {
+        // warn!("[e1000e] poll() called");
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
+        
+        // Ensure any pending IRQ-driven jobs are processed
+        crate::utils::deferred_job::drain_deferred_jobs();
         
         // Disable interrupts while polling to avoid re-entering from IRQ
         let flag = intr_get();
@@ -1035,17 +1111,69 @@ impl NetScheme for E1000eInterface {
         self.driver.hw.lock().can_send()
     }
 
-    fn add_route(&self, _cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
-        info!("[e1000e] adding default route via {:?}", gateway);
+    fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+        info!("[e1000e] adding route {:?} via {:?}", cidr, gateway);
         let mut iface = self.iface.lock();
-        if let Some(IpAddress::Ipv4(gw)) = gateway {
-            iface
-                .routes_mut()
-                .add_default_ipv4_route(gw)
-                .map_err(|_| DeviceError::IoError)?;
+        match (cidr, gateway) {
+            (IpCidr::Ipv4(c), Some(IpAddress::Ipv4(gw))) if c.prefix_len() == 0 => {
+                iface
+                    .routes_mut()
+                    .add_default_ipv4_route(gw)
+                    .map_err(|_| DeviceError::IoError)?;
+                
+                let mut routes = self.routes.lock();
+                routes.retain(|r| r.dst.prefix_len() != 0);
+                routes.push(RouteInfo {
+                    dst: cidr,
+                    gateway: Some(IpAddress::Ipv4(gw)),
+                });
+            }
+            _ => {
+                warn!("[e1000e] non-default routes are not yet fully supported by this smoltcp version; tracking in driver only");
+                self.routes.lock().push(RouteInfo { dst: cidr, gateway });
+            }
         }
-        info!("[e1000e] default route added");
+        info!("[e1000e] route added");
         Ok(())
+    }
+
+    fn del_route(&self, cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+        info!("[e1000e] deleting route {:?}", cidr);
+        let mut iface = self.iface.lock();
+        if let IpCidr::Ipv4(c) = cidr {
+            if c.prefix_len() == 0 {
+                // iface.routes_mut().remove_default_ipv4_route(); // Might not exist
+                // Set to unspecified if needed, or just let it be if we can't remove.
+            }
+        }
+        self.routes.lock().retain(|r| r.dst != cidr);
+        Ok(())
+    }
+
+    fn get_routes(&self) -> Vec<RouteInfo> {
+        let iface = self.iface.lock();
+        let mut res = Vec::new();
+        
+        // 1. Add tracked routes (including default gateway)
+        res.extend(self.routes.lock().clone());
+        
+        // 2. Add direct routes for each assigned IP address
+        for cidr in iface.ip_addrs() {
+            if let IpCidr::Ipv4(v4) = cidr {
+                if v4.prefix_len() > 0 {
+                    // Use v4.network() directly if it returns IpCidr
+                    res.push(RouteInfo {
+                        dst: IpCidr::Ipv4(v4.network()),
+                        gateway: None,
+                    });
+                }
+            }
+        }
+        res
+    }
+
+    fn get_stats(&self) -> NetStats {
+        self.driver.hw.lock().stats.clone()
     }
 }
 
@@ -1065,7 +1193,7 @@ impl phy::Device<'_> for E1000eDriver {
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         let mut hw = self.hw.lock();
         if let Some(pkt) = hw.receive() {
-            // warn!("[e1000e] Driver received packet of {} bytes: {:02x?}", pkt.len(), &pkt[..pkt.len().min(64)]);
+            warn!("[e1000e] Driver received packet of {} bytes", pkt.len());
             super::net_dispatch_packet(&pkt);
             Some((
                 E1000eRxToken { data: pkt },
@@ -1084,7 +1212,7 @@ impl phy::Device<'_> for E1000eDriver {
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1514;
+        caps.max_transmission_unit = 1536;
         caps.max_burst_size = Some(64);
         caps
     }
@@ -1148,7 +1276,7 @@ pub fn init(
     let mut hw = E1000eHw {
         base: vaddr,
         device_id,
-        mac: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+        mac: [0u8; 6], // Read from hardware during reset
         rx_ring,
         rx_bufs,
         rx_tail: 0,
@@ -1157,23 +1285,28 @@ pub fn init(
         tx_tail: 0,
         tx_head_shadow: 0,
         tx_first: true,
+        stats: NetStats::default(),
     };
 
     unsafe {
+        let ral = mmio_read(vaddr, E1000E_RAL0);
+        let rah = mmio_read(vaddr, E1000E_RAH0);
+        hw.mac[0..4].copy_from_slice(&ral.to_le_bytes());
+        hw.mac[4..6].copy_from_slice(&rah.to_le_bytes()[..2]);
         hw.reset_and_init()?;
     }
 
     let mac_bytes = hw.mac;
     info!(
-        "[e1000e] finalized MAC for smoltcp: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (ID: {:#x})",
+        "[e1000e] finalized MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (ID: {:#x})",
         mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5], device_id
     );
     let hw_arc = Arc::new(Mutex::new(hw));
     let driver = E1000eDriver { hw: hw_arc.clone() };
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac_bytes);
-    let ip_addrs = [IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)];
-    let default_v4_gw = Ipv4Address::new(10, 0, 2, 2);
+    let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 24)];
+    let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
     routes.add_default_ipv4_route(default_v4_gw).unwrap();
@@ -1191,7 +1324,12 @@ pub fn init(
         driver,
         name,
         irq,
+        base: vaddr,
         poll_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        routes: Arc::new(Mutex::new(vec![RouteInfo {
+            dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+            gateway: Some(IpAddress::Ipv4(default_v4_gw)),
+        }])),
     };
 
     Ok(e1000e_iface)
@@ -1205,25 +1343,21 @@ impl PciDriver for E1000eDriverPci {
     }
 
     fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
-        vendor_id == 0x8086 && matches!(device_id,
-            0x10bf | 0x10cb | 0x10cc | 0x10cd | 0x10ce |
-            0x10de | 0x10df | 0x10e5 | 0x10f5 |
-            0x10ea | 0x10eb | 0x10ef | 0x10f0 |
-            0x1502 | 0x1503 |
-            0x153a | 0x153b |
-            0x155a | 0x1559 | 0x15a0 | 0x15a1 | 0x15a2 | 0x15a3 |
-            0x10d3 |
-            0x15b7 | 0x15b8 | 0x15b9 |
-            0x15bc | 0x15bd | 0x15be |
-            0x15d6 | 0x15d7 | 0x15d8 |
-            0x15e3 | 0x15d9 | 0x15bb | 0x15da |
-            0x15df | 0x15e0 | 0x15e1 | 0x15e2 |
-            0x15f4 | 0x15f5 | 0x15f9 | 0x15fa | 0x15fb | 0x15fc |
-            0x0d4c | 0x0d4d | 0x0d4e | 0x0d4f |
-            0x1a1c | 0x1a1d | 0x1a1e | 0x1a1f |
-            0x550a | 0x550b | 0x550c | 0x550d | 0x550e | 0x550f |
-            0x5502 | 0x5503 |
-            0x57a0 | 0x57a1 | 0x57b3
+        if vendor_id != 0x8086 {
+            return false;
+        }
+        matches!(
+            device_id,
+            // 82574L, 82583V
+            0x10d3 | 0x10f5 | 0x150c |
+            // I217, I218
+            0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 |
+            // I219
+            0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 
+            0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 
+            0x57a0..=0x57a1 | 0x57b3..=0x57ba |
+            // I210/I211 (sometimes handled by e1000e)
+            0x1533 | 0x1539 | 0x157b | 0x157c
         )
     }
 

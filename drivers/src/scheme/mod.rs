@@ -25,7 +25,7 @@ pub use drm::DrmScheme;
 pub use event::EventScheme;
 pub use input::InputScheme;
 pub use irq::IrqScheme;
-pub use net::NetScheme;
+pub use net::{NetScheme, NetStats, RouteInfo};
 pub use uart::UartScheme;
 
 /// Common of all device drivers.

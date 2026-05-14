@@ -9,6 +9,7 @@ use rcore_fs::vfs::{
 };
 
 use crate::fs::pseudo::Pseudo;
+use smoltcp::wire::{IpAddress, IpCidr};
 
 /// A minimal `procfs` with a few common files.
 pub struct ProcFS;
@@ -121,8 +122,8 @@ impl INode for ProcRootINode {
 struct ProcNetDirINode;
 
 impl ProcNetDirINode {
-    fn entries() -> [&'static str; 1] {
-        ["dev"]
+    fn entries() -> [&'static str; 2] {
+        ["dev", "route"]
     }
 }
 
@@ -174,6 +175,10 @@ impl INode for ProcNetDirINode {
                 &proc_net_dev_content(),
                 FileType::File,
             ))),
+            "route" => Ok(Arc::new(Pseudo::new(
+                &proc_net_route_content(),
+                FileType::File,
+            ))),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -208,7 +213,49 @@ fn proc_net_dev_content() -> String {
 
     for iface in ifaces.iter() {
         let name = iface.get_ifname();
-        let _ = writeln!(s, "{:>6}: {}", name, "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
+        let stats = iface.get_stats();
+        let _ = writeln!(
+            s,
+            "{:>6}: {:>7} {:>7}    0    0    0     0          0         0 {:>8} {:>8}    0    0    0     0       0          0",
+            name, stats.rx_bytes, stats.rx_packets, stats.tx_bytes, stats.tx_packets
+        );
+    }
+    s
+}
+
+fn proc_net_route_content() -> String {
+    use crate::net::ipv4_netmask;
+
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT"
+    );
+
+    let ifaces = drivers::all_net().as_vec();
+    for iface in ifaces.iter() {
+        let name = iface.get_ifname();
+        for route in iface.get_routes() {
+            if let IpCidr::Ipv4(dst_cidr) = route.dst {
+                let dst = u32::from_ne_bytes(dst_cidr.address().0);
+                let gateway = match route.gateway {
+                    Some(IpAddress::Ipv4(gw)) => u32::from_ne_bytes(gw.0),
+                    _ => 0,
+                };
+                let mask = u32::from_ne_bytes(ipv4_netmask(dst_cidr.prefix_len()).0);
+                let flags = if route.gateway.is_some() {
+                    0x0003 // RTF_UP | RTF_GATEWAY
+                } else {
+                    0x0001 // RTF_UP
+                };
+
+                let _ = writeln!(
+                    s,
+                    "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t0\t{:08X}\t0\t0\t0",
+                    name, dst, gateway, flags, mask
+                );
+            }
+        }
     }
     s
 }

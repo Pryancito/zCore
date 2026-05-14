@@ -5,6 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use smoltcp::iface::*;
@@ -15,7 +16,7 @@ use smoltcp::Result;
 
 use super::{timer_now_as_micros, ProviderImpl};
 use crate::net::get_sockets;
-use crate::scheme::{NetScheme, Scheme, SchemeUpcast};
+use crate::scheme::{NetScheme, Scheme, SchemeUpcast, RouteInfo, NetStats};
 use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
@@ -27,6 +28,7 @@ use lock::Mutex;
 #[derive(Clone)]
 pub struct E1000Driver {
     pub hw: Arc<Mutex<E1000<crate::net::ProviderImpl>>>,
+    pub stats: Arc<Mutex<NetStats>>,
 }
 
 #[derive(Clone)]
@@ -35,6 +37,8 @@ pub struct E1000Interface {
     driver: E1000Driver,
     name: String,
     irq: usize,
+    pub stats: Arc<Mutex<NetStats>>,
+    pub routes: Arc<Mutex<Vec<RouteInfo>>>,
 }
 
 impl Scheme for E1000Interface {
@@ -132,23 +136,61 @@ impl NetScheme for E1000Interface {
         Ok(())
     }
 
-    fn add_route(&self, _cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
+    fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
         let mut iface = self.iface.lock();
         if let Some(IpAddress::Ipv4(gw)) = gateway {
             iface
                 .routes_mut()
                 .add_default_ipv4_route(gw)
                 .map_err(|_| DeviceError::IoError)?;
+            
+            let mut routes = self.routes.lock();
+            routes.retain(|r| r.dst.prefix_len() != 0);
+            routes.push(RouteInfo {
+                dst: cidr,
+                gateway: Some(IpAddress::Ipv4(gw)),
+            });
+        } else {
+            self.routes.lock().push(RouteInfo { dst: cidr, gateway });
         }
         Ok(())
+    }
+
+    fn get_routes(&self) -> Vec<RouteInfo> {
+        let iface = self.iface.lock();
+        let mut res = Vec::new();
+        
+        // 1. Add tracked routes
+        res.extend(self.routes.lock().clone());
+
+        // 2. Add direct routes
+        for cidr in iface.ip_addrs() {
+            if let IpCidr::Ipv4(v4) = cidr {
+                if v4.prefix_len() > 0 {
+                    res.push(RouteInfo {
+                        dst: IpCidr::Ipv4(v4.network()),
+                        gateway: None,
+                    });
+                }
+            }
+        }
+        res
+    }
+
+    fn get_stats(&self) -> NetStats {
+        self.stats.lock().clone()
     }
 }
 
 pub struct E1000RxToken {
     data: Vec<u8>,
+    stats: Arc<Mutex<NetStats>>,
 }
 
-pub struct E1000TxToken(E1000Driver);
+pub struct E1000TxToken {
+    driver: E1000Driver,
+    stats: Arc<Mutex<NetStats>>,
+}
 
 impl phy::Device<'_> for E1000Driver {
     type RxToken = E1000RxToken;
@@ -157,15 +199,15 @@ impl phy::Device<'_> for E1000Driver {
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         self.hw.lock().receive().map(|pkt| {
             (
-                E1000RxToken { data: pkt },
-                E1000TxToken(self.clone()),
+                E1000RxToken { data: pkt, stats: self.stats.clone() },
+                E1000TxToken { driver: self.clone(), stats: self.stats.clone() },
             )
         })
     }
 
     fn transmit(&mut self) -> Option<Self::TxToken> {
         if self.hw.lock().can_send() {
-            Some(E1000TxToken(self.clone()))
+            Some(E1000TxToken { driver: self.clone(), stats: self.stats.clone() })
         } else {
             None
         }
@@ -184,6 +226,11 @@ impl phy::RxToken for E1000RxToken {
     where
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
+        let mut stats = self.stats.lock();
+        stats.rx_packets += 1;
+        stats.rx_bytes += self.data.len() as u64;
+        drop(stats);
+
         // Dispatch to global packet tapping (AF_PACKET sockets)
         super::net_dispatch_packet(&self.data);
         f(&mut self.data)
@@ -198,8 +245,13 @@ impl phy::TxToken for E1000TxToken {
         let mut buffer = [0u8; 1536];
         let result = f(&mut buffer[..len]);
 
-        let mut driver = (self.0).hw.lock();
+        let mut driver = self.driver.hw.lock();
         driver.send(&buffer[..len]);
+        drop(driver);
+        
+        let mut stats = self.stats.lock();
+        stats.tx_packets += 1;
+        stats.tx_bytes += len as u64;
 
         result
     }
@@ -217,11 +269,12 @@ pub fn init(
     let mac: [u8; 6] = [0x54, 0x51, 0x9F, 0x71, 0xC0, index as u8];
     let e1000 = E1000::new(header, size, DriverEthernetAddress::from_bytes(&mac));
     let hw = Arc::new(Mutex::new(e1000));
-    let net_driver = E1000Driver { hw: hw.clone() };
+    let stats = Arc::new(Mutex::new(NetStats::default()));
+    let net_driver = E1000Driver { hw: hw.clone(), stats: stats.clone() };
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac);
-    let ip_addrs = [IpCidr::new(IpAddress::v4(10, 0, 2, (15 + index) as u8), 24)];
-    let default_v4_gw = Ipv4Address::new(10, 0, 2, 2);
+    let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)];
+    let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
     routes.add_default_ipv4_route(default_v4_gw).unwrap();
@@ -244,6 +297,11 @@ pub fn init(
         driver: net_driver,
         name,
         irq,
+        stats,
+        routes: Arc::new(Mutex::new(vec![RouteInfo {
+            dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+            gateway: Some(IpAddress::Ipv4(default_v4_gw)),
+        }])),
     };
 
     Ok(e1000_iface)
@@ -257,7 +315,7 @@ impl PciDriver for E1000DriverPci {
     }
 
     fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
-        vendor_id == 0x8086 && (device_id == 0x100e || device_id == 0x100f)
+        vendor_id == 0x8086 && (device_id == 0x100e || device_id == 0x100f || device_id == 0x10d3)
     }
 
     fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {

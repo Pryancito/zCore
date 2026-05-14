@@ -7,8 +7,9 @@ pub mod socket_address;
 use crate::fs::{FileLike, PollEvents};
 use crate::error::{LxError, LxResult};
 use kernel_hal::user::{IoVecOut, UserInPtr, UserInOutPtr};
-use smoltcp::wire::IpEndpoint;
+use smoltcp::wire::{Ipv4Cidr, IpCidr, IpEndpoint};
 pub use socket_address::*;
+use log::*;
 
 pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
     let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -18,6 +19,66 @@ pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
 /// Global initialization for the network stack.
 pub fn init() {
     zcore_drivers::net::set_packet_callback(packet::push_packet);
+}
+
+pub fn iface_by_name(ifname: &str) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+    get_net_device()
+        .into_iter()
+        .find(|iface| iface.get_ifname() == ifname)
+        .ok_or(LxError::ENODEV)
+}
+
+pub fn iface_ipv4_cidr(iface: &dyn zcore_drivers::scheme::NetScheme) -> Option<Ipv4Cidr> {
+    iface
+        .get_ip_address()
+        .into_iter()
+        .find_map(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => Some(cidr),
+            _ => None,
+        })
+}
+
+pub fn ipv4_sockaddr(addr: Ipv4Address) -> SockAddrIn {
+    SockAddrIn {
+        sin_family: AddressFamily::Internet.into(),
+        sin_port: 0,
+        sin_addr: u32::from_ne_bytes(addr.0),
+        sin_zero: [0; 8],
+    }
+}
+
+pub fn ipv4_netmask(prefix_len: u8) -> Ipv4Address {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len as u32)
+    };
+    Ipv4Address::from_bytes(&mask.to_be_bytes())
+}
+
+pub fn ipv4_broadcast(addr: Ipv4Address, prefix_len: u8) -> Ipv4Address {
+    let addr_u32 = u32::from_be_bytes(addr.0);
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len as u32)
+    };
+    let broadcast = addr_u32 | !mask;
+    Ipv4Address::from_bytes(&broadcast.to_be_bytes())
+}
+
+pub fn prefix_len_from_netmask(addr: Ipv4Address) -> LxResult<u8> {
+    let mask = u32::from_be_bytes(addr.0);
+    let prefix_len = mask.leading_ones() as u8;
+    let canonical = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len as u32)
+    };
+    if mask != canonical {
+        return Err(LxError::EINVAL);
+    }
+    Ok(prefix_len)
 }
 
 
@@ -110,12 +171,16 @@ pub const IP_HDRINCL: usize = 3;
 pub const SOCKET_TYPE_MASK: usize = 0xff;
 
 pub const SOCKET_FD: usize = 1000;
+pub const SIOCADDRT: usize = 0x890b;
+pub const SIOCDELRT: usize = 0x890c;
 
 pub const SIOCGIFCONF: usize = 0x8912;
 pub const SIOCGIFFLAGS: usize = 0x8913;
 pub const SIOCSIFFLAGS: usize = 0x8914;
 pub const SIOCGIFADDR: usize = 0x8915;
 pub const SIOCSIFADDR: usize = 0x8916;
+pub const SIOCGIFBRDADDR: usize = 0x8919;
+pub const SIOCSIFBRDADDR: usize = 0x891a;
 pub const SIOCGIFNETMASK: usize = 0x891b;
 pub const SIOCSIFNETMASK: usize = 0x891c;
 pub const SIOCGIFMETRIC: usize = 0x891d;
@@ -172,6 +237,27 @@ impl IfReq {
         let len = self.ifr_name.iter().position(|&b| b == 0).unwrap_or(self.ifr_name.len());
         core::str::from_utf8(&self.ifr_name[..len]).unwrap_or("")
     }
+}
+
+pub const RTF_UP: u16 = 0x0001;
+pub const RTF_GATEWAY: u16 = 0x0002;
+pub const RTF_HOST: u16 = 0x0004;
+
+#[repr(C)]
+pub struct RtEntry {
+    pub rt_pad1: usize,
+    pub rt_dst: SockAddrIn,
+    pub rt_gateway: SockAddrIn,
+    pub rt_genmask: SockAddrIn,
+    pub rt_flags: u16,
+    pub rt_pad2: i16,
+    pub rt_pad3: usize,
+    pub rt_pad4: usize,
+    pub rt_metric: i16,
+    pub rt_dev: *mut u8,
+    pub rt_mtu: usize,
+    pub rt_window: usize,
+    pub rt_irtt: u16,
 }
 
 #[repr(C)]
@@ -401,6 +487,265 @@ fn get_ephemeral_port() -> u16 {
     }
 }
 
+// ============= Rand Port =============
+// ============= IOCTL =============
+
+pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
+    match request {
+        // SIOCGIFCONF: get list of interfaces
+        SIOCGIFCONF => {
+            #[allow(unsafe_code)]
+            let ifc = unsafe { &mut *(arg1 as *mut IfConf) };
+            if ifc.ifc_len < 0 {
+                return Err(LxError::EINVAL);
+            }
+            let buf_bytes = ifc.ifc_len as usize;
+            let req_size = size_of::<IfReq>();
+
+            let ifaces = get_net_device();
+            let max = if buf_bytes >= req_size {
+                buf_bytes / req_size
+            } else {
+                0
+            };
+            let count = core::cmp::min(max, ifaces.len());
+
+            #[allow(unsafe_code)]
+            let out = unsafe { core::slice::from_raw_parts_mut(ifc.ifc_buf as *mut u8, buf_bytes) };
+            for i in 0..count {
+                let iface = &ifaces[i];
+
+                let mut ifr_name = [0u8; 16];
+                let name = iface.get_ifname();
+                let n = core::cmp::min(15, name.as_bytes().len());
+                ifr_name[..n].copy_from_slice(&name.as_bytes()[..n]);
+
+                let addr = iface_ipv4_cidr(&**iface)
+                    .map(|cidr| ipv4_sockaddr(cidr.address()))
+                    .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
+                let ifr = IfReq {
+                    ifr_name,
+                    ifr_ifru: IfReqUnion { addr },
+                };
+
+                let start = i * req_size;
+                let end = start + req_size;
+                if end <= out.len() {
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            &ifr as *const IfReq as *const u8,
+                            out[start..end].as_mut_ptr(),
+                            req_size,
+                        );
+                    }
+                }
+            }
+
+            ifc.ifc_len = (count * req_size) as i32;
+            Ok(0)
+        }
+
+        SIOCGIFINDEX => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let ifaces = kernel_hal::drivers::all_net();
+            for (i, iface) in ifaces.as_vec().iter().enumerate() {
+                if iface.get_ifname() == ifname {
+                    ifr.ifr_ifru = IfReqUnion { ifindex: (i + 1) as i32 };
+                    return Ok(0);
+                }
+            }
+            Err(LxError::ENODEV)
+        }
+
+        // SIOCGIFFLAGS: get interface flags
+        SIOCGIFFLAGS => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            ifr.ifr_ifru = IfReqUnion {
+                flags: (IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST) as i16,
+            };
+            Ok(0)
+        }
+
+        SIOCSIFFLAGS => {
+            // Ignore for now, just return success
+            Ok(0)
+        }
+
+        SIOCGIFADDR => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let iface = iface_by_name(ifname)?;
+            let addr = iface_ipv4_cidr(&*iface)
+                .map(|cidr| ipv4_sockaddr(cidr.address()))
+                .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
+            ifr.ifr_ifru = IfReqUnion { addr };
+            Ok(0)
+        }
+
+        SIOCSIFADDR => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &*(arg1 as *const IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let iface = iface_by_name(ifname)?;
+            #[allow(unsafe_code)]
+            let addr = unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
+            let prefix_len = iface_ipv4_cidr(&*iface)
+                .map(|cidr| cidr.prefix_len())
+                .unwrap_or(32);
+            iface
+                .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
+                .map_err(|_| LxError::EINVAL)?;
+            Ok(0)
+        }
+
+        SIOCGIFBRDADDR => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let iface = iface_by_name(ifname)?;
+            let addr = iface_ipv4_cidr(&*iface)
+                .map(|cidr| ipv4_sockaddr(ipv4_broadcast(cidr.address(), cidr.prefix_len())))
+                .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
+            ifr.ifr_ifru = IfReqUnion { addr };
+            Ok(0)
+        }
+
+        SIOCGIFNETMASK => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let iface = iface_by_name(ifname)?;
+            let addr = iface_ipv4_cidr(&*iface)
+                .map(|cidr| ipv4_sockaddr(ipv4_netmask(cidr.prefix_len())))
+                .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
+            ifr.ifr_ifru = IfReqUnion { addr };
+            Ok(0)
+        }
+
+        SIOCSIFNETMASK => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &*(arg1 as *const IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let iface = iface_by_name(ifname)?;
+            #[allow(unsafe_code)]
+            let netmask =
+                unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
+            let prefix_len = prefix_len_from_netmask(netmask)?;
+            let addr = iface_ipv4_cidr(&*iface)
+                .map(|cidr| cidr.address())
+                .unwrap_or(Ipv4Address::UNSPECIFIED);
+            iface
+                .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
+                .map_err(|_| LxError::EINVAL)?;
+            Ok(0)
+        }
+
+        // SIOCGIFHWADDR: get hardware address
+        SIOCGIFHWADDR => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let ifaces = kernel_hal::drivers::all_net();
+            for iface in ifaces.as_vec().iter() {
+                if iface.get_ifname() == ifname {
+                    let mac = iface.get_mac();
+                    unsafe {
+                        ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_ETHER;
+                        ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
+                    }
+                    return Ok(0);
+                }
+            }
+            Err(LxError::ENODEV)
+        }
+
+        // SIOCGIFMTU: get MTU
+        SIOCGIFMTU => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            ifr.ifr_ifru = IfReqUnion { ifmtu: 1500 };
+            Ok(0)
+        }
+
+        // SIOCGIFMETRIC: get metric
+        SIOCGIFMETRIC => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            ifr.ifr_ifru = IfReqUnion { ifmetric: 0 };
+            Ok(0)
+        }
+
+        // SIOCADDRT: add route
+        SIOCADDRT => {
+            #[allow(unsafe_code)]
+            let rt = unsafe { &*(arg1 as *const RtEntry) };
+            let gateway = if (rt.rt_flags & RTF_GATEWAY) != 0 {
+                let addr = Ipv4Address::from_bytes(&rt.rt_gateway.sin_addr.to_ne_bytes());
+                Some(IpAddress::Ipv4(addr))
+            } else {
+                None
+            };
+            let dst_addr = Ipv4Address::from_bytes(&rt.rt_dst.sin_addr.to_ne_bytes());
+            let genmask = Ipv4Address::from_bytes(&rt.rt_genmask.sin_addr.to_ne_bytes());
+            let prefix_len = prefix_len_from_netmask(genmask).unwrap_or(0);
+            let cidr = IpCidr::Ipv4(Ipv4Cidr::new(dst_addr, prefix_len));
+
+            let ifname = if !rt.rt_dev.is_null() {
+                #[allow(unsafe_code)]
+                unsafe { from_cstr(rt.rt_dev) }
+            } else {
+                "eth0" // default to eth0 if not specified
+            };
+
+            info!("SIOCADDRT: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, ifname);
+            let iface = iface_by_name(ifname)?;
+            iface.add_route(cidr, gateway).map_err(|_| LxError::EIO)?;
+            Ok(0)
+        }
+
+        // SIOCDELRT: delete route
+        SIOCDELRT => {
+            #[allow(unsafe_code)]
+            let rt = unsafe { &*(arg1 as *const RtEntry) };
+            let gateway = if (rt.rt_flags & RTF_GATEWAY) != 0 {
+                let addr = Ipv4Address::from_bytes(&rt.rt_gateway.sin_addr.to_ne_bytes());
+                Some(IpAddress::Ipv4(addr))
+            } else {
+                None
+            };
+            let dst_addr = Ipv4Address::from_bytes(&rt.rt_dst.sin_addr.to_ne_bytes());
+            let genmask = Ipv4Address::from_bytes(&rt.rt_genmask.sin_addr.to_ne_bytes());
+            let prefix_len = prefix_len_from_netmask(genmask).unwrap_or(0);
+            let cidr = IpCidr::Ipv4(Ipv4Cidr::new(dst_addr, prefix_len));
+
+            let ifname = if !rt.rt_dev.is_null() {
+                #[allow(unsafe_code)]
+                unsafe { from_cstr(rt.rt_dev) }
+            } else {
+                "eth0" // default to eth0 if not specified
+            };
+
+            info!("SIOCDELRT: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, ifname);
+            let iface = iface_by_name(ifname)?;
+            iface.del_route(cidr, gateway).map_err(|_| LxError::EIO)?;
+            Ok(0)
+        }
+
+        // SIOCGARP
+        SIOCGARP => {
+            Err(LxError::ENOENT)
+        }
+
+        _ => Err(LxError::ENOSYS),
+    }
+}
+
+// ============= IOCTL =============
 // ============= Rand Port =============
 
 // ============= Util =============

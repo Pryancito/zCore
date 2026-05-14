@@ -7,17 +7,18 @@ use alloc::sync::Arc;
 use alloc::string::String;
 use lock::Mutex;
 
-use crate::scheme::{NetScheme, Scheme};
+use crate::scheme::{NetScheme, Scheme, RouteInfo};
 use crate::{DeviceError, DeviceResult};
 
 use alloc::vec::Vec;
 use smoltcp::wire::EthernetAddress;
-use smoltcp::wire::IpCidr;
+use smoltcp::wire::{IpCidr, Ipv4Cidr};
 
 #[derive(Clone)]
 pub struct LoopbackInterface {
     pub iface: Arc<Mutex<Interface<'static, Loopback>>>,
     pub name: String,
+    pub routes: Arc<Mutex<Vec<RouteInfo>>>,
 }
 
 impl Scheme for LoopbackInterface {
@@ -58,5 +59,36 @@ impl NetScheme for LoopbackInterface {
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
         Vec::from(self.iface.lock().ip_addrs())
+    }
+    
+    fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+        self.routes.lock().push(RouteInfo { dst: cidr, gateway });
+        Ok(())
+    }
+
+    fn del_route(&self, cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+        self.routes.lock().retain(|r| r.dst != cidr);
+        Ok(())
+    }
+
+    fn get_routes(&self) -> Vec<RouteInfo> {
+        let iface = self.iface.lock();
+        let mut res = Vec::new();
+        
+        // 1. Add tracked routes
+        res.extend(self.routes.lock().clone());
+
+        // 2. Add direct routes
+        for cidr in iface.ip_addrs() {
+            if let IpCidr::Ipv4(v4) = cidr {
+                if v4.prefix_len() > 0 {
+                    res.push(RouteInfo {
+                        dst: IpCidr::Ipv4(v4.network()),
+                        gateway: None,
+                    });
+                }
+            }
+        }
+        res
     }
 }

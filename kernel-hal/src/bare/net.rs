@@ -6,6 +6,7 @@ use smoltcp::{
 };
 
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 
 // use zcore_drivers::net::get_sockets;
@@ -17,7 +18,7 @@ use lock::Mutex;
 use crate::drivers::add_device;
 use crate::drivers::all_net;
 use zcore_drivers::net::LoopbackInterface;
-use zcore_drivers::scheme::NetScheme;
+use zcore_drivers::scheme::{NetScheme, RouteInfo};
 use zcore_drivers::Device;
 
 pub fn init() {
@@ -60,6 +61,10 @@ pub fn init() {
     let loopback_iface = LoopbackInterface {
         iface: Arc::new(Mutex::new(iface)),
         name,
+        routes: Arc::new(Mutex::new(vec![RouteInfo {
+            dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+            gateway: Some(IpAddress::Ipv4(default_gateway)),
+        }])),
     };
     // loopback_iface
     let dev = Device::Net(Arc::new(loopback_iface));
