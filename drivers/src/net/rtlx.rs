@@ -15,7 +15,7 @@ use super::realtek::rtl8211f::{self, RTL8211F};
 use super::{timer_now_as_micros, ProviderImpl, PAGE_SIZE};
 
 use crate::net::get_sockets;
-use crate::scheme::{NetScheme, Scheme};
+use crate::scheme::{NetScheme, RouteInfo, Scheme};
 use crate::{DeviceError, DeviceResult};
 
 #[derive(Clone)]
@@ -25,6 +25,7 @@ pub struct RTLxDriver(Arc<Mutex<RTL8211F<ProviderImpl>>>);
 pub struct RTLxInterface {
     pub iface: Arc<Mutex<Interface<'static, RTLxDriver>>>,
     pub driver: RTLxDriver,
+    pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub name: String,
     pub irq: usize,
 }
@@ -74,6 +75,74 @@ impl NetScheme for RTLxInterface {
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
         Vec::from(self.iface.lock().ip_addrs())
+    }
+
+    fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        iface.update_ip_addrs(|addrs| {
+            if let Some(addr) = addrs
+                .iter_mut()
+                .find(|addr| matches!(addr, IpCidr::Ipv4(_)))
+            {
+                *addr = IpCidr::Ipv4(cidr);
+            } else if let Some(addr) = addrs.iter_mut().next() {
+                *addr = IpCidr::Ipv4(cidr);
+            }
+        });
+        Ok(())
+    }
+
+    fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        match (cidr, gateway) {
+            (IpCidr::Ipv4(c), Some(IpAddress::Ipv4(gw))) if c.prefix_len() == 0 => {
+                iface
+                    .routes_mut()
+                    .add_default_ipv4_route(gw)
+                    .map_err(|_| DeviceError::IoError)?;
+
+                let mut routes = self.routes.lock();
+                routes.retain(|r| r.dst.prefix_len() != 0);
+                routes.push(RouteInfo {
+                    dst: cidr,
+                    gateway: Some(IpAddress::Ipv4(gw)),
+                });
+            }
+            _ => {
+                self.routes.lock().push(RouteInfo { dst: cidr, gateway });
+            }
+        }
+        Ok(())
+    }
+
+    fn del_route(&self, cidr: IpCidr, _gateway: Option<IpAddress>) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        if let IpCidr::Ipv4(c) = cidr {
+            if c.prefix_len() == 0 {
+                let _ = iface.routes_mut().remove_default_ipv4_route();
+            }
+        }
+        self.routes.lock().retain(|r| r.dst != cidr);
+        Ok(())
+    }
+
+    fn get_routes(&self) -> Vec<RouteInfo> {
+        let iface = self.iface.lock();
+        let mut res = Vec::new();
+
+        res.extend(self.routes.lock().clone());
+
+        for cidr in iface.ip_addrs() {
+            if let IpCidr::Ipv4(v4) = cidr {
+                if v4.prefix_len() > 0 {
+                    res.push(RouteInfo {
+                        dst: IpCidr::Ipv4(v4.network()),
+                        gateway: None,
+                    });
+                }
+            }
+        }
+        res
     }
 
     fn poll(&self) -> DeviceResult {
@@ -229,6 +298,10 @@ pub fn rtlx_init<F: Fn(usize, usize) -> Option<usize>>(
     let rtl8211f_iface = RTLxInterface {
         iface: Arc::new(Mutex::new(iface)),
         driver: net_driver,
+        routes: Arc::new(Mutex::new(vec![RouteInfo {
+            dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+            gateway: Some(IpAddress::Ipv4(default_gateway)),
+        }])),
         name: String::from("rtl8211f"),
         irq,
     };
