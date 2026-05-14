@@ -154,7 +154,7 @@ pub fn set_packet_callback(callback: fn(&[u8])) {
 
 /// Dispatches a received packet to the registered callback.
 pub fn net_dispatch_packet(data: &[u8]) {
-    trace!("[net] dispatching packet of {} bytes", data.len());
+    warn!("[net] dispatching packet of {} bytes to callback", data.len());
     let flag = intr_get();
     if flag { intr_off(); }
     

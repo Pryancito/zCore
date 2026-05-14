@@ -71,35 +71,95 @@ const E1000E_VET: usize = 0x0038 / 4;
 const E1000E_RXCSUM: usize = 0x5000 / 4;
 const E1000E_RFCTL: usize = 0x5008 / 4;
 const E1000E_MRQC: usize = 0x5818 / 4;
-const E1000E_FEXTNVM6: usize = 0x0010 / 4;
-const E1000E_FEXTNVM7: usize = 0x0014 / 4;
+const E1000E_FEXTNVM6: usize = 0x01014 / 4;
+const E1000E_FEXTNVM7: usize = 0x01018 / 4;
 const E1000E_FEXTNVM11: usize = 0x05BBC / 4;
 const E1000E_KMRNCTRLSTA: usize = 0x00034 / 4;
 const E1000E_PBA: usize = 0x01000 / 4;
+const E1000E_WUC: usize = 0x05800 / 4;
+const E1000E_FCTTV: usize = 0x00170 / 4;
+const E1000E_FCRTV: usize = 0x05F40 / 4;
+const E1000E_FCRTL: usize = 0x02160 / 4;
+const E1000E_FCRTH: usize = 0x02168 / 4;
+const E1000E_TARC0: usize = 0x03840 / 4;
+const E1000E_TARC1: usize = 0x03940 / 4;
+const E1000E_TXDCTL: usize = 0x03828 / 4;
+const E1000E_RXDCTL: usize = 0x02828 / 4;
+const E1000E_FEXTNVM4: usize = 0x000E0 / 4;
+const E1000E_FEXTNVM9: usize = 0x05BB4 / 4;
+const E1000E_PBECCSTS: usize = 0x0100C / 4;
+const E1000E_CTRL_EXT: usize = 0x00018 / 4;
+const E1000E_CRC_OFFSET: usize = 0x05F50 / 4;
+const E1000E_KABGTXD: usize = 0x03004 / 4;
+const E1000E_IOSFPC: usize = 0x00F28 / 4;
+const E1000E_FWSM: usize = 0x05B54 / 4;
+
+// RFCTL bits
+const RFCTL_NFSW_DIS: u32 = 1 << 6;
+const RFCTL_NFSR_DIS: u32 = 1 << 7;
+const RFCTL_IPV6_EX_DIS: u32 = 1 << 13;
+const RFCTL_NEW_IPV6_EXT_DIS: u32 = 1 << 15;
+
+// KABGTXD bits
+const KABGTXD_BGSQLBIAS: u32 = 0x00050000;
 
 // FEXTNVM6 bits
 const FEXTNVM6_K1_OFF_EN: u32 = 1 << 31;
 const FEXTNVM6_DIS_ELDW: u32 = 1 << 5; // Disable Early Link Down Window
 
-// FEXTNVM7 bits
-const FEXTNVM7_DIS_LR_PROMISC: u32 = 1 << 28;
-
-// FEXTNVM11 bits
-const FEXTNVM11_DISABLE_L1_2: u32 = 0x00000001;
-
-// KMRNCTRLSTA bits
-const KMRNCTRLSTA_K1_CONFIG: u32 = 1 << 13;
+// KMRNCTRLSTA bits for ICH8/PCH
+const KMRNCTRLSTA_OFFSET_SHIFT: u32 = 16;
+const KMRNCTRLSTA_REN: u32 = 1 << 21;
+const KMRNCTRLSTA_WEN: u32 = 1 << 22;
+const KMRNCTRLSTA_K1_CONFIG: u16 = 0x1F; // Index 0x1F
+const KMRNCTRLSTA_K1_ENABLE: u16 = 1 << 13;
 
 // CTRL bits
+const CTRL_MEHE: u32 = 1 << 19; // ME Hardware Enable
 const CTRL_SLU: u32 = 1 << 6; // set link up
 const CTRL_ASDE: u32 = 1 << 5; // auto-speed detection enable
 const CTRL_RST: u32 = 1 << 26; // full MAC + PHY reset
 const CTRL_TFCE: u32 = 1 << 27; // Transmit Flow Control Enable
 const CTRL_RFCE: u32 = 1 << 28; // Receive Flow Control Enable
 const CTRL_VME: u32 = 1 << 30; // VLAN Mode Enable
+const CTRL_GIO_MASTER_DISABLE: u32 = 1 << 2; // GIO Master Disable
+
+// CTRL_EXT bits
+const CTRL_EXT_RO_DIS: u32 = 1 << 2; // Relaxation Order Disable
+const CTRL_EXT_PHYPDEN: u32 = 1 << 20; // PHY Power Down Enable
+const CTRL_EXT_DPG_EN: u32 = 1 << 3; // Dynamic Power Gating Enable
+
+// FEXTNVM4 bits
+const FEXTNVM4_BEACON_DURATION_8USEC: u32 = 0x7;
+const FEXTNVM4_BEACON_DURATION_MASK: u32 = 0x7;
+
+// FEXTNVM7 bits
+const FEXTNVM7_SIDE_CLK_UNGATE: u32 = 1 << 2;
+const FEXTNVM7_DISABLE_SMB_PERST: u32 = 1 << 5;
+const FEXTNVM7_DIS_LR_PROMISC: u32 = 1 << 28;
+
+// FEXTNVM9 bits
+const FEXTNVM9_IOSFSB_CLKGATE_DIS: u32 = 1 << 11;
+const FEXTNVM9_IOSFSB_CLKREQ_DIS: u32 = 1 << 12;
+
+// FEXTNVM11 bits
+const FEXTNVM11_DISABLE_L1_2: u32 = 0x00000001;
+const FEXTNVM11_DISABLE_MULR_FIX: u32 = 1 << 13;
+
+// PBECCSTS bits
+const PBECCSTS_ECC_ENABLE: u32 = 1 << 16;
+
+// TXDCTL bits
+const TXDCTL_PTHRESH: u32 = 0x3F; // bits 0-5
+const TXDCTL_HTHRESH: u32 = 0x3F << 8; // bits 8-13
+const TXDCTL_WTHRESH: u32 = 0x3F << 16; // bits 16-21
+const TXDCTL_GRAN: u32 = 1 << 24; // 0=cache lines, 1=descriptors
+const TXDCTL_FULL_TX_DESC_WB: u32 = 1 << 26;
+const TXDCTL_COUNT_DESC: u32 = 1 << 22; // bit 22 must be 1 on some ICH8
 
 // STATUS bits
 const STATUS_LU: u32 = 1 << 1; // link up
+const STATUS_GIO_MASTER_ENABLE: u32 = 1 << 19; // GIO Master Enable Status
 
 // EERD bits (discrete e1000e like 82574L use bit 4 for DONE; PCH-integrated like I219 use bit 1)
 const EERD_START: u32 = 1 << 0;
@@ -230,10 +290,30 @@ impl E1000eHw {
     fn recycle_rx_desc(&mut self, idx: usize, desc: &mut RxDesc) {
         desc.status = 0;
         desc.errors = 0;
+        // Flush the zeroed descriptor to memory so hardware doesn't see old DD=1
+        unsafe { core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8); }
         fence(Ordering::SeqCst);
         self.rx_tail = (idx + 1) % NUM_RX;
         // CRITICAL: Hardware only sees the new descriptors when we update RDT.
         unsafe { mmio_write(self.base, E1000E_RDT, idx as u32) };
+    }
+
+    // -----------------------------------------------------------------------
+    // Kumeran (KMRN) register access (ICH8/PCH specific)
+    // -----------------------------------------------------------------------
+    unsafe fn kmrn_read(&self, offset: u16) -> u16 {
+        let cmd = ((offset as u32) << KMRNCTRLSTA_OFFSET_SHIFT) | KMRNCTRLSTA_REN;
+        mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
+        let _ = mmio_read(self.base, E1000E_KMRNCTRLSTA); // flush
+        core::hint::spin_loop();
+        (mmio_read(self.base, E1000E_KMRNCTRLSTA) & 0xFFFF) as u16
+    }
+
+    unsafe fn kmrn_write(&self, offset: u16, data: u16) {
+        let cmd = ((offset as u32) << KMRNCTRLSTA_OFFSET_SHIFT) | KMRNCTRLSTA_WEN | (data as u32);
+        mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
+        let _ = mmio_read(self.base, E1000E_KMRNCTRLSTA); // flush
+        core::hint::spin_loop();
     }
 
     // -----------------------------------------------------------------------
@@ -310,9 +390,52 @@ impl E1000eHw {
     }
 
     // -----------------------------------------------------------------------
+    // Flush descriptor rings (I219 workaround)
+    // -----------------------------------------------------------------------
+    unsafe fn flush_desc_rings(&self) {
+        // Only SPT (I219) and later require this (SPT: 0x156f..=0x1570, 0x15b7..=0x15be, etc.)
+        if !matches!(self.device_id, 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
+            return;
+        }
+
+        // Disable MULR fix in FEXTNVM11
+        let mut fextnvm11 = mmio_read(self.base, E1000E_FEXTNVM11);
+        fextnvm11 |= FEXTNVM11_DISABLE_MULR_FIX;
+        mmio_write(self.base, E1000E_FEXTNVM11, fextnvm11);
+
+        // If TDLEN is non-zero, we might have pending descriptors
+        let tdlen = mmio_read(self.base, E1000E_TDLEN);
+        if tdlen > 0 {
+            // Briefly enable TX to flush
+            let tctl = mmio_read(self.base, E1000E_TCTL);
+            mmio_write(self.base, E1000E_TCTL, tctl | TCTL_EN);
+            let _ = mmio_read(self.base, E1000E_TCTL); // flush
+            
+            let t_start = timer_now_as_micros();
+            while timer_now_as_micros().wrapping_sub(t_start) < 250 {
+                core::hint::spin_loop();
+            }
+            
+            mmio_write(self.base, E1000E_TCTL, tctl & !TCTL_EN);
+        }
+
+        // Disable RX
+        let rctl = mmio_read(self.base, E1000E_RCTL);
+        mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
+        let _ = mmio_read(self.base, E1000E_RCTL); // flush
+        let t_start = timer_now_as_micros();
+        while timer_now_as_micros().wrapping_sub(t_start) < 150 {
+            core::hint::spin_loop();
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Full hardware reset + init
     // -----------------------------------------------------------------------
     unsafe fn reset_and_init(&mut self) -> DeviceResult {
+        // 1. Pre-reset flush for I219
+        self.flush_desc_rings();
+
         // 1b. Try reading MAC from hardware (BIOS initialized) before we reset it.
         self.read_mac_from_hw();
         let mut mac_found = self.is_valid_mac();
@@ -324,11 +447,18 @@ impl E1000eHw {
         }
 
         // 2. Issue global reset (RST bit in CTRL).
-        //    CRITICAL: On e1000e (I217/I218/I219/82574) the datasheet (§4.6)
-        //    requires NO MMIO reads for at least 10 ms after setting RST.
-        //    Reading MMIO during that window can stall the PCI bus on real HW.
-        //    Use a real timer so the delay is correct on fast CPUs.
-        let ctrl = mmio_read(self.base, E1000E_CTRL);
+        //    Before resetting, disable PCIe master and wait for it to take effect.
+        let mut ctrl = mmio_read(self.base, E1000E_CTRL);
+        mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_GIO_MASTER_DISABLE);
+        let t_master = timer_now_as_micros();
+        while timer_now_as_micros().wrapping_sub(t_master) < 50_000 {
+            if mmio_read(self.base, E1000E_STATUS) & STATUS_GIO_MASTER_ENABLE == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_RST);
 
         // Hard silence: spin for at least 10 ms, timed with the kernel clock.
@@ -395,17 +525,58 @@ impl E1000eHw {
         }
 
         // 6. Set link-up + auto-speed detection. 
-        // Also explicitly DISABLE flow control (TFCE/RFCE) and VLAN mode (VME).
+        // Also explicitly DISABLE flow control (TFCE | RFCE) and VLAN mode (VME).
         let ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(
             self.base,
             E1000E_CTRL,
-            (ctrl | CTRL_SLU | CTRL_ASDE) & !(CTRL_TFCE | CTRL_RFCE | CTRL_VME),
+            (ctrl | CTRL_SLU | CTRL_ASDE) & !(CTRL_TFCE | CTRL_RFCE | CTRL_VME | CTRL_GIO_MASTER_DISABLE),
         );
 
         // 7. Clear MTA (multicast table)
         for i in 0..E1000E_MTA_LEN {
             mmio_write(self.base, E1000E_MTA_BASE + i, 0);
+        }
+
+        // 8. Initialize hardware bits (e1000_initialize_hw_bits_ich8lan)
+        let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+        ctrl_ext |= 1 << 22; // Required bit
+        if matches!(self.device_id, 0x1502..=0x1503 | 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
+            ctrl_ext |= CTRL_EXT_PHYPDEN;
+        }
+        ctrl_ext |= CTRL_EXT_RO_DIS;
+        ctrl_ext &= !CTRL_EXT_DPG_EN; // Disable Dynamic Power Gating
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+
+        // Apply PCH-specific bits
+        if matches!(self.device_id, 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
+            mmio_write(self.base, E1000E_CRC_OFFSET, 0x65656565);
+            let kabgtxd = mmio_read(self.base, E1000E_KABGTXD);
+            mmio_write(self.base, E1000E_KABGTXD, kabgtxd | KABGTXD_BGSQLBIAS);
+        }
+
+        // Set TXDCTL bits
+        let mut txdctl = mmio_read(self.base, E1000E_TXDCTL);
+        txdctl |= 1 << 22; // Required bit
+        mmio_write(self.base, E1000E_TXDCTL, txdctl);
+
+        // Set TARC bits
+        let mut tarc0 = mmio_read(self.base, E1000E_TARC0);
+        tarc0 |= (1 << 23) | (1 << 24) | (1 << 26) | (1 << 27);
+        mmio_write(self.base, E1000E_TARC0, tarc0);
+
+        let mut tarc1 = mmio_read(self.base, E1000E_TARC1);
+        tarc1 |= (1 << 24) | (1 << 26) | (1 << 30);
+        tarc1 |= 1 << 28; // Not MULR
+        mmio_write(self.base, E1000E_TARC1, tarc1);
+
+        // Enable ECC on Lynxpoint and later
+        if matches!(self.device_id, 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
+            let pbeccsts = mmio_read(self.base, E1000E_PBECCSTS);
+            mmio_write(self.base, E1000E_PBECCSTS, pbeccsts | PBECCSTS_ECC_ENABLE);
+            
+            let ctrl = mmio_read(self.base, E1000E_CTRL);
+            mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_MEHE);
         }
 
         // 6. Set receive address 0 (RAL0/RAH0) to our MAC
@@ -439,18 +610,20 @@ impl E1000eHw {
         );
         mmio_write(self.base, E1000E_TDH, 0);
         mmio_write(self.base, E1000E_TDT, 0);
+        
+        // TIPG: IPGT=8, IPGR1=8, IPGR2=12 (Linux default for ICH8+)
+        mmio_write(self.base, E1000E_TIPG, 8u32 | (8 << 10) | (12 << 20));
+
         mmio_write(
             self.base,
             E1000E_TCTL,
             TCTL_EN | TCTL_PSP | TCTL_CT_16 | TCTL_COLD_64,
         );
-        // TIPG: IPGT=10, IPGR1=8, IPGR2=12 (IEEE 802.3 recommended)
-        mmio_write(self.base, E1000E_TIPG, 10u32 | (8 << 10) | (12 << 20));
 
         // 10b. Apply Linux-style workarounds for PCH-based NICs (I217/I218/I219)
         // These are critical for fixing broadcast packet drops (DHCP).
-        if matches!(self.device_id, 0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0 | 0x15a1 | 0x15a2 | 0x15a3 | 0x15b7 | 0x15b8 | 0x15b9 | 0x15bc | 0x15bd | 0x15be | 0x15bb | 0x0d4c | 0x0d4d | 0x0d4e | 0x0d4f | 0x1a1c | 0x1a1d | 0x1a1e | 0x1a1f) {
-            warn!("[e1000e] applying I217/I218/I219 broadcast workarounds (K1, ELDW, L1.2)");
+        if matches!(self.device_id, 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
+            warn!("[e1000e] applying I217/I218/I219 broadcast workarounds (K1, ELDW, L1.2, FEXT)");
             
             // Disable K1 in FEXTNVM6
             let mut fextnvm6 = mmio_read(self.base, E1000E_FEXTNVM6);
@@ -458,18 +631,33 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_FEXTNVM6, fextnvm6);
             
             // Disable K1 in KMRNCTRLSTA
-            let mut kmrn = mmio_read(self.base, E1000E_KMRNCTRLSTA);
-            kmrn &= !KMRNCTRLSTA_K1_CONFIG;
-            mmio_write(self.base, E1000E_KMRNCTRLSTA, kmrn);
+            let mut kmrn = self.kmrn_read(KMRNCTRLSTA_K1_CONFIG);
+            kmrn &= !KMRNCTRLSTA_K1_ENABLE;
+            self.kmrn_write(KMRNCTRLSTA_K1_CONFIG, kmrn);
             
             // Disable L1.2 power state in FEXTNVM11
             let mut fextnvm11 = mmio_read(self.base, E1000E_FEXTNVM11);
             fextnvm11 |= FEXTNVM11_DISABLE_L1_2;
             mmio_write(self.base, E1000E_FEXTNVM11, fextnvm11);
 
+            // Set Beacon Duration in FEXTNVM4 to 8usec
+            let mut fextnvm4 = mmio_read(self.base, E1000E_FEXTNVM4);
+            fextnvm4 &= !FEXTNVM4_BEACON_DURATION_MASK;
+            fextnvm4 |= FEXTNVM4_BEACON_DURATION_8USEC;
+            mmio_write(self.base, E1000E_FEXTNVM4, fextnvm4);
+
+            // Set FEXTNVM7 bits
+            let mut fextnvm7 = mmio_read(self.base, E1000E_FEXTNVM7);
+            fextnvm7 |= FEXTNVM7_SIDE_CLK_UNGATE | FEXTNVM7_DISABLE_SMB_PERST;
+            mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
+
+            // Set FEXTNVM9 bits
+            let mut fextnvm9 = mmio_read(self.base, E1000E_FEXTNVM9);
+            fextnvm9 |= FEXTNVM9_IOSFSB_CLKGATE_DIS | FEXTNVM9_IOSFSB_CLKREQ_DIS;
+            mmio_write(self.base, E1000E_FEXTNVM9, fextnvm9);
+
             // Set PBA (Packet Buffer Allocation)
             // Linux uses 18K for RX, 14K for TX on these chips to avoid drops.
-            // 0x000E0012: RX=18, TX=14 (or similar depending on chip)
             mmio_write(self.base, E1000E_PBA, 0x000E0012);
         } else {
             // Default PBA for older e1000e
@@ -501,9 +689,17 @@ impl E1000eHw {
         
         unsafe {
             mmio_write(self.base, E1000E_RXCSUM, 0); // Disable RX checksum offload
-            mmio_write(self.base, E1000E_RFCTL, 0);  // Disable advanced filtering
+            // Disable NFS filtering and IPv6 extension header parsing which can hang RX
+            let rfctl = RFCTL_NFSW_DIS | RFCTL_NFSR_DIS | RFCTL_IPV6_EX_DIS | RFCTL_NEW_IPV6_EXT_DIS;
+            mmio_write(self.base, E1000E_RFCTL, rfctl);
             mmio_write(self.base, E1000E_MRQC, 0);   // Disable RSS / multiple queues
             mmio_write(self.base, E1000E_VET, 0);    // Clear VLAN EtherType
+            
+            // SPT/KBL Si errata workaround to avoid data corruption (IOSFPC bit 16)
+            if matches!(self.device_id, 0x156f..=0x1570 | 0x15b7..=0x15be) {
+                let iosfpc = mmio_read(self.base, E1000E_IOSFPC);
+                mmio_write(self.base, E1000E_IOSFPC, iosfpc | 0x00010000);
+            }
         }
 
         // 7. Enable receiver
@@ -511,13 +707,25 @@ impl E1000eHw {
         // MPE: bit 4, BAM: bit 15, SECRC: bit 26
         // RCTL_UPE is critical: DHCPOFFER is unicast-to-our-MAC; without UPE the hardware
         // may silently drop it if RAL0/RAH0 initialisation races or address is wrong.
-        let rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
+        let rctl = RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
         unsafe { mmio_write(self.base, E1000E_RCTL, rctl) };
         
         // Set RXDCTL (RX Descriptor Control)
-        // GRAN=1 (descriptors), WTHRESH=0 (write back immediately)
-        unsafe { mmio_write(self.base, 0x02828 / 4, (1 << 24)) };
+        // GRAN=1 (descriptors), WTHRESH=4, HTHRESH=4, PTHRESH=32 (Linux burst defaults)
+        unsafe { mmio_write(self.base, E1000E_RXDCTL, (1 << 24) | (4 << 16) | (4 << 8) | 0x20) };
         
+        // Set TXDCTL (TX Descriptor Control)
+        // GRAN=1, FULL_TX_DESC_WB=1, PTHRESH=31
+        unsafe { mmio_write(self.base, E1000E_TXDCTL, TXDCTL_GRAN | TXDCTL_FULL_TX_DESC_WB | 0x1F) };
+
+        // Flow control watermarks (Linux defaults)
+        unsafe {
+            mmio_write(self.base, E1000E_FCTTV, 0xFFFF);
+            mmio_write(self.base, E1000E_FCRTV, 0xFFFF);
+            mmio_write(self.base, E1000E_FCRTL, 0x05048);
+            mmio_write(self.base, E1000E_FCRTH, 0x05C20);
+        }
+
         // Wait a bit for the receiver to stabilize
         for _ in 0..1000 { unsafe { core::arch::x86_64::_mm_pause() }; }
 
@@ -579,11 +787,7 @@ impl E1000eHw {
                 // No more descriptors owned by software; stop the drain.
                 return None;
             }
-            let errors = unsafe { read_volatile(&desc.errors) };
-            // Check for hardware reported errors
-            if errors != 0 {
-                warn!("[e1000e] RX packet error: status={:#x}, errors={:#x}, len={}", status, errors, desc.len);
-            }
+            warn!("[e1000e] RX hardware status={:#x}, errors={:#x}, len={}", status, desc.errors, desc.len);
 
             // Must be a complete frame and fit in our DMA buffer.
             // If not, recycle (advancing rx_tail + writing RDT) and keep looping
@@ -637,7 +841,7 @@ impl E1000eHw {
         let buf =
             unsafe { core::slice::from_raw_parts_mut(self.tx_bufs[idx].vaddr() as *mut u8, data.len()) };
         buf.copy_from_slice(data);
-        // warn!("[e1000e] Driver sending packet of {} bytes: {:02x?}", data.len(), &data[..data.len().min(64)]);
+        warn!("[e1000e] TX packet: {} bytes", data.len());
 
         desc.addr = self.tx_bufs[idx].paddr() as u64;
         desc.len = data.len() as u16;
@@ -676,7 +880,7 @@ impl E1000eHw {
     pub fn handle_interrupt(&mut self) -> bool {
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr != 0 {
-            // warn!("[e1000e] ICR={:#x}", icr);
+            warn!("[e1000e] Interrupt! ICR={:#x}", icr);
             unsafe { mmio_write(self.base, E1000E_ICR, icr) };
             return true;
         }
@@ -953,8 +1157,8 @@ pub fn init(
 
     let mac_bytes = hw.mac;
     info!(
-        "[e1000e] finalized MAC for smoltcp: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
+        "[e1000e] finalized MAC for smoltcp: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (ID: {:#x})",
+        mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5], device_id
     );
     let hw_arc = Arc::new(Mutex::new(hw));
     let driver = E1000eDriver { hw: hw_arc.clone() };

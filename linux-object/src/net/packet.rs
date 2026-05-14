@@ -60,6 +60,8 @@ pub fn push_packet(packet: &[u8]) {
             } else {
                 info!("PacketSocket: non-ethernet packet received");
             }
+            
+            warn!("PacketSocket: received {} bytes, protocol filter={:#x}", packet.len(), protocol);
 
             let mut queue = state.inner.packet_queue.lock();
             // Limit queue size to avoid OOM
@@ -170,7 +172,7 @@ impl Socket for PacketSocketState {
                 return (Err(LxError::EAGAIN), endpoint);
             }
 
-            // Drain deferred jobs (IRQ → iface.poll → push_packet) and then sleep a short
+            // Drain deferred jobs (IRQ -> iface.poll -> push_packet) and then sleep a short
             // interval. On real hardware the NIC IRQ enqueues a deferred_job; draining here
             // ensures we don't miss a packet that arrived just before we slept.
             kernel_hal::deferred_job::drain_deferred_jobs();
