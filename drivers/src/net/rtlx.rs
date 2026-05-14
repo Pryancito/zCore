@@ -79,15 +79,21 @@ impl NetScheme for RTLxInterface {
 
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
         let mut iface = self.iface.lock();
+        let mut updated = false;
         iface.update_ip_addrs(|addrs| {
             if let Some(addr) = addrs
                 .iter_mut()
                 .find(|addr| matches!(addr, IpCidr::Ipv4(_)))
             {
                 *addr = IpCidr::Ipv4(cidr);
+                updated = true;
             }
         });
-        Ok(())
+        if updated {
+            Ok(())
+        } else {
+            Err(DeviceError::NotSupported)
+        }
     }
 
     fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
@@ -100,7 +106,7 @@ impl NetScheme for RTLxInterface {
                     .map_err(|_| DeviceError::IoError)?;
 
                 let mut routes = self.routes.lock();
-                routes.retain(|r| r.dst.prefix_len() != 0);
+                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
                 routes.push(RouteInfo {
                     dst: cidr,
                     gateway: Some(IpAddress::Ipv4(gw)),
