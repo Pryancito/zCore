@@ -28,7 +28,7 @@ pub fn push_packet(packet: &[u8]) {
 
     for (i, weak) in sockets.iter().enumerate() {
         if let Some(state) = weak.upgrade() {
-            let protocol = u16::from_be(*state.inner.protocol.lock());
+            let protocol = *state.inner.protocol.lock();
             // Try to parse Ethernet header to filter by protocol
             if let Ok(frame) = EthernetFrame::new_checked(packet) {
                 let ethertype: u16 = frame.ethertype().into();
@@ -196,7 +196,7 @@ impl Socket for PacketSocketState {
                 } else {
                     *self.inner.protocol.lock()
                 };
-                let protocol = u16::from_be(protocol_raw);
+                let protocol = protocol_raw;
                 frame.set_ethertype(protocol.into());
                 frame.payload_mut().copy_from_slice(data);
                 dev.send(&buf).map_err(|_| LxError::EIO)?;
@@ -221,7 +221,7 @@ impl Socket for PacketSocketState {
             *self.inner.ifindex.lock() = ll.interface_index as u32;
             let proto = ll.protocol;
             *self.inner.protocol.lock() = proto;
-            info!("PacketSocket: bound to ifindex {}, proto (network)={:#x} (host={:#x})", ll.interface_index, proto, u16::from_be(proto));
+            info!("PacketSocket: bound to ifindex {}, proto (host)={:#x}", ll.interface_index, proto);
             Ok(0)
         } else {
             Err(LxError::EINVAL)
