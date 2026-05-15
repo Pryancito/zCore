@@ -287,8 +287,20 @@ impl E1000eHw {
     /// `timer_now_as_micros` is imported from `super` (drivers/src/net/mod.rs).
     fn udelay(us: u64) {
         let t0 = timer_now_as_micros();
+        // On some real hardware, the early boot time source can stall briefly.
+        // Keep a hard spin guard to prevent any infinite wait in init paths.
+        let max_spins = us.saturating_mul(50_000).max(50_000);
+        let mut spins = 0u64;
         while timer_now_as_micros().wrapping_sub(t0) < us {
             core::hint::spin_loop();
+            spins = spins.saturating_add(1);
+            if spins >= max_spins {
+                warn!(
+                    "[e1000e] udelay fallback hit ({}us, timer did not advance fast enough)",
+                    us
+                );
+                break;
+            }
         }
     }
 
@@ -314,25 +326,27 @@ impl E1000eHw {
         // Try Address Shift 2 first (82574L and most discrete e1000e)
         let cmd = ((offset as u32) << 2) | EERD_START;
         mmio_write(self.base, E1000E_EERD, cmd);
-        let t0 = timer_now_as_micros();
-        while timer_now_as_micros().wrapping_sub(t0) < NVM_POLL_US {
+        let mut tries = (NVM_POLL_US / 50).max(1);
+        while tries > 0 {
             let v = mmio_read(self.base, E1000E_EERD);
             if v & (EERD_DONE_BIT4 | EERD_DONE_BIT1) != 0 {
                 return (v >> EERD_DATA_SHIFT) as u16;
             }
             Self::udelay(50); // C6: allow timer to tick on bare-metal
+            tries -= 1;
         }
 
         // Try Address Shift 3 (PCH-integrated NICs like I217/I218/I219)
         let cmd = ((offset as u32) << 3) | EERD_START;
         mmio_write(self.base, E1000E_EERD, cmd);
-        let t0 = timer_now_as_micros();
-        while timer_now_as_micros().wrapping_sub(t0) < NVM_POLL_US {
+        let mut tries = (NVM_POLL_US / 50).max(1);
+        while tries > 0 {
             let v = mmio_read(self.base, E1000E_EERD);
             if v & (EERD_DONE_BIT4 | EERD_DONE_BIT1) != 0 {
                 return (v >> EERD_DATA_SHIFT) as u16;
             }
             Self::udelay(50); // C6: allow timer to tick on bare-metal
+            tries -= 1;
         }
         0
     }
@@ -574,12 +588,13 @@ impl E1000eHw {
         warn!("[e1000e] disabling GIO master...");
         let mut ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_GIO_MASTER_DISABLE);
-        let t_master = timer_now_as_micros();
-        while timer_now_as_micros().wrapping_sub(t_master) < 50_000 {
+        let mut master_wait = 500; // 500 * 100us = 50ms budget
+        while master_wait > 0 {
             if mmio_read(self.base, E1000E_STATUS) & STATUS_GIO_MASTER_ENABLE == 0 {
                 break;
             }
             Self::udelay(100); // C1: allow LAPIC timer to advance on bare-metal
+            master_wait -= 1;
         }
 
         warn!("[e1000e] issuing RST...");
@@ -587,12 +602,13 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_RST);
 
         // Wait for RST self-clear BEFORE touching any other register.
-        let t_rst = timer_now_as_micros();
-        while timer_now_as_micros().wrapping_sub(t_rst) < 100_000 {
+        let mut rst_wait = 1_000; // 1000 * 100us = 100ms budget
+        while rst_wait > 0 {
             if mmio_read(self.base, E1000E_CTRL) & CTRL_RST == 0 {
                 break;
             }
             Self::udelay(100); // C2: allow LAPIC timer to advance on bare-metal
+            rst_wait -= 1;
         }
         // Minimum post-reset silence before any MMIO (datasheet §4.6.3)
         Self::udelay(10_000);
@@ -610,14 +626,15 @@ impl E1000eHw {
         // MAC register file is accessible and we can proceed.
         // STATUS_POLL_US = 150ms is the budget for PCH-based NICs (I219).
         let mut ready = false;
-        let t_poll = timer_now_as_micros();
-        while timer_now_as_micros().wrapping_sub(t_poll) < STATUS_POLL_US {
+        let mut status_poll_tries = (STATUS_POLL_US / 1_000).max(1);
+        while status_poll_tries > 0 {
             let s = mmio_read(self.base, E1000E_STATUS);
             if s != 0xFFFF_FFFF {
                 ready = true;
                 break;
             }
             Self::udelay(1_000);
+            status_poll_tries -= 1;
         }
         if !ready {
             warn!("[e1000e] STATUS still 0xFFFFFFFF after {}ms — device not responding", STATUS_POLL_US / 1000);
@@ -782,10 +799,10 @@ impl E1000eHw {
             // PCH-SPT (I219+) requires explicit QUEUE_ENABLE (bit 25) to start TX DMA.
             let txdctl = mmio_read(self.base, E1000E_TXDCTL);
             mmio_write(self.base, E1000E_TXDCTL, txdctl | TXDCTL_QUEUE_ENABLE);
-            let t0 = timer_now_as_micros();
-            while mmio_read(self.base, E1000E_TXDCTL) & TXDCTL_QUEUE_ENABLE == 0 {
-                if timer_now_as_micros().wrapping_sub(t0) > 10_000 { break; }
+            let mut txq_wait = 100; // 100 * 100us = 10ms
+            while txq_wait > 0 && mmio_read(self.base, E1000E_TXDCTL) & TXDCTL_QUEUE_ENABLE == 0 {
                 Self::udelay(100); // C3: allow timer to tick on bare-metal
+                txq_wait -= 1;
             }
         }
         mmio_write(self.base, E1000E_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT_16 | TCTL_COLD_64);
@@ -846,10 +863,10 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_RXDCTL, rxdctl);
         }
         if self.is_pch_spt_or_later() {
-            let t0 = timer_now_as_micros();
-            while mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE == 0 {
-                if timer_now_as_micros().wrapping_sub(t0) > 10_000 { break; }
+            let mut rxq_wait = 100; // 100 * 100us = 10ms
+            while rxq_wait > 0 && mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE == 0 {
                 Self::udelay(100); // C4: allow timer to tick on bare-metal
+                rxq_wait -= 1;
             }
         }
         warn!("[e1000e] RX queues configured");
@@ -916,11 +933,12 @@ impl E1000eHw {
         let mut status = mmio_read(self.base, E1000E_STATUS);
         if status & STATUS_LU == 0 {
             warn!("[e1000e] link is DOWN, waiting up to 3 s...");
-            let t0 = timer_now_as_micros();
-            while timer_now_as_micros().wrapping_sub(t0) < 3_000_000 {
+            let mut link_wait = 300; // 300 * 10ms = 3s
+            while link_wait > 0 {
                 Self::udelay(10_000); // 10 ms per iteration — lets timer interrupt fire
                 status = mmio_read(self.base, E1000E_STATUS);
                 if status & STATUS_LU != 0 { break; }
+                link_wait -= 1;
             }
             if status & STATUS_LU == 0 {
                 warn!("[e1000e] link still DOWN after 3 s — continuing anyway");
