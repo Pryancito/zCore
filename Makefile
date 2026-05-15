@@ -3,6 +3,7 @@
 ARCH ?= x86_64
 XTASK ?= 1
 LOG ?= error
+IFACE ?= eno1
 GRAPHIC ?= on
 ACCEL ?= 1
 
@@ -85,6 +86,13 @@ clean-everything: clean
 # 	echo x86 gcc build rt-test,now need manual modificy.
 qemu: image
 	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL)
+
+# Macvtap networking: VM gets its own MAC/IP on the physical LAN.
+# Useful for testing the I219-V driver on bare metal.
+# Usage: make qemu-macvtap [LOG=warn] [IFACE=eno1]
+qemu-real: image
+	IFACE=$(IFACE) LOG=$(LOG) ACCEL=$(ACCEL) GRAPHIC=$(GRAPHIC) \
+		bash zCore/run-qemu-macvtap.sh
 
 ################ Distribution images ################
 #

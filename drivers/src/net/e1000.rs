@@ -315,7 +315,7 @@ impl PciDriver for E1000DriverPci {
     }
 
     fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
-        vendor_id == 0x8086 && (device_id == 0x100e || device_id == 0x100f || device_id == 0x10d3)
+        vendor_id == 0x8086 && (device_id == 0x100e || device_id == 0x100f)
     }
 
     fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {

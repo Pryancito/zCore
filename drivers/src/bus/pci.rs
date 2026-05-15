@@ -30,7 +30,7 @@ const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
 #[allow(dead_code)]
 const PCI_CAP_ID_MSI: u8 = 0x05;
 
-pub(crate) struct PortOpsImpl;
+pub struct PortOpsImpl;
 
 /// Read a BAR's physical base address directly from PCI config space.
 /// Handles both 32-bit and 64-bit memory BARs without probing (no side effects).
