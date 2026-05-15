@@ -550,9 +550,14 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     unsafe fn reset_and_init(&mut self) -> DeviceResult {
         warn!("[e1000e] reset_and_init starting...");
-        // 0. Wake up card
+        // 0. Wake up card (disable ULP so the PHY is fully powered).
+        // NOTE: toggle_lanphypc() is intentionally NOT called here.  That
+        // function is a recovery/error-path tool (used by Linux only when
+        // auto-negotiation fails) — calling it during normal init resets the
+        // PHY that the BIOS already initialised, forces link re-negotiation,
+        // and triggers the 3-second link-wait loop, making the boot appear
+        // stuck at 80% on real hardware.
         self.disable_ulp();
-        self.toggle_lanphypc();
 
         // 1. Pre-reset flush for I219
         self.flush_desc_rings();
