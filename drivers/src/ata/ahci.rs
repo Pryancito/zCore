@@ -9,7 +9,7 @@ use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
-use crate::bus::{drivers_dma_alloc, phys_to_virt, virt_to_phys};
+use crate::bus::{drivers_dma_alloc, drivers_timer_now_as_micros, phys_to_virt, virt_to_phys};
 use crate::scheme::{BlockScheme, Scheme};
 use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
@@ -99,11 +99,68 @@ const CMD_TABLE_STRIDE: usize = 256; // 128-aligned, fits CommandTable
 const DMA_PAGES: usize = 3;
 
 // AHCI spec §10.4.2: COMRESET must be asserted for at least 1 ms.
-// On modern x86 hardware each spin_loop() iteration is ~1 ns → 1_000_000 ≈ 1 ms.
-const COMRESET_DELAY_ITER: usize = 1_000_000;
+const COMRESET_US: u64 = 1_000;
 // AHCI spec §10.4.2: device reinitialization after COMRESET must complete within
-// 10 seconds; we give it 1 second worth of spin iterations.
-const PHY_LINK_TIMEOUT_ITER: usize = 1_000_000;
+// 10 seconds; we give it 1 second.
+const PHY_LINK_TIMEOUT_US: u64 = 1_000_000;
+// Timeout for HBA global reset to self-clear (spec: 1 second).
+const HBA_RESET_TIMEOUT_US: u64 = 1_000_000;
+// Timeout for stop_engine: CR and FR must clear within 500 ms (AHCI spec).
+const ENGINE_STOP_TIMEOUT_US: u64 = 500_000;
+// Timeout for exec_cmd: 10 seconds covers slow spinning disks.
+const CMD_TIMEOUT_US: u64 = 10_000_000;
+// Shorter timeout for ATA IDENTIFY during init — 5 seconds is enough.
+const IDENTIFY_TIMEOUT_US: u64 = 5_000_000;
+// Timeout for port TFD-busy before issuing a command: 2 seconds.
+const TFD_TIMEOUT_US: u64 = 2_000_000;
+
+/// Busy-wait for `us` microseconds using the TSC-based driver timer.
+#[inline]
+fn udelay(us: u64) {
+    let t0 = unsafe { drivers_timer_now_as_micros() };
+    // Hard spin guard: prevents infinite loop if TSC-based timer does not advance
+    // (e.g. cpu_frequency() returned a wrong value, or early-boot timer quirk).
+    // At ~1 GHz effective spin rate, 10 M iterations ≈ 10 ms; at 4 GHz ≈ 2.5 ms.
+    // This fires only when the timer is genuinely broken; normally the timer-based
+    // condition exits first.
+    const MAX_SPINS: u64 = 10_000_000;
+    let mut spins = 0u64;
+    while unsafe { drivers_timer_now_as_micros() }.wrapping_sub(t0) < us {
+        spin_loop();
+        spins = spins.wrapping_add(1);
+        if spins >= MAX_SPINS {
+            warn!("[AHCI] udelay fallback hit ({}us requested — timer did not advance)", us);
+            break;
+        }
+    }
+}
+
+/// Busy-wait until `pred()` returns true or `timeout_us` elapses.
+/// Returns true if the condition was met, false on timeout.
+/// Includes a hard spin-count cap so the function always terminates even
+/// if `drivers_timer_now_as_micros()` returns a constant (broken timer).
+#[inline]
+fn wait_until<F: Fn() -> bool>(timeout_us: u64, pred: F) -> bool {
+    let t0 = unsafe { drivers_timer_now_as_micros() };
+    // Maximum iterations: 500 M is ~500 ms at 1 GHz, ~125 ms at 4 GHz.
+    // We scale by the requested timeout to keep proportional coverage.
+    // At worst this adds a 500 ms hard cap per call, which is acceptable
+    // for a boot path but ensures we never hang the system indefinitely.
+    let max_spins: u64 = 500_000_000u64.max(timeout_us.saturating_mul(500));
+    let mut spins = 0u64;
+    loop {
+        if pred() { return true; }
+        spin_loop();
+        spins = spins.wrapping_add(1);
+        if unsafe { drivers_timer_now_as_micros() }.wrapping_sub(t0) >= timeout_us {
+            return false;
+        }
+        if spins >= max_spins {
+            warn!("[AHCI] wait_until fallback: timer stuck, forcing timeout after {} spins", spins);
+            return false;
+        }
+    }
+}
 
 struct AhciPort {
     base: usize,
@@ -129,14 +186,9 @@ impl AhciPort {
         self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) & !CMD_ST);
         self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) & !CMD_FRE);
         // AHCI spec requires CR and FR to clear within 500 ms of clearing ST/FRE.
-        // Iteration-based timeout consistent with the rest of this driver; each
-        // spin_loop() iteration is roughly 1 ns on modern x86 hardware.
-        let mut timeout = 500_000;
-        while self.read_reg(PORT_CMD) & (CMD_CR | CMD_FR) != 0 && timeout > 0 {
-            timeout -= 1;
-            spin_loop();
-        }
-        if timeout == 0 {
+        if !wait_until(ENGINE_STOP_TIMEOUT_US, || {
+            self.read_reg(PORT_CMD) & (CMD_CR | CMD_FR) == 0
+        }) {
             warn!(
                 "[AHCI] Port {} stop_engine timeout (CR/FR stuck)",
                 self.port_idx
@@ -146,13 +198,9 @@ impl AhciPort {
 
     fn start_engine(&self) {
         // AHCI spec: wait for CR to clear before setting FRE and ST.
-        // Iteration-based timeout consistent with the rest of this driver.
-        let mut timeout = 500_000;
-        while self.read_reg(PORT_CMD) & CMD_CR != 0 && timeout > 0 {
-            timeout -= 1;
-            spin_loop();
-        }
-        if timeout == 0 {
+        if !wait_until(ENGINE_STOP_TIMEOUT_US, || {
+            self.read_reg(PORT_CMD) & CMD_CR == 0
+        }) {
             warn!(
                 "[AHCI] Port {} start_engine timeout (CR stuck)",
                 self.port_idx
@@ -191,16 +239,14 @@ impl AhciPort {
             self.read_reg(PORT_CMD) | CMD_POD | CMD_SUD | CMD_FRE,
         );
 
+        // COMRESET: assert DET=1 for at least 1 ms, then release
         self.write_reg(PORT_SCTL, (self.read_reg(PORT_SCTL) & !0xF) | 1);
-        for _ in 0..1_000_000 {
-            spin_loop();
-        }
+        udelay(COMRESET_US);
         self.write_reg(PORT_SCTL, self.read_reg(PORT_SCTL) & !0xF);
 
-        let mut timeout = 1_000_000;
-        while self.read_reg(PORT_SSTS) & 0xF != 3 && timeout > 0 {
-            timeout -= 1;
-            spin_loop();
+        // Wait for PHY to establish link (DET=3), max 1 second
+        if !wait_until(PHY_LINK_TIMEOUT_US, || self.read_reg(PORT_SSTS) & 0xF == 3) {
+            warn!("[AHCI] Port {} init: PHY link timeout", self.port_idx);
         }
 
         self.write_reg(PORT_SERR, 0xFFFF_FFFF);
@@ -211,15 +257,11 @@ impl AhciPort {
         self.stop_engine();
         // COMRESET: set DET=1, wait ≥1 ms (AHCI spec §10.4.2), then clear DET
         self.write_reg(PORT_SCTL, (self.read_reg(PORT_SCTL) & !0xF) | 1);
-        for _ in 0..COMRESET_DELAY_ITER {
-            spin_loop();
-        }
+        udelay(COMRESET_US);
         self.write_reg(PORT_SCTL, self.read_reg(PORT_SCTL) & !0xF);
-        // Wait for PHY to re-establish link (DET=3)
-        let mut timeout = PHY_LINK_TIMEOUT_ITER;
-        while self.read_reg(PORT_SSTS) & 0xF != 3 && timeout > 0 {
-            timeout -= 1;
-            spin_loop();
+        // Wait for PHY to re-establish link (DET=3), max 1 second
+        if !wait_until(PHY_LINK_TIMEOUT_US, || self.read_reg(PORT_SSTS) & 0xF == 3) {
+            warn!("[AHCI] Port {} reset_port: PHY link timeout", self.port_idx);
         }
         self.write_reg(PORT_SERR, 0xFFFF_FFFF);
         self.write_reg(PORT_IS, 0xFFFF_FFFF);
@@ -227,18 +269,16 @@ impl AhciPort {
     }
 
     fn exec_cmd(&self, slot: u32) -> DeviceResult {
+        self.exec_cmd_with_timeout(slot, CMD_TIMEOUT_US)
+    }
+
+    fn exec_cmd_with_timeout(&self, slot: u32, timeout_us: u64) -> DeviceResult {
         fence(Ordering::SeqCst);
         self.write_reg(PORT_IS, 0xFFFF_FFFF);
         self.write_reg(PORT_CI, 1 << slot);
 
-        let mut timeout = 10_000_000;
-        while self.read_reg(PORT_CI) & (1 << slot) != 0 && timeout > 0 {
-            timeout -= 1;
-            spin_loop();
-        }
-
-        if timeout == 0 {
-            error!("[AHCI] Port {} command timeout", self.port_idx);
+        if !wait_until(timeout_us, || self.read_reg(PORT_CI) & (1 << slot) == 0) {
+            error!("[AHCI] Port {} command timeout ({}ms)", self.port_idx, timeout_us / 1000);
             self.reset_port();
             return Err(DeviceError::IoError);
         }
@@ -255,15 +295,10 @@ impl AhciPort {
     fn rw_block(&self, lba: u64, buf_phys: u64, buf_len: usize, write: bool) -> DeviceResult {
         let slot = 0u32;
 
-        // Wait for port to become ready; bound the spin to avoid infinite hangs
-        let mut tfd_timeout = 2_000_000;
-        while self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) != 0
-            && tfd_timeout > 0
-        {
-            tfd_timeout -= 1;
-            spin_loop();
-        }
-        if tfd_timeout == 0 {
+        // Wait for port to become ready (TFD BUSY/DRQ clear), max 2 seconds
+        if !wait_until(TFD_TIMEOUT_US, || {
+            self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
+        }) {
             error!(
                 "[AHCI] Port {} TFD busy timeout before command",
                 self.port_idx
@@ -340,7 +375,7 @@ impl AhciPort {
             (*header).prdbc = 0;
         }
 
-        if self.exec_cmd(slot).is_err() {
+        if self.exec_cmd_with_timeout(slot, IDENTIFY_TIMEOUT_US).is_err() {
             return None;
         }
 
@@ -367,15 +402,15 @@ impl AhciInterface {
         unsafe {
             write_volatile((base + HBA_GHC) as *mut u32, GHC_AE);
             write_volatile((base + HBA_GHC) as *mut u32, GHC_AE | GHC_HR);
-            let mut timeout = 1_000_000;
-            while read_volatile((base + HBA_GHC) as *const u32) & GHC_HR != 0 && timeout > 0 {
-                timeout -= 1;
-                spin_loop();
+            // Wait for HBA Global Reset to self-clear (spec: ≤1 second)
+            if !wait_until(HBA_RESET_TIMEOUT_US, || {
+                read_volatile((base + HBA_GHC) as *const u32) & GHC_HR == 0
+            }) {
+                warn!("[AHCI] HBA reset timeout — hardware may not be functional");
             }
             write_volatile((base + HBA_GHC) as *mut u32, GHC_AE);
-            for _ in 0..1_000_000 {
-                spin_loop();
-            }
+            // AHCI spec §10.1.2: minimum 1 ms after GHC.HR before touching registers.
+            udelay(1_000);
         }
 
         let pi = unsafe { read_volatile((base + HBA_PI) as *const u32) };
@@ -397,17 +432,23 @@ impl AhciInterface {
                     ct_virt: dma_vaddr + 4096,
                 };
 
+                // Skip COMRESET/link waits on ports with no device (DET=0).
+                if port.read_reg(PORT_SSTS) & 0xF == 0 {
+                    continue;
+                }
+
                 port.init();
 
+                // Wait up to 1 second for PORT_SIG to become valid
+                // (10ms × 100 = 1 s). Use TSC-based udelay to avoid
+                // non-deterministic spin counts on different CPUs.
                 let mut sig = 0;
                 for _ in 0..100 {
                     sig = port.read_reg(PORT_SIG);
                     if sig != 0 && sig != 0xFFFF_FFFF {
                         break;
                     }
-                    for _ in 0..100_000 {
-                        spin_loop();
-                    }
+                    udelay(10_000); // 10 ms between polls
                 }
 
                 if sig == HBA_SIG_ATA {

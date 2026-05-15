@@ -11,6 +11,7 @@ use alloc::sync::Arc;
 use lock::Mutex;
 
 // --- Registers and Constants (aligned with Nova / open-gpu-kernel-modules) ---
+#[allow(dead_code)]
 mod regs {
     pub const NV_PMC_BOOT_0: u32 = 0x0000_0000;
     pub const PMC_BOOT0_CHIP_ID_SHIFT: u32 = 20;
@@ -193,36 +194,15 @@ impl NvidiaGpu {
         default_width: u32,
         default_height: u32,
     ) -> DeviceResult<Self> {
-        // 1. Identify Architecture
-        let boot0 = unsafe {
-            core::ptr::read_volatile((bar0 + regs::NV_PMC_BOOT_0 as usize) as *const u32)
-        };
-        let arch = arch_from_pmc_boot0(boot0);
+        // Boot path: identify from PCI ID only. BAR0 MMIO reads during early
+        // driver init can stall the CPU indefinitely on some firmware/GPU combos
+        // (screen frozen at 80%). PMC/VRAM/resolution probes are deferred.
+        let (arch, gpu_model, vram_size_mb) = identify_gpu(device_id);
 
-        // 2. Identify Model using PCI ID + architecture cross-check
-        let (pci_arch, gpu_model, _vram_mb_pci) = identify_gpu(device_id);
-        let arch = if arch == NvidiaArchitecture::Unknown {
-            pci_arch
-        } else {
-            arch
-        };
-
-        // 3. Read VRAM Size
-        let vram_size_mb = unsafe {
-            core::ptr::read_volatile((bar0 + regs::NV_PFB_CSTATUS as usize) as *const u32)
-        } & regs::NV_PFB_CSTATUS_MEM_SIZE_MASK;
-
-        // 4. Resolution probing and inheritance
         let mut w = default_width;
         let mut h = default_height;
         let mut pitch_override = None;
         let final_fb_vaddr = fb_vaddr;
-
-        // Try legacy probe first
-        if let Some((pw, ph)) = unsafe { probe_resolution_from_bar0(bar0) } {
-            w = pw;
-            h = ph;
-        }
 
         // Check if this GPU matches the boot framebuffer (UEFI GOP)
         if let Some(boot_info) = *BOOT_FB_INFO.lock() {
@@ -388,6 +368,7 @@ impl NvidiaGpu {
     }
 }
 
+#[allow(dead_code)] // used when deferred BAR0 MMIO probe is enabled
 fn arch_from_pmc_boot0(boot0: u32) -> NvidiaArchitecture {
     let chip_id = (boot0 >> regs::PMC_BOOT0_CHIP_ID_SHIFT) & regs::PMC_BOOT0_CHIP_ID_MASK;
     if chip_id >= regs::PMC_BOOT0_CHIPID_BLACKWELL_MIN {
@@ -426,6 +407,7 @@ fn read_temperature(bar0: usize) -> Option<i32> {
     }
 }
 
+#[allow(dead_code)]
 unsafe fn probe_resolution_from_bar0(bar0: usize) -> Option<(u32, u32)> {
     let reg =
         core::ptr::read_volatile((bar0 + regs::NV50_HEAD0_RASTER_SIZE as usize) as *const u32);
@@ -665,7 +647,7 @@ impl PciDriver for NvidiaGpuDriverPci {
     }
 
     fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, _irq: Option<usize>) -> DeviceResult<Device> {
-        use crate::bus::pci::{read_bar_addr, probe_bar_size, PortOpsImpl, PCI_ACCESS};
+        use crate::bus::pci::{read_bar_addr, PortOpsImpl, PCI_ACCESS};
         use crate::bus::phys_to_virt;
         use crate::bus::PAGE_SIZE;
         const BAR0: u16 = 0x10;
@@ -705,16 +687,10 @@ impl PciDriver for NvidiaGpuDriverPci {
                 if addr == 0 {
                     return None;
                 }
+                // Do not probe BAR size at boot (writes 0xFFFFFFFF to BAR registers);
+                // on some GPUs that wedges config space and hangs the machine.
                 let actual_len: u64 = if len == 0 {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let bar_reg = BAR0 + (i as u16 * 4);
-                        let ops = &PortOpsImpl;
-                        let sz = unsafe { probe_bar_size(ops, PCI_ACCESS, dev.loc, bar_reg) };
-                        if sz == 0 { 256 * 1024 * 1024 } else { sz }
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    { 256 * 1024 * 1024 }
+                    256 * 1024 * 1024
                 } else {
                     len as u64
                 };

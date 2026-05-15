@@ -53,7 +53,13 @@ impl Apic {
     }
 
     pub fn init_local_apic_ap() {
-        unsafe { LocalApic::init_ap() }
+        if LocalApic::is_initialized() {
+            unsafe { LocalApic::init_ap() }
+        }
+    }
+
+    pub fn local_apic_ready() -> bool {
+        LocalApic::is_initialized()
     }
 
     pub fn local_apic<'a>() -> &'a mut LocalApic {
@@ -79,7 +85,9 @@ impl Scheme for Apic {
     }
 
     fn handle_irq(&self, vector: usize) {
-        Self::local_apic().eoi();
+        if LocalApic::is_initialized() {
+            Self::local_apic().eoi();
+        }
         let res = if vector >= X86_INT_LOCAL_APIC_BASE {
             let handler = self.manager_lapic.lock();
             handler.handle(vector - X86_INT_LOCAL_APIC_BASE)
@@ -195,7 +203,9 @@ impl IrqScheme for Apic {
     }
 
     fn apic_timer_enable(&self) {
-        // SAFETY: this will called only once for every core
-        Apic::local_apic().enable_timer();
+        if LocalApic::is_initialized() {
+            // SAFETY: this will called only once for every core
+            Apic::local_apic().enable_timer();
+        }
     }
 }

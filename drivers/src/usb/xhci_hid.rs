@@ -33,9 +33,9 @@ fn timer_now_us() -> u64 {
 
 #[inline(always)]
 fn xhci_wait_spin_limit(timeout_us: u64) -> u64 {
-    timeout_us
-        .saturating_mul(XHCI_WAIT_SPIN_FACTOR)
-        .max(XHCI_WAIT_SPIN_FACTOR)
+    // Cap spin iterations so a stuck TSC timer cannot block boot for minutes.
+    // (Previously timeout_us * 50_000 allowed billions of iterations at 80%.)
+    500_000_000u64.max(timeout_us.saturating_mul(500))
 }
 
 #[inline(always)]
@@ -299,9 +299,7 @@ impl XhciMmio {
 
                     let start = timer_now_us();
                     let mut spins = 0u64;
-                    let max_spins = 500_000_u64
-                        .saturating_mul(XHCI_WAIT_SPIN_FACTOR)
-                        .max(XHCI_WAIT_SPIN_FACTOR);
+                    let max_spins = xhci_wait_spin_limit(500_000);
                     while (self.read_cap(cap_ptr) & (1 << 16)) != 0
                         && (timer_now_us() - start) < 500_000
                         && spins < max_spins
@@ -761,6 +759,8 @@ pub struct XhciInner {
     pub fb_height: u32,
     /// Cambios de puerto diferidos para evitar re-entrada recursiva en pop_ev.
     pending_port_changes: Vec<u8>,
+    /// HID enumeration deferred from PCI probe so boot can pass 80% quickly.
+    boot_enum_pending: bool,
 }
 
 struct HidDev {
@@ -808,6 +808,7 @@ impl XhciInner {
             fb_width: 1024,
             fb_height: 768,
             pending_port_changes: Vec::new(),
+            boot_enum_pending: true,
         })
     }
 
@@ -2233,6 +2234,11 @@ pub fn poll() {
     if let Some(d) = &*inst {
         let mut g = d.inner.lock();
         if let Some(xi) = &mut *g {
+            if xi.boot_enum_pending {
+                xi.boot_enum_pending = false;
+                info!("[xhci] deferred boot enumeration starting");
+                xi.enumerate_root_hid();
+            }
             static mut POLL_COUNT: u64 = 0;
             unsafe {
                 POLL_COUNT += 1;
@@ -2268,7 +2274,7 @@ impl XhciUsbHid {
         let max_ports = ((hcsp >> 24) & 0xff) as u8;
         let mut inner = XhciInner::new(mmio, max_slots, max_ports, msi_vector)?;
         inner.reset_and_run()?;
-        inner.enumerate_root_hid();
+        // HID enumeration is deferred to the first poll() so PCI probe stays fast at 80%.
         let arc = Arc::new(Self {
             listener: EventListener::new(),
             inner: Mutex::new(Some(inner)),

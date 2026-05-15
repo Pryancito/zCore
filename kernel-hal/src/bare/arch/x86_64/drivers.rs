@@ -16,8 +16,17 @@ pub(super) fn init_early() -> DeviceResult {
     Ok(())
 }
 
+fn boot_progress(p: u32) {
+    #[cfg(feature = "graphic")]
+    crate::console::early_progress_bar(p);
+    #[cfg(not(feature = "graphic"))]
+    let _ = p;
+}
+
 pub(super) fn init() -> DeviceResult {
+    boot_progress(81);
     zcore_drivers::init();
+    boot_progress(82);
     Apic::init_local_apic_bsp(crate::mem::phys_to_virt);
     let irq = Arc::new(Apic::new(
         super::special::pc_firmware_tables().0 as usize,
@@ -38,13 +47,18 @@ pub(super) fn init() -> DeviceResult {
 
     irq.register_local_apic_handler(trap::X86_INT_APIC_TIMER, Box::new(super::trap::super_timer))?;
 
-    // SAFETY: this will be called once and only once for every core
-    Apic::local_apic().set_timer_mode(TimerMode::Periodic);
-    Apic::local_apic().set_timer_divide(TimerDivide::Div256); // indeed it is Div1, the name is confusing.
-    let cycles =
-        super::cpu::cpu_frequency() as u64 * 1_000_000 / super::super::timer::TICKS_PER_SEC;
-    Apic::local_apic().set_timer_initial(cycles as u32);
-    Apic::local_apic().disable_timer();
+    if Apic::local_apic_ready() {
+        // SAFETY: called once on BSP during primary_init
+        let lapic = Apic::local_apic();
+        lapic.set_timer_mode(TimerMode::Periodic);
+        lapic.set_timer_divide(TimerDivide::Div256); // indeed it is Div1, the name is confusing.
+        let cycles =
+            super::cpu::cpu_frequency() as u64 * 1_000_000 / super::super::timer::TICKS_PER_SEC;
+        lapic.set_timer_initial(cycles as u32);
+        lapic.disable_timer();
+    } else {
+        warn!("[drivers] LAPIC unavailable — APIC timer left disabled");
+    }
 
     #[cfg(all(not(feature = "no-pci"), feature = "xhci-usb-hid"))]
     {
@@ -54,6 +68,7 @@ pub(super) fn init() -> DeviceResult {
     }
 
     drivers::add_device(Device::Irq(irq.clone()));
+    boot_progress(83);
 
     #[cfg(not(feature = "no-pci"))]
     {
@@ -109,7 +124,9 @@ pub(super) fn init() -> DeviceResult {
             );
         }
 
+        boot_progress(84);
         let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;
+        boot_progress(87);
         for d in pci_devs.into_iter() {
             drivers::add_device(d);
         }
@@ -129,6 +146,8 @@ pub(super) fn init() -> DeviceResult {
         }
     }
 
+    boot_progress(88);
+
     #[cfg(feature = "graphic")]
     {
         // If display was already created in init_early(), just hook up the graphic console.
@@ -138,11 +157,8 @@ pub(super) fn init() -> DeviceResult {
             // VirtIO GPU (and similar) needs an explicit flush to push framebuffer
             // contents to the screen.  Spawn a periodic flush task matching
             // what the RISC-V init already does.
-            if display.need_flush() {
-                crate::thread::spawn(crate::common::future::DisplayFlushFuture::new(
-                    display, 30,
-                ));
-            }
+            // DisplayFlushFuture is spawned after timer_init (post-90%) elsewhere.
+            let _ = display.need_flush();
         } else {
             use crate::KCONFIG;
             use zcore_drivers::display::UefiDisplay;
@@ -150,16 +166,24 @@ pub(super) fn init() -> DeviceResult {
 
             let (width, height) = KCONFIG.fb_mode.resolution();
             let stride = KCONFIG.fb_mode.stride();
-            let display = Arc::new(UefiDisplay::new(DisplayInfo {
-                width: width as _,
-                height: height as _,
-                pitch: (stride * 4) as u32,
-                format: ColorFormat::ARGB8888, // uefi::proto::console::gop::PixelFormat::Bgr
-                fb_base_vaddr: crate::mem::phys_to_virt(KCONFIG.fb_addr as usize),
-                fb_size: KCONFIG.fb_size as usize,
-            }));
-            crate::drivers::add_device(Device::Display(display.clone()));
-            crate::console::init_graphic_console(display.clone());
+            // Guard: if the bootloader did not provide a framebuffer address, skip
+            // display init entirely rather than mapping phys 0 into the kernel's
+            // virtual address space, which would alias kernel code/data.
+            if KCONFIG.fb_addr == 0 || width == 0 || height == 0 {
+                warn!("[drivers] No framebuffer from bootloader (fb_addr={:#x}, {}x{}) — skipping graphic console",
+                    KCONFIG.fb_addr, width, height);
+            } else {
+                let display = Arc::new(UefiDisplay::new(DisplayInfo {
+                    width: width as _,
+                    height: height as _,
+                    pitch: (stride * 4) as u32,
+                    format: ColorFormat::ARGB8888,
+                    fb_base_vaddr: crate::mem::phys_to_virt(KCONFIG.fb_addr as usize),
+                    fb_size: KCONFIG.fb_size as usize,
+                }));
+                crate::drivers::add_device(Device::Display(display.clone()));
+                crate::console::init_graphic_console(display.clone());
+            }
         }
     }
 

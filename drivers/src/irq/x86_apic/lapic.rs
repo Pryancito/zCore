@@ -12,6 +12,10 @@ pub struct LocalApic {
 }
 
 impl LocalApic {
+    pub fn is_initialized() -> bool {
+        unsafe { (*core::ptr::addr_of!(LOCAL_APIC)).is_some() }
+    }
+
     pub unsafe fn get<'a>() -> &'a mut LocalApic {
         (*core::ptr::addr_of_mut!(LOCAL_APIC))
             .as_mut()
@@ -20,16 +24,28 @@ impl LocalApic {
 
     pub unsafe fn init_bsp(phys_to_virt: Phys2VirtFn) {
         let base_vaddr = phys_to_virt(xapic_base() as usize);
-        let mut inner = LocalApicBuilder::new()
+        let mut inner = match LocalApicBuilder::new()
             .timer_vector(consts::X86_INT_APIC_TIMER)
             .error_vector(consts::X86_INT_APIC_ERROR)
             .spurious_vector(consts::X86_INT_APIC_SPURIOUS)
             .set_xapic_base(base_vaddr as u64)
             .build()
-            .unwrap_or_else(|err| panic!("{}", err));
+        {
+            Ok(lapic) => lapic,
+            Err(e) => {
+                // A LAPIC build failure is a critical issue but not necessarily
+                // a hard stop on all hardware — log it and attempt to continue
+                // rather than panicking and leaving the screen frozen at 80%.
+                log::error!("[lapic] LocalApicBuilder::build() failed: {} — continuing without LAPIC", e);
+                return;
+            }
+        };
         inner.enable();
 
-        assert!(inner.is_bsp());
+        if !inner.is_bsp() {
+            log::warn!("[lapic] init_bsp() called on non-BSP core (id={:#x}); APIC routing may be incorrect",
+                inner.id());
+        }
         BSP_ID = Some((inner.id() >> 24) as u8);
         LOCAL_APIC = Some(LocalApic { inner });
     }
@@ -39,7 +55,7 @@ impl LocalApic {
     }
 
     pub fn bsp_id() -> u8 {
-        unsafe { BSP_ID.unwrap() }
+        unsafe { BSP_ID.unwrap_or(0) }
     }
 
     pub fn id(&mut self) -> u8 {

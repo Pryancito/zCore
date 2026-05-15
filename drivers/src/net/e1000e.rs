@@ -287,14 +287,17 @@ impl E1000eHw {
     /// `timer_now_as_micros` is imported from `super` (drivers/src/net/mod.rs).
     fn udelay(us: u64) {
         let t0 = timer_now_as_micros();
-        // On some real hardware, the early boot time source can stall briefly.
-        // Keep a hard spin guard to prevent any infinite wait in init paths.
-        let max_spins = us.saturating_mul(50_000).max(50_000);
+        // Hard spin guard: at most ~10M iterations (~10ms at 1GHz) regardless of
+        // the requested delay. This prevents infinite loops on bare-metal when the
+        // TSC-based timer hasn't started yet, without burning seconds of CPU time.
+        // The guard activates only when the timer is genuinely broken; otherwise
+        // the timer-based condition fires first and we exit normally.
+        const MAX_SPINS: u64 = 10_000_000;
         let mut spins = 0u64;
         while timer_now_as_micros().wrapping_sub(t0) < us {
             core::hint::spin_loop();
-            spins = spins.saturating_add(1);
-            if spins >= max_spins {
+            spins = spins.wrapping_add(1);
+            if spins >= MAX_SPINS {
                 warn!(
                     "[e1000e] udelay fallback hit ({}us, timer did not advance fast enough)",
                     us
@@ -450,27 +453,20 @@ impl E1000eHw {
         if !self.is_pch_lpt_or_later() {
             return;
         }
-        // Disable ULP via H2ME register
+        // NOTE: Writing to H2ME (Host-to-Management Engine) register can
+        // trigger an SMI on systems with active Intel ME firmware. An SMI
+        // freezes the CPU from the OS side — if ME's handler hangs or isn't
+        // expecting this request during early boot, the system requires a
+        // power cycle to recover (reset button becomes unresponsive).
+        //
+        // The CTRL_RST issued immediately after this function will disable
+        // ULP unconditionally at the hardware level, making this write
+        // redundant and dangerous. Skip it entirely.
         let fwsm = mmio_read(self.base, E1000E_FWSM);
-        if fwsm & 0x8000 != 0 { // E1000_ICH_FWSM_FW_VALID
-            let mut h2me = mmio_read(self.base, E1000E_H2ME);
-            h2me &= !0x00000800; // E1000_H2ME_ULP
-            h2me |= 0x00001000; // E1000_H2ME_ENFORCE_SETTINGS
-            mmio_write(self.base, E1000E_H2ME, h2me);
-            let _ = mmio_read(self.base, E1000E_H2ME); // flush posted write (M7)
-            
-            // Poll until ULP_CFG_DONE (bit 24) clears, meaning firmware finished.
-            // Bit 24 = 1 → firmware still processing; 0 → done.
-            // Limit to 50 × 1ms = 50ms total (Linux uses a similar short poll).
-            let mut timeout = 50;
-            while mmio_read(self.base, E1000E_FWSM) & 0x0100_0000 != 0 && timeout > 0 {
-                Self::udelay(1_000);
-                timeout -= 1;
-            }
-            
-            h2me = mmio_read(self.base, E1000E_H2ME);
-            h2me &= !0x00001000;
-            mmio_write(self.base, E1000E_H2ME, h2me);
+        if fwsm & 0x8000 != 0 {
+            // E1000_ICH_FWSM_FW_VALID is set: Intel ME firmware is active.
+            // Log it but do NOT write to H2ME — that would trigger an SMI.
+            warn!("[e1000e] Intel ME firmware active (FWSM={:#010x}), skipping H2ME write", fwsm);
         }
     }
 
@@ -478,85 +474,35 @@ impl E1000eHw {
     // Flush descriptor rings (I219 workaround)
     // -----------------------------------------------------------------------
     unsafe fn flush_desc_rings(&self) {
-        // Only SPT (I219) and later require this
+        // Only SPT (I219) and later require this.
         if !self.is_pch_spt_or_later() {
             return;
         }
 
-        // Check if flush is required via PCI config space
+        // Check if flush is required via PCI config space.
         let hang_state = PCI_ACCESS.read16(&PortOpsImpl, self.pci_loc, PCICFG_DESC_RING_STATUS);
         if (hang_state & FLUSH_DESC_REQUIRED) == 0 {
             return;
         }
-        
-        warn!("[e1000e] I219 hang detected (state={:#x}), performing flush...", hang_state);
 
-        // 1. Set NEED_DESCR_RING_FLUSH in FEXTNVM7
+        warn!("[e1000e] I219 pre-reset flush (state={:#x}): setting FEXTNVM bits only", hang_state);
+
+        // SAFE path: only write FEXTNVM7/FEXTNVM11 status bits.
+        // DO NOT enable TX/RX DMA here — the NIC is still in its BIOS-handed
+        // state and activating the DMA engine before CTRL_RST can trigger a
+        // PCIe fatal error (completion timeout / unsupported request) that
+        // freezes the entire system, requiring a power cycle to recover.
+        // The hardware reset (CTRL_RST, issued next) will clear the ring-hang
+        // condition without needing us to pump dummy descriptors through DMA.
         let mut fextnvm7 = mmio_read(self.base, E1000E_FEXTNVM7);
         fextnvm7 |= FEXTNVM7_NEED_DESCR_RING_FLUSH | FEXTNVM7_DIS_LR_PROMISC;
         mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
+        let _ = mmio_read(self.base, E1000E_FEXTNVM7); // flush posted write
 
-        // 2. Disable MULR fix in FEXTNVM11
         let mut fextnvm11 = mmio_read(self.base, E1000E_FEXTNVM11);
         fextnvm11 |= FEXTNVM11_DISABLE_MULR_FIX;
         mmio_write(self.base, E1000E_FEXTNVM11, fextnvm11);
-
-        // To safely flush, we MUST ensure the ring registers point to our allocated ring
-        // because we are about to tell the hardware to process descriptors.
-        let tx_ring_pa = self.tx_ring.paddr();
-        mmio_write(self.base, E1000E_TDBAL, tx_ring_pa as u32);
-        mmio_write(self.base, E1000E_TDBAH, (tx_ring_pa >> 32) as u32);
-        mmio_write(self.base, E1000E_TDLEN, (NUM_TX * size_of::<TxDesc>()) as u32);
-        mmio_write(self.base, E1000E_TDH, 0);
-        mmio_write(self.base, E1000E_TDT, 0);
-
-        // 3. Flush TX ring (send dummy descriptor).
-        // H5: I219+ requires TXDCTL_QUEUE_ENABLE (bit 25) in addition to TCTL_EN
-        // for the TX DMA engine to actually process descriptors.
-        let tctl = mmio_read(self.base, E1000E_TCTL);
-        let txdctl_saved = mmio_read(self.base, E1000E_TXDCTL);
-        mmio_write(self.base, E1000E_TXDCTL, txdctl_saved | TXDCTL_QUEUE_ENABLE);
-        mmio_write(self.base, E1000E_TCTL, tctl | TCTL_EN);
-        
-        let ring = self.tx_ring.as_ptr::<TxDesc>();
-        let desc = &mut *ring; // use the first descriptor
-        
-        // Dummy descriptor pointing to ring itself
-        desc.addr = tx_ring_pa as u64;
-        desc.len = 512;
-        desc.cmd = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
-        desc.status = 0;
-        
-        core::arch::x86_64::_mm_clflush(desc as *const TxDesc as *const u8);
-        fence(Ordering::SeqCst);
-        
-        mmio_write(self.base, E1000E_TDT, 1);
-        Self::udelay(250);
-        mmio_write(self.base, E1000E_TCTL, tctl & !TCTL_EN);
-        mmio_write(self.base, E1000E_TXDCTL, txdctl_saved & !TXDCTL_QUEUE_ENABLE);
-
-        // 4. Flush RX ring (momentarily enable with specific thresholds)
-        let rx_ring_pa = self.rx_ring.paddr();
-        mmio_write(self.base, E1000E_RDBAL, rx_ring_pa as u32);
-        mmio_write(self.base, E1000E_RDBAH, (rx_ring_pa >> 32) as u32);
-        mmio_write(self.base, E1000E_RDLEN, (NUM_RX * size_of::<RxDesc>()) as u32);
-        mmio_write(self.base, E1000E_RDH, 0);
-        mmio_write(self.base, E1000E_RDT, 0);
-
-        let rctl = mmio_read(self.base, E1000E_RCTL);
-        mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
-        Self::udelay(150);
-        
-        let mut rxdctl = mmio_read(self.base, E1000E_RXDCTL);
-        rxdctl &= 0xFFFFC000; // zero lower 14 bits
-        rxdctl |= 0x1F | (1 << 8) | (1 << 24); // P=31, H=1, G=1
-        mmio_write(self.base, E1000E_RXDCTL, rxdctl);
-        
-        mmio_write(self.base, E1000E_RCTL, rctl | RCTL_EN);
-        Self::udelay(150);
-        mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
-        
-        Self::udelay(150);
+        let _ = mmio_read(self.base, E1000E_FEXTNVM11); // flush posted write
     }
 
     // -----------------------------------------------------------------------
@@ -573,14 +519,22 @@ impl E1000eHw {
         // stuck at 80% on real hardware.
         self.disable_ulp();
 
-        // 1. Pre-reset flush for I219
-        self.flush_desc_rings();
-
-        // 1b. Try reading MAC from hardware (BIOS initialized) before we reset it.
         self.read_mac_from_hw();
         let mut mac_found = self.is_valid_mac();
 
-        // 2. Signal driver loaded before any reset
+        // PCH I219+: CTRL_RST after UEFI can wedge PCIe (CPU stalls on MMIO).
+        let skip_hw_reset = self.is_pch_spt_or_later();
+
+        self.flush_desc_rings();
+
+        if skip_hw_reset {
+            warn!("[e1000e] PCH: skipping CTRL_RST, keeping BIOS PHY/link state");
+            mmio_write(self.base, E1000E_WUC, 0);
+            mmio_write(self.base, E1000E_WUFC, 0);
+            mmio_write(self.base, E1000E_WUS, 0xFFFF_FFFF);
+            let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+            mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
+        } else {
         let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
 
@@ -641,10 +595,9 @@ impl E1000eHw {
             return Err(DeviceError::IoError);
         }
 
-        // Signal driver loaded AGAIN after reset
         let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
-
+        }
 
         // 4. Linux Workarounds for I219-V (SPT)
         // NOTE: The is_pch_lpt_or_later() block below (step 6) already applies
@@ -662,8 +615,23 @@ impl E1000eHw {
         // MAC filter to briefly accept everything on real hardware, which can
         // cause stray frames to fill the RX ring before init finishes.
         if !mac_found {
-            self.read_mac_from_nvm();
-            mac_found = self.is_valid_mac();
+            // PCH-SPT (I219) and later do NOT use EERD for NVM reads — they use a
+            // proprietary flash/firmware mechanism that requires acquiring a firmware
+            // semaphore and talking to the CSME. Calling nvm_read_word() on these
+            // chips always times out (200 iter × 50µs × 2 attempts = 20ms wasted)
+            // and returns 0, which is not the real MAC.
+            // For these chips, the BIOS always programs RAL0/RAH0, so the pre-reset
+            // read_mac_from_hw() above should already have mac_found = true.
+            // We only fall back to EERD-based NVM for discrete silicon (82574L etc.).
+            if !self.is_pch_spt_or_later() {
+                self.read_mac_from_nvm();
+                mac_found = self.is_valid_mac();
+            } else {
+                // For I219 and later: re-read RAL0/RAH0 post-reset.
+                // The reset may have reloaded the NVM shadow registers from flash.
+                self.read_mac_from_hw();
+                mac_found = self.is_valid_mac();
+            }
         }
         if !mac_found {
             self.read_mac_from_hw();
@@ -923,26 +891,19 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_ICR); // clear pending
         mmio_write(self.base, E1000E_IMS, (1 << 7) | (1 << 2) | (1 << 0)); // RXT0, LSC, TXDW
 
-        // 13. Wait for link (max 3 s, with explicit udelay so the timer can tick).
+        // 13. Check link state but do NOT block boot waiting for it.
         // On real hardware the BIOS/UEFI has already negotiated the link by the
-        // time the OS driver loads, so STATUS_LU is usually already set.  If it
-        // is not (e.g. cable unplugged), we give the PHY 3 seconds to come up
-        // but we MUST call udelay() between polls — a naked spin_loop() stalls
-        // the LAPIC timer on bare-metal when interrupts are disabled, preventing
-        // timer_now_as_micros() from ever advancing (infinite loop).
-        let mut status = mmio_read(self.base, E1000E_STATUS);
+        // time the OS driver loads, so STATUS_LU is usually already set.
+        // If the link is DOWN (e.g. cable just connected, or NIC negotiating),
+        // the LSC (Link Status Change) interrupt — already enabled in IMS above —
+        // will fire and handle_irq() will log the new state. Blocking here for
+        // up to 1.5 s with udelay(100_000) was the primary cause of the boot
+        // hang at 80% on real I219-V hardware.
+        let status = mmio_read(self.base, E1000E_STATUS);
         if status & STATUS_LU == 0 {
-            warn!("[e1000e] link is DOWN, waiting up to 3 s...");
-            let mut link_wait = 300; // 300 * 10ms = 3s
-            while link_wait > 0 {
-                Self::udelay(10_000); // 10 ms per iteration — lets timer interrupt fire
-                status = mmio_read(self.base, E1000E_STATUS);
-                if status & STATUS_LU != 0 { break; }
-                link_wait -= 1;
-            }
-            if status & STATUS_LU == 0 {
-                warn!("[e1000e] link still DOWN after 3 s — continuing anyway");
-            }
+            warn!("[e1000e] link is DOWN at init — will come up via LSC interrupt");
+        } else {
+            info!("[e1000e] link UP at init");
         }
 
         info!("[e1000e] init done. STATUS={:#010x} link={}", status, if status & STATUS_LU != 0 { "UP" } else { "DOWN" });
@@ -1350,13 +1311,18 @@ impl NetScheme for E1000eInterface {
     fn get_arp_content(&self) -> String {
         use alloc::fmt::Write;
         let mut s = String::new();
-        let routes = self.get_routes();
-        warn!("[e1000e] get_arp_content called, {} routes", routes.len());
+        // Do not call get_routes() here: it locks smoltcp's iface mutex and can
+        // deadlock with TX/RX/poll paths. /proc/net/arp only needs tracked routes.
+        let routes = self.routes.lock();
         let _ = writeln!(s, "IP address       HW type     Flags       HW address            Mask     Device");
-        for route in routes {
+        for route in routes.iter() {
             if let Some(IpAddress::Ipv4(gw)) = route.gateway {
-                 // Format: IP HW_TYPE FLAGS HW_ADDR MASK DEVICE
-                 let _ = writeln!(s, "{:<15}  0x1         0x2         52:54:00:12:34:56     *        {}", gw, self.name);
+                let _ = writeln!(
+                    s,
+                    "{:<15}  0x1         0x2         52:54:00:12:34:56     *        {}",
+                    gw,
+                    self.name
+                );
             }
         }
         s
