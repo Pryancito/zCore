@@ -29,6 +29,7 @@ const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
 
 #[allow(dead_code)]
 const PCI_CAP_ID_MSI: u8 = 0x05;
+const PCI_MAX_CAP_TRAVERSAL: usize = 64;
 
 pub struct PortOpsImpl;
 
@@ -210,7 +211,32 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     let mut msi_found = false;
     let mut cap_ptr = am.read8(ops, loc, PCI_CAP_PTR) as u16;
     let mut assigned_irq = None;
+    let mut cap_steps = 0usize;
+    let mut prev_cap_ptr = 0u16;
     while cap_ptr > 0 {
+        if cap_steps >= PCI_MAX_CAP_TRAVERSAL {
+            warn!(
+                "PCI capability chain too long or cyclic at {:?}, aborting traversal",
+                loc
+            );
+            break;
+        }
+        if cap_ptr == prev_cap_ptr {
+            warn!(
+                "PCI capability chain stuck at {:#x} for {:?}, aborting traversal",
+                cap_ptr, loc
+            );
+            break;
+        }
+        if cap_ptr < 0x40 {
+            warn!(
+                "PCI capability pointer out of spec ({:#x}) for {:?}, aborting traversal",
+                cap_ptr, loc
+            );
+            break;
+        }
+
+        cap_steps = cap_steps.saturating_add(1);
         let cap_id = am.read8(ops, loc, cap_ptr);
         if cap_id == PCI_CAP_ID_MSI {
             let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
@@ -240,6 +266,7 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
             msi_found = true;
         }
         debug!("PCI device has cap id {} at {:#X}", cap_id, cap_ptr);
+        prev_cap_ptr = cap_ptr;
         cap_ptr = am.read8(ops, loc, cap_ptr + 1) as u16;
     }
 

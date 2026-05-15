@@ -31,6 +31,28 @@ fn timer_now_us() -> u64 {
     unsafe { drivers_timer_now_as_micros() }
 }
 
+#[inline(always)]
+fn xhci_wait_spin_limit(timeout_us: u64) -> u64 {
+    timeout_us
+        .saturating_mul(XHCI_WAIT_SPIN_FACTOR)
+        .max(XHCI_WAIT_SPIN_FACTOR)
+}
+
+#[inline(always)]
+fn xhci_wait_expired(start: u64, timeout_us: u64, spins: u64) -> bool {
+    timer_now_us().wrapping_sub(start) >= timeout_us || spins >= xhci_wait_spin_limit(timeout_us)
+}
+
+#[inline(always)]
+fn xhci_spin_delay_us(delay_us: u64) {
+    let start = timer_now_us();
+    let mut spins = 0u64;
+    while !xhci_wait_expired(start, delay_us, spins) {
+        spins = spins.saturating_add(1);
+        spin_loop();
+    }
+}
+
 // PORTSC bits RW1C (port change). Hay que mantenerlos a 0 salvo cuando queramos limpiarlos.
 const PORTSC_CHANGE_BITS: u32 =
     (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
@@ -39,6 +61,8 @@ const PORTSC_CHANGE_BITS: u32 =
 // PED (bit 1) es RW1C: escribir 1 deshabilita el puerto. Siempre hay que enmascararlo
 // cuando modificamos PORTSC para no tirar accidentalmente la habilitación del puerto.
 const PORTSC_RW1C_AND_RO_MASK: u32 = PORTSC_CHANGE_BITS | (1 << 1); // incluye PED
+const XHCI_MAX_XECP_TRAVERSAL: usize = 256;
+const XHCI_WAIT_SPIN_FACTOR: u64 = 50_000;
 
 // ——— USB legacy (EHCI/OHCI/UHCI) ———
 //
@@ -256,7 +280,13 @@ impl XhciMmio {
             return;
         }
         let mut cap_ptr = xecp << 2;
+        let mut cap_steps = 0usize;
         while cap_ptr != 0 && cap_ptr < self.bar_size {
+            if cap_steps >= XHCI_MAX_XECP_TRAVERSAL {
+                warn!("[xhci] xECP chain demasiado larga/cíclica, abortando handoff");
+                break;
+            }
+            cap_steps = cap_steps.saturating_add(1);
             let cap_val = self.read_cap(cap_ptr);
             let cap_id = (cap_val & 0xff) as u8;
             if cap_id == 1 {
@@ -268,10 +298,19 @@ impl XhciMmio {
                     self.write_cap(cap_ptr, legsup);
 
                     let start = timer_now_us();
+                    let mut spins = 0u64;
+                    let max_spins = 500_000_u64
+                        .saturating_mul(XHCI_WAIT_SPIN_FACTOR)
+                        .max(XHCI_WAIT_SPIN_FACTOR);
                     while (self.read_cap(cap_ptr) & (1 << 16)) != 0
                         && (timer_now_us() - start) < 500_000
+                        && spins < max_spins
                     {
+                        spins = spins.saturating_add(1);
                         spin_loop();
+                    }
+                    if spins >= max_spins {
+                        warn!("[xhci] handoff alcanzó guard de spins (timer estancado?)");
                     }
 
                     if (self.read_cap(cap_ptr) & (1 << 16)) != 0 {
@@ -892,8 +931,10 @@ impl XhciInner {
     }
 
     fn wait_cmd_phys(&mut self, cmd_trb_phys: u64) -> DeviceResult<()> {
+        let timeout_us = 5_000_000;
         let start = timer_now_us();
-        while (timer_now_us() - start) < 5_000_000 {
+        let mut spins = 0u64;
+        while !xhci_wait_expired(start, timeout_us, spins) {
             // 5s
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
@@ -910,15 +951,21 @@ impl XhciInner {
                     }
                 }
             }
+            spins = spins.saturating_add(1);
             spin_loop();
+        }
+        if spins >= xhci_wait_spin_limit(timeout_us) {
+            warn!("[xhci] wait_cmd_phys salió por guard de spins (timer estancado?)");
         }
         error!("[xhci] timeout esperando comando");
         Err(DeviceError::IoError)
     }
 
     fn wait_cmd_phys_slot(&mut self, cmd_trb_phys: u64) -> DeviceResult<u8> {
+        let timeout_us = 5_000_000;
         let start = timer_now_us();
-        while (timer_now_us() - start) < 5_000_000 {
+        let mut spins = 0u64;
+        while !xhci_wait_expired(start, timeout_us, spins) {
             // 5s
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
@@ -936,7 +983,11 @@ impl XhciInner {
                     }
                 }
             }
+            spins = spins.saturating_add(1);
             spin_loop();
+        }
+        if spins >= xhci_wait_spin_limit(timeout_us) {
+            warn!("[xhci] wait_cmd_phys_slot salió por guard de spins (timer estancado?)");
         }
         error!("[xhci] timeout esperando comando de slot");
         Err(DeviceError::IoError)
@@ -962,8 +1013,9 @@ impl XhciInner {
             slot, setup_phys, data_phys, status_phys
         );
         let start = timer_now_us();
+        let mut spins = 0u64;
         let mut ev_count = 0u32;
-        while (timer_now_us() - start) < timeout_us {
+        while !xhci_wait_expired(start, timeout_us, spins) {
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
                 ev_count += 1;
@@ -999,7 +1051,11 @@ impl XhciInner {
                     info!("[xhci] EP0 espera: ev#{} type={}", ev_count, ty);
                 }
             }
+            spins = spins.saturating_add(1);
             spin_loop();
+        }
+        if spins >= xhci_wait_spin_limit(timeout_us) {
+            warn!("[xhci] EP0 slot={} salió por guard de spins (timer estancado?)", slot);
         }
         error!(
             "[xhci] timeout EP0 slot={} ({} eventos vistos, setup={:#x})",
@@ -1099,16 +1155,28 @@ impl XhciInner {
         if (usbcmd & 1) != 0 {
             info!("[xhci] deteniendo controlador antes del reset");
             m.write_op(0, usbcmd & !1); // RS=0
+            let timeout_us = 100_000;
             let start = timer_now_us();
-            while (m.read_op(4) & 1) == 0 && (timer_now_us() - start) < 100_000 {
+            let mut spins = 0u64;
+            while (m.read_op(4) & 1) == 0 && !xhci_wait_expired(start, timeout_us, spins) {
+                spins = spins.saturating_add(1);
                 spin_loop();
+            }
+            if spins >= xhci_wait_spin_limit(timeout_us) {
+                warn!("[xhci] stop-before-reset salió por guard de spins (timer estancado?)");
             }
         }
 
         // 2. Esperar a que CNR (Controller Not Ready) se limpie antes del reset
+        let timeout_us = 1_000_000;
         let start = timer_now_us();
-        while (m.read_op(4) & (1 << 11)) != 0 && (timer_now_us() - start) < 1_000_000 {
+        let mut spins = 0u64;
+        while (m.read_op(4) & (1 << 11)) != 0 && !xhci_wait_expired(start, timeout_us, spins) {
+            spins = spins.saturating_add(1);
             spin_loop();
+        }
+        if spins >= xhci_wait_spin_limit(timeout_us) {
+            warn!("[xhci] wait-CNR-before-reset salió por guard de spins (timer estancado?)");
         }
         if (m.read_op(4) & (1 << 11)) != 0 {
             error!("[xhci] timeout esperando CNR antes de reset");
@@ -1118,15 +1186,27 @@ impl XhciInner {
         // 3. Emitir HCRST (bit 1 de USBCMD)
         info!("[xhci] emitiendo HCRST");
         m.write_op(0, m.read_op(0) | 2);
+        let timeout_us = 100_000;
         let start = timer_now_us();
-        while (m.read_op(0) & 2) != 0 && (timer_now_us() - start) < 100_000 {
+        let mut spins = 0u64;
+        while (m.read_op(0) & 2) != 0 && !xhci_wait_expired(start, timeout_us, spins) {
+            spins = spins.saturating_add(1);
             spin_loop();
+        }
+        if spins >= xhci_wait_spin_limit(timeout_us) {
+            warn!("[xhci] wait-HCRST-clear salió por guard de spins (timer estancado?)");
         }
 
         // 4. Esperar a que CNR se limpie de nuevo tras reset
+        let timeout_us = 1_000_000;
         let start = timer_now_us();
-        while (m.read_op(4) & (1 << 11)) != 0 && (timer_now_us() - start) < 1_000_000 {
+        let mut spins = 0u64;
+        while (m.read_op(4) & (1 << 11)) != 0 && !xhci_wait_expired(start, timeout_us, spins) {
+            spins = spins.saturating_add(1);
             spin_loop();
+        }
+        if spins >= xhci_wait_spin_limit(timeout_us) {
+            warn!("[xhci] wait-CNR-after-reset salió por guard de spins (timer estancado?)");
         }
         if (m.read_op(4) & (1 << 11)) != 0 {
             error!("[xhci] timeout esperando CNR tras reset");
@@ -1192,14 +1272,20 @@ impl XhciInner {
 
         // Esperar a que el controlador salga de HCHalted (bit 0 de USBSTS=1 = halted).
         // NOTA: la condición es sts & 1 != 0 — el controlador está DETENIDO mientras ese bit esté en 1.
+        let timeout_us = 100_000;
         let start = timer_now_us();
-        while (timer_now_us() - start) < 100_000 {
+        let mut spins = 0u64;
+        while !xhci_wait_expired(start, timeout_us, spins) {
             let sts = m.read_op(4);
             if (sts & 1) == 0 {
                 // HCHalted=0 → controlador corriendo
                 break;
             }
+            spins = spins.saturating_add(1);
             spin_loop();
+        }
+        if spins >= xhci_wait_spin_limit(timeout_us) {
+            warn!("[xhci] wait-HCHalted-clear salió por guard de spins (timer estancado?)");
         }
         {
             let sts = m.read_op(4);
@@ -1226,10 +1312,7 @@ impl XhciInner {
         }
         // Pequeña espera tras dar energía (USB spec exige ≥100ms de VBUS estable antes de
         // que el dispositivo pueda responder; los devices gaming con firmware complejo lo necesitan).
-        let start = timer_now_us();
-        while (timer_now_us() - start) < 100_000 {
-            spin_loop();
-        }
+        xhci_spin_delay_us(100_000);
 
         Ok(())
     }
@@ -1248,8 +1331,10 @@ impl XhciInner {
         // Require multiple consecutive "ready" samples to filter transient link-state flaps.
         const STABLE_SAMPLES: u32 = 256;
         let mut stable = 0u32;
+        let timeout_us = 1_000_000;
         let start = timer_now_us();
-        while (timer_now_us() - start) < 1_000_000 {
+        let mut spins = 0u64;
+        while !xhci_wait_expired(start, timeout_us, spins) {
             // Max 1s
             let s = m.read_op(off);
             let ccs = (s & 1) != 0;
@@ -1265,6 +1350,7 @@ impl XhciInner {
             } else {
                 stable = 0;
             }
+            spins = spins.saturating_add(1);
             spin_loop();
         }
         None
@@ -1294,10 +1380,7 @@ impl XhciInner {
             info!("[xhci] puerto {}: PP=0, encendiendo", port);
             self.mmio
                 .write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 9));
-            let start = timer_now_us();
-            while (timer_now_us() - start) < 100_000 {
-                spin_loop();
-            }
+            xhci_spin_delay_us(100_000);
             portsc = self.mmio.read_op(off);
         }
         let pre_spd = ((portsc >> 10) & 0x0f) as u8;
@@ -1314,13 +1397,16 @@ impl XhciInner {
 
             // Espera robusta de reset (100ms)
             let mut success = false;
+            let timeout_us = 100_000;
             let start = timer_now_us();
-            while (timer_now_us() - start) < 100_000 {
+            let mut spins = 0u64;
+            while !xhci_wait_expired(start, timeout_us, spins) {
                 let s = self.mmio.read_op(off);
                 if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
                     success = true;
                     break;
                 }
+                spins = spins.saturating_add(1);
                 spin_loop();
             }
             if !success {
@@ -1340,10 +1426,7 @@ impl XhciInner {
             .write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | clr);
 
         // Pequeño delay tras reset para estabilización del link
-        let start = timer_now_us();
-        while (timer_now_us() - start) < 10_000 {
-            spin_loop();
-        }
+        xhci_spin_delay_us(10_000);
 
         if spd == 0 || (self.mmio.read_op(off) & 1) == 0 {
             return Ok(());
@@ -1362,10 +1445,7 @@ impl XhciInner {
                 }
                 self.mmio
                     .write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
-                let start = timer_now_us();
-                while (timer_now_us() - start) < 100_000 {
-                    spin_loop();
-                }
+                xhci_spin_delay_us(100_000);
                 let spd_retry = self.wait_port_ready(off, true).unwrap_or_else(|| {
                     s = self.mmio.read_op(off);
                     ((s >> 10) & 0x0f) as u8
@@ -1373,10 +1453,7 @@ impl XhciInner {
                 s = self.mmio.read_op(off);
                 self.mmio
                     .write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | clr);
-                let start = timer_now_us();
-                while (timer_now_us() - start) < 50_000 {
-                    spin_loop();
-                }
+                xhci_spin_delay_us(50_000);
                 if spd_retry == 0 || (self.mmio.read_op(off) & 1) == 0 {
                     return Ok(());
                 }
@@ -1480,10 +1557,7 @@ impl XhciInner {
         // Pequeña pausa tras Address Device: algunos dispositivos FS/LS necesitan
         // tiempo para procesar el SET_ADDRESS y estar listos en la nueva dirección.
         {
-            let start = timer_now_us();
-            while (timer_now_us() - start) < 2_000 {
-                spin_loop();
-            } // 2ms
+            xhci_spin_delay_us(2_000); // 2ms
         }
 
         // Invalidar la caché del descriptor buffer antes de pasarlo al controlador
