@@ -64,6 +64,11 @@ hal_fn_def! {
 
         /// Flush the physical frame.
         pub fn frame_flush(target: PhysAddr);
+
+        /// Get memory usage: (used_bytes, total_bytes)
+        pub fn memory_usage() -> (usize, usize) {
+            (0, 0)
+        }
     }
 
     /// Virtual memory operations.

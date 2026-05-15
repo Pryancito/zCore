@@ -66,5 +66,10 @@ hal_fn_impl! {
         fn frame_flush(_target: PhysAddr) {
             // do nothing
         }
+
+        fn memory_usage() -> (usize, usize) {
+            let used = FRAME_ALLOCATOR.lock().used_count() * PAGE_SIZE;
+            (used, PMEM_SIZE)
+        }
     }
 }

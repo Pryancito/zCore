@@ -35,4 +35,8 @@ impl KernelHandler for ZcoreKernelHandler {
             );
         }
     }
+
+    fn memory_usage(&self) -> (usize, usize) {
+        memory::stats()
+    }
 }

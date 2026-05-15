@@ -10,7 +10,12 @@ use core::{
 };
 use customizable_buddy::{BuddyAllocator, LinkedListBuddy, UsizeBuddy};
 use kernel_hal::PhysAddr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lock::Mutex;
+
+static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
+static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
+
 
 /// 堆分配器。
 ///
@@ -37,7 +42,8 @@ static mut MEMORY: [u8; 2 * 1024 * 1024] = [0u8; 2 * 1024 * 1024];
 unsafe impl GlobalAlloc for LockedHeap {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if let Ok((ptr, _)) = self.0.lock().allocate_layout(layout) {
+        if let Ok((ptr, size)) = self.0.lock().allocate_layout(layout) {
+            USED_MEMORY.fetch_add(size, Ordering::Relaxed);
             ptr.as_ptr()
         } else {
             handle_alloc_error(layout)
@@ -46,6 +52,7 @@ unsafe impl GlobalAlloc for LockedHeap {
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        USED_MEMORY.fetch_sub(layout.size(), Ordering::Relaxed);
         self.0
             .lock()
             .deallocate_layout(NonNull::new(ptr).unwrap(), layout)
@@ -60,6 +67,7 @@ pub fn init() {
         let ptr = NonNull::new(MEMORY.as_mut_ptr()).unwrap();
         heap.init(core::mem::size_of::<usize>().trailing_zeros() as _, ptr);
         heap.transfer(ptr, MEMORY.len());
+        TOTAL_MEMORY.fetch_add(MEMORY.len(), Ordering::Relaxed);
     }
 }
 
@@ -75,6 +83,7 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
                 NonNull::new_unchecked((region.start + offset) as *mut u8),
                 region.len(),
             );
+            TOTAL_MEMORY.fetch_add(region.len(), Ordering::Relaxed);
         });
 }
 
@@ -87,12 +96,21 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         })
         .ok()?;
     assert_eq!(size, frame_count << PAGE_BITS);
+    USED_MEMORY.fetch_add(size, Ordering::Relaxed);
     Some(ptr.as_ptr() as PhysAddr - phys_to_virt_offset())
 }
 
 pub fn frame_dealloc(target: PhysAddr) {
+    USED_MEMORY.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
     HEAP.0.lock().deallocate(
         unsafe { NonNull::new_unchecked((target + phys_to_virt_offset()) as *mut u8) },
         1 << PAGE_BITS,
     );
+}
+
+pub fn stats() -> (usize, usize) {
+    (
+        USED_MEMORY.load(Ordering::Relaxed),
+        TOTAL_MEMORY.load(Ordering::Relaxed),
+    )
 }

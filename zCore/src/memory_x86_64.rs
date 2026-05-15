@@ -3,7 +3,13 @@
 use bitmap_allocator::BitAlloc;
 use core::ops::Range;
 use kernel_hal::PhysAddr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lock::Mutex;
+
+static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
+static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
+
+
 
 type FrameAlloc = bitmap_allocator::BitAlloc16M; // max 64G
 
@@ -43,6 +49,7 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
         let frame_end = phys_addr_to_frame_idx(end - 1) + 1;
         if frame_start < frame_end {
             ba.insert(frame_start..frame_end);
+            TOTAL_MEMORY.fetch_add(frame_idx_to_phys_addr(frame_end - frame_start), Ordering::Relaxed);
             info!(
                 "Frame allocator: add range {:#x?}",
                 frame_idx_to_phys_addr(frame_start)..frame_idx_to_phys_addr(frame_end),
@@ -57,6 +64,9 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         .lock()
         .alloc_contiguous(frame_count, align_log2)
         .map(frame_idx_to_phys_addr);
+    if ret.is_some() {
+        USED_MEMORY.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
+    }
     trace!(
         "frame_alloc_contiguous(): {ret:x?} ~ {end_ret:x?}, align_log2={align_log2}",
         end_ret = ret.map(|x| x + frame_count),
@@ -66,9 +76,16 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
 
 pub fn frame_dealloc(target: PhysAddr) {
     trace!("frame_dealloc(): {target:x}");
+    USED_MEMORY.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
     FRAME_ALLOCATOR
         .lock()
         .dealloc(phys_addr_to_frame_idx(target))
+}
+
+pub fn stats() -> (usize, usize) {
+    let used = USED_MEMORY.load(Ordering::Relaxed);
+    let total = TOTAL_MEMORY.load(Ordering::Relaxed);
+    (used, total)
 }
 
 cfg_if! {
@@ -129,10 +146,14 @@ cfg_if! {
                     .lock()
                     .alloc(layout)
                     .ok()
-                    .map_or(core::ptr::null_mut::<u8>(), |allocation| allocation.as_ptr())
+                    .map_or(core::ptr::null_mut::<u8>(), |allocation| {
+                        USED_MEMORY.fetch_add(layout.size(), Ordering::Relaxed);
+                        allocation.as_ptr()
+                    })
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                USED_MEMORY.fetch_sub(layout.size(), Ordering::Relaxed);
                 self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
             }
         }

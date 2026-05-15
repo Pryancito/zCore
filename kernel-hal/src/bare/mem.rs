@@ -45,5 +45,9 @@ hal_fn_impl! {
         fn frame_flush(target: PhysAddr) {
             super::arch::mem::frame_flush(target)
         }
+
+        fn memory_usage() -> (usize, usize) {
+            crate::KHANDLER.memory_usage()
+        }
     }
 }

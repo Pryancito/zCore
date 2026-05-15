@@ -45,5 +45,8 @@ pub trait NetScheme: Scheme {
     fn get_stats(&self) -> NetStats {
         NetStats::default()
     }
+    fn get_arp_content(&self) -> String {
+        String::new()
+    }
     fn poll(&self) -> DeviceResult;
 }

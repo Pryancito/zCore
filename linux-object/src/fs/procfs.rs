@@ -1,6 +1,6 @@
 //! Minimal procfs implementation for Linux userland compatibility.
 
-use alloc::{fmt::Write as _, string::String, sync::Arc};
+use alloc::{fmt::Write as _, string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use kernel_hal::drivers;
@@ -122,8 +122,8 @@ impl INode for ProcRootINode {
 struct ProcNetDirINode;
 
 impl ProcNetDirINode {
-    fn entries() -> [&'static str; 2] {
-        ["dev", "route"]
+    fn entries() -> [&'static str; 3] {
+        ["dev", "route", "arp"]
     }
 }
 
@@ -177,6 +177,10 @@ impl INode for ProcNetDirINode {
             ))),
             "route" => Ok(Arc::new(Pseudo::new(
                 &proc_net_route_content(),
+                FileType::File,
+            ))),
+            "arp" => Ok(Arc::new(Pseudo::new(
+                &proc_net_arp_content(),
                 FileType::File,
             ))),
             _ => Err(FsError::EntryNotFound),
@@ -269,13 +273,30 @@ fn proc_uptime_content() -> String {
 }
 
 fn proc_meminfo_content() -> String {
-    // Minimal placeholder: values are reported as 0 until we wire real memory stats.
-    // Keep the most common keys so basic userland tooling doesn't choke.
+    let (used, total) = kernel_hal::mem::memory_usage();
+    let free = total.saturating_sub(used);
     let mut s = String::new();
-    let _ = writeln!(s, "MemTotal:        0 kB");
-    let _ = writeln!(s, "MemFree:         0 kB");
-    let _ = writeln!(s, "MemAvailable:    0 kB");
-    let _ = writeln!(s, "Buffers:         0 kB");
-    let _ = writeln!(s, "Cached:          0 kB");
+    let _ = writeln!(s, "MemTotal:     {:>10} kB", total / 1024);
+    let _ = writeln!(s, "MemFree:      {:>10} kB", free / 1024);
+    let _ = writeln!(s, "MemAvailable: {:>10} kB", free / 1024);
+    let _ = writeln!(s, "Buffers:               0 kB");
+    let _ = writeln!(s, "Cached:                0 kB");
+    s
+}
+fn proc_net_arp_content() -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "IP address       HW type     Flags       HW address            Mask     Device");
+    let ifaces = drivers::all_net().as_vec();
+    for iface in ifaces.iter() {
+        let content = iface.get_arp_content();
+        if !content.is_empty() {
+            // Skip header from device content if we already have one
+            let lines: Vec<&str> = content.lines().collect();
+            for line in lines.iter().skip(1) {
+                s.push_str(line);
+                s.push('\n');
+            }
+        }
+    }
     s
 }
