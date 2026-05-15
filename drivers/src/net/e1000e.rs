@@ -159,7 +159,11 @@ const TXDCTL_HTHRESH: u32 = 0x3F << 8; // bits 8-13
 const TXDCTL_WTHRESH: u32 = 0x3F << 16; // bits 16-21
 const TXDCTL_GRAN: u32 = 1 << 24; // 0=cache lines, 1=descriptors
 const TXDCTL_FULL_TX_DESC_WB: u32 = 1 << 26;
-const TXDCTL_COUNT_DESC: u32 = 1 << 22; // bit 22 must be 1 on some ICH8
+const TXDCTL_COUNT_DESC: u32 = 1 << 22; // bit 22 must be 1 on ICH8+
+const TXDCTL_QUEUE_ENABLE: u32 = 1 << 25; // PCH-SPT (I219) and later: must be set to enable TX DMA
+
+// RXDCTL bits
+const RXDCTL_QUEUE_ENABLE: u32 = 1 << 25; // PCH-SPT (I219) and later: must be set to enable RX DMA
 
 // STATUS bits
 const STATUS_LU: u32 = 1 << 1; // link up
@@ -407,6 +411,17 @@ impl E1000eHw {
         !all_zeros && !all_fs
     }
 
+    /// Returns true for PCH-SPT (I219) and later silicon.
+    /// These chips require explicit RXDCTL/TXDCTL QUEUE_ENABLE (bit 25) to
+    /// activate the RX/TX DMA queues after RCTL_EN/TCTL_EN.
+    fn is_pch_spt_or_later(&self) -> bool {
+        matches!(self.device_id,
+            0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 |
+            0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f |
+            0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba
+        )
+    }
+
     // -----------------------------------------------------------------------
     // Read MAC address from NVM (3 words at offsets 0, 1, 2)
     // -----------------------------------------------------------------------
@@ -600,11 +615,6 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_KABGTXD, kabgtxd | KABGTXD_BGSQLBIAS);
         }
 
-        // Set TXDCTL bits
-        let mut txdctl = mmio_read(self.base, E1000E_TXDCTL);
-        txdctl |= 1 << 22; // Required bit
-        mmio_write(self.base, E1000E_TXDCTL, txdctl);
-
         // Set TARC bits
         let mut tarc0 = mmio_read(self.base, E1000E_TARC0);
         tarc0 |= (1 << 23) | (1 << 24) | (1 << 26) | (1 << 27);
@@ -780,8 +790,27 @@ impl E1000eHw {
         unsafe { mmio_write(self.base, E1000E_RCTL, rctl) };
         
         // Set TXDCTL (TX Descriptor Control)
-        // GRAN=1, FULL_TX_DESC_WB=1, PTHRESH=31
-        unsafe { mmio_write(self.base, E1000E_TXDCTL, TXDCTL_GRAN | TXDCTL_FULL_TX_DESC_WB | 0x1F) };
+        // GRAN=1, FULL_TX_DESC_WB=1, COUNT_DESC=1 (bit 22, required on ICH8+), PTHRESH=31
+        unsafe { mmio_write(self.base, E1000E_TXDCTL, TXDCTL_GRAN | TXDCTL_FULL_TX_DESC_WB | TXDCTL_COUNT_DESC | 0x1F) };
+
+        // For PCH-SPT (I219) and later: explicitly enable the TX DMA queue (bit 25) and poll.
+        // Without this, the TX descriptor ring DMA engine stays disabled on real hardware.
+        if self.is_pch_spt_or_later() {
+            let txdctl = unsafe { mmio_read(self.base, E1000E_TXDCTL) } | TXDCTL_QUEUE_ENABLE;
+            unsafe { mmio_write(self.base, E1000E_TXDCTL, txdctl) };
+            let _ = unsafe { mmio_read(self.base, E1000E_STATUS) }; // flush posted writes
+            let t = timer_now_as_micros();
+            loop {
+                if unsafe { mmio_read(self.base, E1000E_TXDCTL) } & TXDCTL_QUEUE_ENABLE != 0 {
+                    break;
+                }
+                if timer_now_as_micros().wrapping_sub(t) > 10_000 {
+                    warn!("[e1000e] timeout waiting for TXDCTL QUEUE_ENABLE");
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
 
         // Flow control watermarks (Linux defaults)
         unsafe {
@@ -796,6 +825,26 @@ impl E1000eHw {
 
         // CRITICAL: Set RDT *AFTER* RCTL_EN per datasheet §13.4.18
         unsafe { mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32) };
+
+        // For PCH-SPT (I219) and later: explicitly enable the RX DMA queue (bit 25) and poll.
+        // Without this, the RX descriptor ring DMA engine stays disabled on real hardware —
+        // packets arrive but hardware never writes them into the descriptor ring.
+        if self.is_pch_spt_or_later() {
+            let rxdctl = unsafe { mmio_read(self.base, E1000E_RXDCTL) } | RXDCTL_QUEUE_ENABLE;
+            unsafe { mmio_write(self.base, E1000E_RXDCTL, rxdctl) };
+            let _ = unsafe { mmio_read(self.base, E1000E_STATUS) }; // flush posted writes
+            let t = timer_now_as_micros();
+            loop {
+                if unsafe { mmio_read(self.base, E1000E_RXDCTL) } & RXDCTL_QUEUE_ENABLE != 0 {
+                    break;
+                }
+                if timer_now_as_micros().wrapping_sub(t) > 10_000 {
+                    warn!("[e1000e] timeout waiting for RXDCTL QUEUE_ENABLE");
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
 
         // 12. Clear any pending interrupts, then enable all interrupts
         let _ = mmio_read(self.base, E1000E_ICR);
