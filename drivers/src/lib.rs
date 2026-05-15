@@ -22,6 +22,7 @@ pub mod virtio;
 
 pub mod ata;
 pub mod builder;
+#[macro_use]
 pub mod bus;
 pub mod display;
 pub mod input;

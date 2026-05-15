@@ -184,9 +184,8 @@ impl IoApicList {
         let tables = match unsafe { AcpiTables::from_rsdp(handler, acpi_rsdp) } {
             Ok(t) => t,
             Err(e) => {
-                log::error!(
-                    "[ioapic] Failed to parse ACPI tables from RSDP={:#x}: {:?}. \
-                     No I/O APICs will be available — PCI interrupts disabled.",
+                crate::klog_err!(
+                    "[ioapic] ACPI parse failed (RSDP={:#x}): {:?} — PCI IRQ routing disabled",
                     acpi_rsdp, e
                 );
                 return Self { io_apics: Vec::new() };
@@ -206,13 +205,13 @@ impl IoApicList {
                     })
                     .collect(),
                 _ => {
-                    log::warn!("[ioapic] ACPI reports non-APIC interrupt model; no I/O APICs");
+                    crate::klog_warn!("[ioapic] ACPI non-APIC interrupt model — no I/O APICs");
                     Vec::new()
                 }
             },
             Err(e) => {
-                log::error!(
-                    "[ioapic] Failed to read ACPI platform info: {:?}. No I/O APICs.",
+                crate::klog_err!(
+                    "[ioapic] ACPI platform info failed: {:?} — no I/O APICs",
                     e
                 );
                 Vec::new()

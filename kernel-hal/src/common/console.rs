@@ -13,14 +13,17 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 static KLOG_READ_FN:  AtomicUsize = AtomicUsize::new(0);
 static KLOG_SIZE_FN:  AtomicUsize = AtomicUsize::new(0);
+static KLOG_EMIT_FN: AtomicUsize = AtomicUsize::new(0);
 
 /// Called once by `zcore` at startup to register the ring-buffer accessors.
 pub fn klog_register(
     read_fn:  fn(&mut [u8]) -> usize,
     size_fn:  fn() -> usize,
+    emit_fn:  fn(u8, &str),
 ) {
     KLOG_READ_FN.store(read_fn as usize, Ordering::SeqCst);
     KLOG_SIZE_FN.store(size_fn as usize, Ordering::SeqCst);
+    KLOG_EMIT_FN.store(emit_fn as usize, Ordering::SeqCst);
 }
 
 /// Copy the kernel log ring buffer into `dst`.  Returns bytes written.
@@ -38,6 +41,22 @@ pub fn klog_buf_size() -> usize {
     if p == 0 { return 0; }
     let f: fn() -> usize = unsafe { core::mem::transmute(p) };
     f()
+}
+
+/// Syslog priorities (Linux `syslog.h`).
+pub const LOG_ERR: u8 = 3;
+pub const LOG_WARNING: u8 = 4;
+pub const LOG_INFO: u8 = 6;
+
+/// Append a vital kernel message to the dmesg ring buffer (syslog priority 0–7).
+/// Always recorded regardless of the `log` crate max level.
+pub fn klog_emit(priority: u8, msg: &str) {
+    let p = KLOG_EMIT_FN.load(Ordering::SeqCst);
+    if p == 0 {
+        return;
+    }
+    let f: fn(u8, &str) = unsafe { core::mem::transmute(p) };
+    f(priority, msg);
 }
 
 
@@ -229,4 +248,34 @@ pub fn console_win_size() -> ConsoleWinSize {
         return winsz;
     }
     ConsoleWinSize::default()
+}
+
+#[macro_export]
+macro_rules! klog_info {
+    ($($arg:tt)*) => {
+        $crate::console::klog_emit(
+            $crate::console::LOG_INFO,
+            &::alloc::format!($($arg)*),
+        )
+    };
+}
+
+#[macro_export]
+macro_rules! klog_warn {
+    ($($arg:tt)*) => {
+        $crate::console::klog_emit(
+            $crate::console::LOG_WARNING,
+            &::alloc::format!($($arg)*),
+        )
+    };
+}
+
+#[macro_export]
+macro_rules! klog_err {
+    ($($arg:tt)*) => {
+        $crate::console::klog_emit(
+            $crate::console::LOG_ERR,
+            &::alloc::format!($($arg)*),
+        )
+    };
 }

@@ -43,10 +43,14 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
         for (v, d) in q.drain(..) {
             match host.register_device(v, d) {
                 Ok(_) => {
-                    warn!("[net] successfully registered device for vector {}", v);
+                    crate::klog_info!("[net] IRQ vector {} registered for NIC", v);
                     let _ = host.unmask(v);
                 }
-                Err(e) => warn!("[net] failed to register device for vector {}: {:?}", v, e),
+                Err(e) => crate::klog_warn!(
+                    "[net] failed to register IRQ vector {}: {:?}",
+                    v,
+                    e
+                ),
             }
         }
     }

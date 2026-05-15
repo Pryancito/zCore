@@ -246,7 +246,7 @@ impl AhciPort {
 
         // Wait for PHY to establish link (DET=3), max 1 second
         if !wait_until(PHY_LINK_TIMEOUT_US, || self.read_reg(PORT_SSTS) & 0xF == 3) {
-            warn!("[AHCI] Port {} init: PHY link timeout", self.port_idx);
+            crate::klog_warn!("[AHCI] port {} PHY link timeout", self.port_idx);
         }
 
         self.write_reg(PORT_SERR, 0xFFFF_FFFF);
@@ -278,13 +278,17 @@ impl AhciPort {
         self.write_reg(PORT_CI, 1 << slot);
 
         if !wait_until(timeout_us, || self.read_reg(PORT_CI) & (1 << slot) == 0) {
-            error!("[AHCI] Port {} command timeout ({}ms)", self.port_idx, timeout_us / 1000);
+            crate::klog_err!(
+                "[AHCI] port {} command timeout ({} ms)",
+                self.port_idx,
+                timeout_us / 1000
+            );
             self.reset_port();
             return Err(DeviceError::IoError);
         }
 
         if self.read_reg(PORT_IS) & (1 << 30) != 0 {
-            error!("[AHCI] Port {} task file error", self.port_idx);
+            crate::klog_err!("[AHCI] port {} task file error", self.port_idx);
             self.reset_port();
             return Err(DeviceError::IoError);
         }
@@ -299,8 +303,8 @@ impl AhciPort {
         if !wait_until(TFD_TIMEOUT_US, || {
             self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
         }) {
-            error!(
-                "[AHCI] Port {} TFD busy timeout before command",
+            crate::klog_err!(
+                "[AHCI] port {} TFD busy timeout before command",
                 self.port_idx
             );
             self.reset_port();
@@ -406,7 +410,7 @@ impl AhciInterface {
             if !wait_until(HBA_RESET_TIMEOUT_US, || {
                 read_volatile((base + HBA_GHC) as *const u32) & GHC_HR == 0
             }) {
-                warn!("[AHCI] HBA reset timeout — hardware may not be functional");
+                crate::klog_err!("[AHCI] HBA reset timeout — controller may not be functional");
             }
             write_volatile((base + HBA_GHC) as *mut u32, GHC_AE);
             // AHCI spec §10.1.2: minimum 1 ms after GHC.HR before touching registers.
@@ -453,8 +457,8 @@ impl AhciInterface {
 
                 if sig == HBA_SIG_ATA {
                     if let Some(sectors) = port.identify() {
-                        warn!(
-                            "[AHCI] Port {} found: SATA disk, {} sectors ({} MiB)",
+                        crate::klog_info!(
+                            "ahci{}: SATA disk attached, {} sectors ({} MiB)",
                             i,
                             sectors,
                             sectors / 2048

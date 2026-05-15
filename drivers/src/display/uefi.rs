@@ -15,7 +15,7 @@ impl UefiDisplay {
 
 impl Scheme for UefiDisplay {
     fn name(&self) -> &str {
-        "mock-display"
+        "uefi-gop"
     }
 }
 

@@ -505,6 +505,38 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_FEXTNVM11); // flush posted write
     }
 
+    /// Push CPU-written DMA data to RAM for the device (WB cache).
+    unsafe fn dma_wbinv_range(vaddr: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut p = vaddr & !63;
+        let end = vaddr.saturating_add(len);
+        while p < end {
+            core::arch::x86_64::_mm_clflush(p as *const u8);
+            p += 64;
+        }
+        fence(Ordering::SeqCst);
+    }
+
+    /// Read a range the device wrote into WB memory. Never clflush here: on x86
+    /// CLFLUSH writebacks dirty cache lines and destroys device-written data.
+    unsafe fn dma_copy_in(dst: &mut Vec<u8>, vaddr: usize, len: usize) {
+        dst.clear();
+        dst.reserve(len);
+        for i in 0..len {
+            dst.push(core::ptr::read_volatile((vaddr + i) as *const u8));
+        }
+    }
+
+    unsafe fn stop_rx_tx_engines(&self) {
+        let rctl = mmio_read(self.base, E1000E_RCTL);
+        mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
+        let tctl = mmio_read(self.base, E1000E_TCTL);
+        mmio_write(self.base, E1000E_TCTL, tctl & !TCTL_EN);
+        Self::udelay(100);
+    }
+
     // -----------------------------------------------------------------------
     // Full hardware reset + init
     // -----------------------------------------------------------------------
@@ -534,6 +566,8 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_WUS, 0xFFFF_FFFF);
             let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
             mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
+            // Stop legacy BIOS DMA before reprogramming our descriptor rings.
+            self.stop_rx_tx_engines();
         } else {
         let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
@@ -901,12 +935,16 @@ impl E1000eHw {
         // hang at 80% on real I219-V hardware.
         let status = mmio_read(self.base, E1000E_STATUS);
         if status & STATUS_LU == 0 {
-            warn!("[e1000e] link is DOWN at init — will come up via LSC interrupt");
+            crate::klog_warn!("e1000e: NIC Link is Down\n");
         } else {
-            info!("[e1000e] link UP at init");
+            crate::klog_info!("e1000e: NIC Link is Up\n");
         }
 
-        info!("[e1000e] init done. STATUS={:#010x} link={}", status, if status & STATUS_LU != 0 { "UP" } else { "DOWN" });
+        crate::klog_info!(
+            "e1000e: init complete STATUS={:#010x} link={}",
+            status,
+            if status & STATUS_LU != 0 { "up" } else { "down" }
+        );
         Ok(())
     }
 
@@ -914,17 +952,9 @@ impl E1000eHw {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let idx = self.rx_tail;
 
-        // Read the descriptor and flush CPU cache so we see hardware's writes.
-        // IMPORTANT: We use the DD (Descriptor Done) bit from the descriptor
-        // status field — NOT RDH — because the I219 may update RDH lazily on
-        // real silicon, while the DD bit is the authoritative "packet ready"
-        // signal defined in the datasheet.
+        // Device → CPU: read descriptor status with volatile only (no clflush).
         let desc = unsafe { &mut *ring.add(idx) };
-        unsafe {
-            core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
-            core::arch::x86_64::_mm_mfence();
-        }
-
+        fence(Ordering::Acquire);
         let status = unsafe { read_volatile(&desc.status) };
 
         // If DD bit is not set, hardware hasn't written a packet here yet.
@@ -943,8 +973,7 @@ impl E1000eHw {
         unsafe {
             write_volatile(&mut desc.length, 0);
             write_volatile(&mut desc.status, 0);
-            core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
-            core::arch::x86_64::_mm_mfence();
+            Self::dma_wbinv_range(desc as *const RxDesc as usize, core::mem::size_of::<RxDesc>());
         }
 
         // CRITICAL: RDT must point to the last descriptor we gave back to hardware
@@ -957,15 +986,8 @@ impl E1000eHw {
 
         if len > 0 && len <= BUF_SIZE {
             let buf_vaddr = self.rx_bufs[idx].vaddr();
-            // Invalidate the CPU cache lines covering the received data so we
-            // read what hardware DMA-ed, not a stale cached copy.
-            for p in (buf_vaddr..buf_vaddr + len).step_by(64) {
-                unsafe { core::arch::x86_64::_mm_clflush(p as *const u8); }
-            }
-            core::sync::atomic::fence(Ordering::SeqCst);
-
-            let buf_slice = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
-            let data = buf_slice.to_vec();
+            let mut data = Vec::new();
+            unsafe { Self::dma_copy_in(&mut data, buf_vaddr, len) };
 
             if len >= 14 {
                 warn!("[e1000e] RX: {} bytes, dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, status={:#x}",
@@ -987,13 +1009,7 @@ impl E1000eHw {
     fn can_send(&self) -> bool {
         let ring = self.tx_ring.as_ptr::<TxDesc>();
         let desc = unsafe { &*ring.add(self.tx_tail) };
-        
-        // Flush before reading status
-        unsafe {
-            core::arch::x86_64::_mm_clflush(desc as *const TxDesc as *const u8);
-        }
-        fence(Ordering::SeqCst);
-        
+        fence(Ordering::Acquire);
         let status = unsafe { read_volatile(&desc.status) };
         self.tx_first || (status & 0x01 != 0) // DD bit
     }
@@ -1055,12 +1071,11 @@ impl E1000eHw {
         }
         fence(Ordering::SeqCst);
 
-        // Flush the data buffer and the descriptor before hardware reads it
-        for p in (self.tx_bufs[idx].vaddr()..self.tx_bufs[idx].vaddr() + data.len()).step_by(64) {
-            unsafe { core::arch::x86_64::_mm_clflush(p as *const u8); }
+        // CPU → device: writeback payload and descriptor to RAM.
+        unsafe {
+            Self::dma_wbinv_range(self.tx_bufs[idx].vaddr(), data.len());
+            Self::dma_wbinv_range(desc as *const TxDesc as usize, core::mem::size_of::<TxDesc>());
         }
-        unsafe { core::arch::x86_64::_mm_clflush(desc as *const TxDesc as *const u8); }
-        fence(Ordering::SeqCst);
 
         self.tx_tail = (idx + 1) % NUM_TX;
         unsafe { 
@@ -1139,8 +1154,11 @@ impl Scheme for E1000eInterface {
         if icr & (1 << 2) != 0 {
             // LSC — Link Status Change
             let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
-            warn!("[e1000e] Link status change: STATUS={:#x} ({})",
-                status, if status & STATUS_LU != 0 { "UP" } else { "DOWN" });
+            if status & STATUS_LU != 0 {
+                crate::klog_info!("{}: NIC Link is Up\n", self.name);
+            } else {
+                crate::klog_warn!("{}: NIC Link is Down\n", self.name);
+            }
         }
 
         if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
@@ -1178,7 +1196,7 @@ impl NetScheme for E1000eInterface {
         Vec::from(self.iface.lock().ip_addrs())
     }
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
-        info!("[e1000e] setting IPv4 address to {}", cidr);
+        crate::klog_info!("{}: IPv4 address set to {}", self.name, cidr);
         self.iface.lock().update_ip_addrs(|addrs| {
             if let Some(addr) = addrs
                 .iter_mut()
@@ -1189,7 +1207,6 @@ impl NetScheme for E1000eInterface {
                 *addr = IpCidr::Ipv4(cidr);
             }
         });
-        info!("[e1000e] IPv4 address set");
         Ok(())
     }
     
@@ -1419,7 +1436,7 @@ pub fn init(
     let mut tx_bufs = Vec::with_capacity(NUM_TX);
 
     for _ in 0..NUM_RX {
-        rx_bufs.push(DmaRegion::alloc(BUF_SIZE).ok_or(DeviceError::DmaError)?);
+        rx_bufs.push(DmaRegion::alloc_uninit(BUF_SIZE).ok_or(DeviceError::DmaError)?);
     }
     for _ in 0..NUM_TX {
         tx_bufs.push(DmaRegion::alloc(BUF_SIZE).ok_or(DeviceError::DmaError)?);
@@ -1445,9 +1462,17 @@ pub fn init(
     }
 
     let mac_bytes = hw.mac;
-    warn!(
-        "[e1000e] probed MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (ID: {:#x})",
-        mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5], pci.id.device_id
+    crate::klog_info!(
+        "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (PCI {:#x}:{:#x})",
+        name,
+        mac_bytes[0],
+        mac_bytes[1],
+        mac_bytes[2],
+        mac_bytes[3],
+        mac_bytes[4],
+        mac_bytes[5],
+        pci.id.vendor_id,
+        pci.id.device_id
     );
     let hw_arc = Arc::new(Mutex::new(hw));
     let driver = E1000eDriver { hw: hw_arc.clone() };
@@ -1511,7 +1536,11 @@ impl PciDriver for E1000eDriverPci {
     }
 
     fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
-        info!("[e1000e] PCI ID: vendor={:#x}, device={:#x}", dev.id.vendor_id, dev.id.device_id);
+        crate::klog_info!(
+            "e1000e: probing PCI {:#x}:{:#x}",
+            dev.id.vendor_id,
+            dev.id.device_id
+        );
         let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
             a as usize
         } else {

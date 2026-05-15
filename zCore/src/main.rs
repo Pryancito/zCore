@@ -43,7 +43,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     let options = utils::boot_options();
     logging::set_max_level(&options.log_level);
     kernel_hal::console::early_progress_bar(70);
-    info!("Boot options: {:#?}", options);
+    klog_info!(
+        "Eclipse: boot options log_level={} root_proc={}",
+        options.log_level,
+        options.root_proc
+    );
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
@@ -78,7 +82,7 @@ fn secondary_main() -> ! {
         core::hint::spin_loop();
     }
     kernel_hal::secondary_init();
-    info!("hart{} inited", kernel_hal::cpu::cpu_id());
+    klog_info!("Eclipse: CPU {} online", kernel_hal::cpu::cpu_id());
     #[cfg(feature = "mock-disk")]
     {
         if MOCK_CORE

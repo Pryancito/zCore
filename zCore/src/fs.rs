@@ -32,7 +32,7 @@ cfg_if! {
                     }
                 }
             };
-            info!("Opening the rootfs...");
+            crate::klog_info!("Eclipse: mounting root filesystem");
             rcore_fs_sfs::SimpleFileSystem::open(device).expect("failed to open device SimpleFS")
         }
     } else if #[cfg(feature = "zircon")] {

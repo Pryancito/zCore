@@ -81,13 +81,33 @@ pub(super) fn init() -> DeviceResult {
     intc_init()?;
 
     #[cfg(feature = "graphic")]
-    if let Some(display) = drivers::all_display().first() {
-        crate::console::init_graphic_console(display.clone());
-        if display.need_flush() {
-            // TODO: support nested interrupt to render in time
-            crate::thread::spawn(crate::common::future::DisplayFlushFuture::new(display, 30));
+    let graphics_console_note = {
+        use zcore_drivers::scheme::DisplayScheme;
+        if let Some(display) = drivers::all_display().first() {
+            crate::console::init_graphic_console(display.clone());
+            if display.need_flush() {
+                // TODO: support nested interrupt to render in time
+                crate::thread::spawn(crate::common::future::DisplayFlushFuture::new(
+                    display.clone(),
+                    30,
+                ));
+            }
+            let info = display.info();
+            Some(format!(
+                "{} {}x{}",
+                display.name(),
+                info.width,
+                info.height
+            ))
+        } else {
+            None
         }
-    }
+    };
+
+    #[cfg(not(feature = "graphic"))]
+    let graphics_console_note: Option<alloc::string::String> = None;
+
+    drivers::klog_graphics_device_summary(graphics_console_note.as_deref());
 
     #[cfg(feature = "loopback")]
     {

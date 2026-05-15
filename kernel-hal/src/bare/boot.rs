@@ -15,12 +15,12 @@ hal_fn_impl! {
         fn primary_init_early(cfg: KernelConfig, handler: &'static impl KernelHandler) {
             KCONFIG.init_once_by(cfg);
             KHANDLER.init_once_by(handler);
-            info!("Primary CPU {} init early...", crate::cpu::cpu_id());
+            crate::klog_info!("Eclipse: primary CPU {} init early", crate::cpu::cpu_id());
             super::arch::primary_init_early();
         }
 
         fn primary_init() {
-            info!("Primary CPU {} init...", crate::cpu::cpu_id());
+            crate::klog_info!("Eclipse: primary CPU {} init", crate::cpu::cpu_id());
             unsafe { trapframe::init() };
             super::arch::primary_init();
         }

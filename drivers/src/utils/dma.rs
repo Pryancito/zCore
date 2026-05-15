@@ -21,10 +21,18 @@ pub struct DmaRegion {
 }
 
 impl DmaRegion {
-    /// Allocate `len` bytes of DMA-capable memory.
-    ///
-    /// Returns `None` if the underlying allocator fails.
+    /// Allocate `len` bytes of DMA-capable memory, zero-filled.
     pub fn alloc(len: usize) -> Option<Self> {
+        Self::alloc_inner(len, true)
+    }
+
+    /// Allocate without zeroing. Use for RX buffers filled by device DMA: zeroing
+    /// dirties the cache and breaks coherency on x86 unless mappings are UC.
+    pub fn alloc_uninit(len: usize) -> Option<Self> {
+        Self::alloc_inner(len, false)
+    }
+
+    fn alloc_inner(len: usize, zero: bool) -> Option<Self> {
         if len == 0 {
             return None;
         }
@@ -34,8 +42,9 @@ impl DmaRegion {
             return None;
         }
         let virt = unsafe { drivers_phys_to_virt(phys) };
-        // Zero-initialise to avoid stale data surprises.
-        unsafe { core::ptr::write_bytes(virt as *mut u8, 0, pages * PAGE_SIZE) };
+        if zero {
+            unsafe { core::ptr::write_bytes(virt as *mut u8, 0, pages * PAGE_SIZE) };
+        }
         Some(Self { virt, phys, pages })
     }
 

@@ -1,5 +1,8 @@
 use alloc::{boxed::Box, sync::Arc};
 
+#[cfg(feature = "graphic")]
+use alloc::format;
+
 use zcore_drivers::irq::x86::Apic;
 use zcore_drivers::scheme::IrqScheme;
 use zcore_drivers::uart::{BufferedUart, Uart16550Pmio};
@@ -57,7 +60,7 @@ pub(super) fn init() -> DeviceResult {
         lapic.set_timer_initial(cycles as u32);
         lapic.disable_timer();
     } else {
-        warn!("[drivers] LAPIC unavailable — APIC timer left disabled");
+        crate::klog_warn!("[drivers] LAPIC unavailable — APIC timer left disabled");
     }
 
     #[cfg(all(not(feature = "no-pci"), feature = "xhci-usb-hid"))]
@@ -101,7 +104,7 @@ pub(super) fn init() -> DeviceResult {
                     paddr, vaddr, size
                 );
                 if let Err(e) = pt.map_cont(vaddr, size, paddr, flags) {
-                    warn!("[xhci] Error crítico al mapear BAR: {:?}", e);
+                    crate::klog_err!("[xhci] failed to map PCI BAR: {:?}", e);
                     return None;
                 }
 
@@ -149,16 +152,18 @@ pub(super) fn init() -> DeviceResult {
     boot_progress(88);
 
     #[cfg(feature = "graphic")]
-    {
-        // If display was already created in init_early(), just hook up the graphic console.
-        // Otherwise create it here (fallback).
+    let graphics_console_note = {
+        use alloc::string::String;
         if let Some(display) = crate::drivers::all_display().first() {
             crate::console::init_graphic_console(display.clone());
-            // VirtIO GPU (and similar) needs an explicit flush to push framebuffer
-            // contents to the screen.  Spawn a periodic flush task matching
-            // what the RISC-V init already does.
-            // DisplayFlushFuture is spawned after timer_init (post-90%) elsewhere.
             let _ = display.need_flush();
+            let info = display.info();
+            Some(format!(
+                "{} {}x{}",
+                display.name(),
+                info.width,
+                info.height
+            ))
         } else {
             use crate::KCONFIG;
             use zcore_drivers::display::UefiDisplay;
@@ -166,12 +171,12 @@ pub(super) fn init() -> DeviceResult {
 
             let (width, height) = KCONFIG.fb_mode.resolution();
             let stride = KCONFIG.fb_mode.stride();
-            // Guard: if the bootloader did not provide a framebuffer address, skip
-            // display init entirely rather than mapping phys 0 into the kernel's
-            // virtual address space, which would alias kernel code/data.
             if KCONFIG.fb_addr == 0 || width == 0 || height == 0 {
-                warn!("[drivers] No framebuffer from bootloader (fb_addr={:#x}, {}x{}) — skipping graphic console",
-                    KCONFIG.fb_addr, width, height);
+                crate::klog_warn!(
+                    "[drivers] no framebuffer from bootloader (fb_addr={:#x}, {}x{}) — skipping graphic console",
+                    KCONFIG.fb_addr, width, height
+                );
+                Some(String::from("unavailable (no bootloader framebuffer)"))
             } else {
                 let display = Arc::new(UefiDisplay::new(DisplayInfo {
                     width: width as _,
@@ -183,9 +188,15 @@ pub(super) fn init() -> DeviceResult {
                 }));
                 crate::drivers::add_device(Device::Display(display.clone()));
                 crate::console::init_graphic_console(display.clone());
+                Some(format!("uefi-gop {}x{}", width, height))
             }
         }
-    }
+    };
+
+    #[cfg(not(feature = "graphic"))]
+    let graphics_console_note: Option<alloc::string::String> = None;
+
+    drivers::klog_graphics_device_summary(graphics_console_note.as_deref());
 
     #[cfg(feature = "loopback")]
     {
@@ -193,6 +204,6 @@ pub(super) fn init() -> DeviceResult {
         net::init();
     }
 
-    info!("Drivers init end.");
+    crate::klog_info!("Eclipse: drivers init complete");
     Ok(())
 }

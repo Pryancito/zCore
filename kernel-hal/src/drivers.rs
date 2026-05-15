@@ -126,6 +126,72 @@ pub fn all_drm() -> &'static DeviceList<dyn DrmScheme> {
     &DEVICES.drm
 }
 
+/// Writes a summary of registered graphics devices to the kernel log (dmesg only).
+///
+/// `active_console` describes which output path is driving the graphical console, if any.
+pub fn klog_graphics_device_summary(active_console: Option<&str>) {
+    #[cfg(not(feature = "graphic"))]
+    {
+        crate::klog_info!(
+            "graphics: kernel built without `graphic` feature — framebuffer console disabled"
+        );
+    }
+
+    let displays = all_display().as_vec();
+    let drms = all_drm().as_vec();
+    let nd = displays.len();
+    let nr = drms.len();
+
+    if nd == 0 && nr == 0 {
+        crate::klog_info!("graphics: no framebuffer (Display) or DRM devices registered");
+    } else {
+        crate::klog_info!(
+            "graphics: {} framebuffer device(s), {} DRM / GPU device(s)",
+            nd,
+            nr
+        );
+
+        for (i, d) in displays.iter().enumerate() {
+            let info = d.info();
+            let fb_kib = info.fb_size.saturating_add(1023) / 1024;
+            crate::klog_info!(
+                "graphics: display[{}] driver={} {}x{} {:?} pitch={} bpp={} fb≈{} KiB",
+                i,
+                d.name(),
+                info.width,
+                info.height,
+                info.format,
+                info.pitch(),
+                info.format.depth(),
+                fb_kib,
+            );
+        }
+
+        for (i, d) in drms.iter().enumerate() {
+            let c = d.get_caps();
+            crate::klog_info!(
+                "graphics: drm[{}] driver={} max_mode={}x{} 3d={} cursor={}",
+                i,
+                d.name(),
+                c.max_width,
+                c.max_height,
+                c.has_3d,
+                c.has_cursor,
+            );
+        }
+    }
+
+    match active_console {
+        Some(note) if !note.is_empty() => {
+            crate::klog_info!("graphics: active framebuffer console: {}", note);
+        }
+        _ => {
+            #[cfg(feature = "graphic")]
+            crate::klog_info!("graphics: active framebuffer console: (none — serial/text only)");
+        }
+    }
+}
+
 impl From<DeviceError> for crate::HalError {
     fn from(err: DeviceError) -> Self {
         warn!("{:?}", err);
@@ -222,5 +288,17 @@ mod drivers_ffi {
     #[no_mangle]
     extern "C" fn drivers_intr_get() -> bool {
         intr_get()
+    }
+
+    use crate::console::klog_emit;
+    #[no_mangle]
+    extern "C" fn drivers_klog_emit(priority: u8, msg: *const u8, len: usize) {
+        if msg.is_null() || len == 0 {
+            return;
+        }
+        let slice = unsafe { core::slice::from_raw_parts(msg, len) };
+        if let Ok(s) = core::str::from_utf8(slice) {
+            klog_emit(priority, s);
+        }
     }
 }

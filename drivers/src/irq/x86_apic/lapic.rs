@@ -36,15 +36,20 @@ impl LocalApic {
                 // A LAPIC build failure is a critical issue but not necessarily
                 // a hard stop on all hardware — log it and attempt to continue
                 // rather than panicking and leaving the screen frozen at 80%.
-                log::error!("[lapic] LocalApicBuilder::build() failed: {} — continuing without LAPIC", e);
+                crate::klog_err!(
+                    "[lapic] LocalApicBuilder::build() failed: {} — continuing without LAPIC",
+                    e
+                );
                 return;
             }
         };
         inner.enable();
 
         if !inner.is_bsp() {
-            log::warn!("[lapic] init_bsp() called on non-BSP core (id={:#x}); APIC routing may be incorrect",
-                inner.id());
+            crate::klog_warn!(
+                "[lapic] init_bsp() on non-BSP core (id={:#x}); APIC routing may be incorrect",
+                inner.id()
+            );
         }
         BSP_ID = Some((inner.id() >> 24) as u8);
         LOCAL_APIC = Some(LocalApic { inner });

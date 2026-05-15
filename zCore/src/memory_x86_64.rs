@@ -39,8 +39,8 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
             continue;
         }
         if end != region.end {
-            warn!(
-                "Frame allocator: recortando region >64GiB: {:#x?} -> {:#x?}",
+            crate::klog_warn!(
+                "memory: frame allocator region clipped (>64GiB): {:#x?} -> {:#x?}",
                 region,
                 start..end
             );
@@ -50,13 +50,23 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
         if frame_start < frame_end {
             ba.insert(frame_start..frame_end);
             TOTAL_MEMORY.fetch_add(frame_idx_to_phys_addr(frame_end - frame_start), Ordering::Relaxed);
-            info!(
-                "Frame allocator: add range {:#x?}",
-                frame_idx_to_phys_addr(frame_start)..frame_idx_to_phys_addr(frame_end),
+            let range_start = frame_idx_to_phys_addr(frame_start);
+            let range_end = frame_idx_to_phys_addr(frame_end);
+            let mib = (range_end - range_start) / (1024 * 1024);
+            crate::klog_info!(
+                "memory: free RAM range {:#x}..{:#x} ({} MiB)",
+                range_start,
+                range_end,
+                mib
             );
         }
     }
-    info!("Frame allocator init end.");
+    let (used, total) = stats();
+    crate::klog_info!(
+        "memory: frame allocator ready ({} MiB managed, {} KiB used)",
+        total / (1024 * 1024),
+        used / 1024
+    );
 }
 
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
@@ -117,9 +127,10 @@ cfg_if! {
                     .lock()
                     .init(heap_start, HEAP_BLOCK * MACHINE_ALIGN);
             }
-            info!(
-                "Heap init end: {:#x?}",
-                heap_start..heap_start + KERNEL_HEAP_SIZE
+            crate::klog_info!(
+                "memory: kernel heap ready ({} KiB @ {:#x})",
+                KERNEL_HEAP_SIZE / 1024,
+                heap_start
             );
         }
 

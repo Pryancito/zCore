@@ -1,4 +1,4 @@
-use core::fmt;
+use core::fmt::{self, Write};
 use log::{self, Level, LevelFilter, Log, Metadata, Record};
 
 // ---------------------------------------------------------------------------
@@ -103,18 +103,69 @@ pub fn klog_size() -> usize {
     KLOG.with(|b| b.size())
 }
 
+/// Write a kernel message into the dmesg ring buffer only (not echoed to the graphic/serial console).
+/// `priority` follows syslog(3): 3=err, 4=warn, 6=info, 7=debug.
+pub fn klog_emit(priority: u8, msg: &str) {
+    let now = kernel_hal::timer::timer_now();
+    let micros = now.as_micros();
+    let mut line = [0u8; 512];
+    struct W<'a> { buf: &'a mut [u8], pos: usize }
+    impl fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            let n = s.len().min(self.buf.len().saturating_sub(self.pos));
+            self.buf[self.pos..self.pos + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.pos += n;
+            Ok(())
+        }
+    }
+    let pos = {
+        let mut w = W { buf: &mut line, pos: 0 };
+        let _ = write!(
+            w,
+            "<{prio}>[{s:>3}.{us:06}] {msg}\n",
+            prio = priority,
+            s = micros / 1_000_000,
+            us = micros % 1_000_000,
+            msg = msg.trim_end_matches('\n'),
+        );
+        w.pos
+    };
+    klog_write(&line[..pos]);
+}
+
 /// Initialize logging with the default max log level (WARN).
 pub fn init() {
     static LOGGER: SimpleLogger = SimpleLogger;
     log::set_logger(&LOGGER).unwrap();
     log::set_max_level(LevelFilter::Warn);
     // Register the ring-buffer accessors so linux-syscall can read them.
-    kernel_hal::console::klog_register(klog_read_all, klog_size);
+    kernel_hal::console::klog_register(klog_read_all, klog_size, klog_emit);
 }
 
 /// Reset max log level.
 pub fn set_max_level(level: &str) {
     log::set_max_level(level.parse().unwrap_or(LevelFilter::Warn));
+}
+
+#[macro_export]
+macro_rules! klog_info {
+    ($($arg:tt)*) => {
+        $crate::logging::klog_emit(6, &::alloc::format!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! klog_warn {
+    ($($arg:tt)*) => {
+        $crate::logging::klog_emit(4, &::alloc::format!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! klog_err {
+    ($($arg:tt)*) => {
+        $crate::logging::klog_emit(3, &::alloc::format!($($arg)*))
+    };
 }
 
 #[inline]
