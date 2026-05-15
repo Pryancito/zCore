@@ -118,9 +118,9 @@ impl Syscall<'_> {
                     }
                     -1 => {
                         // When the timeout = -1, the poll blocks indefinitely.
-                        // Fixme. So Check this Future regularly every 500ms
+                        // Fixme. So Check this Future regularly every 10ms
                         let current_time_ms = TimeVal::now().to_msec();
-                        let deadline = current_time_ms + 500;
+                        let deadline = current_time_ms + 10;
                         let waker = cx.waker().clone();
                         timer::timer_set(
                             Duration::from_millis(deadline as u64),
@@ -283,6 +283,17 @@ impl Syscall<'_> {
                                 Box::new(move |_| waker.wake_by_ref()),
                             );
                         }
+                    }
+                    -1 => {
+                        // When the timeout = -1, the select blocks indefinitely.
+                        // Check this Future regularly every 10ms
+                        let current_time_ms = TimeVal::now().to_msec();
+                        let deadline = current_time_ms + 10;
+                        let waker = cx.waker().clone();
+                        timer::timer_set(
+                            Duration::from_millis(deadline as u64),
+                            Box::new(move |_| waker.wake_by_ref()),
+                        );
                     }
                     _ => {}
                 }

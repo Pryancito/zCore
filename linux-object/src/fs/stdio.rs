@@ -250,8 +250,10 @@ impl INode for Stdin {
             Err(FsError::Again)
         }
     }
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        unimplemented!()
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        let s = unsafe { core::str::from_utf8_unchecked(buf) };
+        kernel_hal::console::console_write_str(s);
+        Ok(buf.len())
     }
     fn poll(&self) -> Result<PollStatus> {
         self.flush_ready_flag();

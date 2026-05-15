@@ -140,6 +140,7 @@ const FEXTNVM4_BEACON_DURATION_MASK: u32 = 0x7;
 // FEXTNVM7 bits
 const FEXTNVM7_SIDE_CLK_UNGATE: u32 = 1 << 2;
 const FEXTNVM7_DISABLE_SMB_PERST: u32 = 1 << 5;
+const FEXTNVM7_NEED_DESCR_RING_FLUSH: u32 = 1 << 16;
 const FEXTNVM7_DIS_LR_PROMISC: u32 = 1 << 28;
 
 // FEXTNVM9 bits
@@ -147,7 +148,7 @@ const FEXTNVM9_IOSFSB_CLKGATE_DIS: u32 = 1 << 11;
 const FEXTNVM9_IOSFSB_CLKREQ_DIS: u32 = 1 << 12;
 
 // FEXTNVM11 bits
-const FEXTNVM11_DISABLE_L1_2: u32 = 0x00000001;
+const FEXTNVM11_DISABLE_L1_2: u32 = 1 << 1;
 const FEXTNVM11_DISABLE_MULR_FIX: u32 = 1 << 13;
 
 // PBECCSTS bits
@@ -411,6 +412,16 @@ impl E1000eHw {
         !all_zeros && !all_fs
     }
 
+    /// Returns true for PCH-LPT (I217/I218) and later integrated NICs.
+    fn is_pch_lpt_or_later(&self) -> bool {
+        matches!(self.device_id,
+            0x1502..=0x1503 | 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 |
+            0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 |
+            0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f |
+            0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba
+        )
+    }
+
     /// Returns true for PCH-SPT (I219) and later silicon.
     /// These chips require explicit RXDCTL/TXDCTL QUEUE_ENABLE (bit 25) to
     /// activate the RX/TX DMA queues after RCTL_EN/TCTL_EN.
@@ -446,39 +457,41 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     unsafe fn flush_desc_rings(&self) {
         // Only SPT (I219) and later require this (SPT: 0x156f..=0x1570, 0x15b7..=0x15be, etc.)
-        if !matches!(self.device_id, 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
+        if !self.is_pch_spt_or_later() {
             return;
         }
 
-        // Disable MULR fix in FEXTNVM11
+        // 1. Set NEED_DESCR_RING_FLUSH in FEXTNVM7
+        let mut fextnvm7 = mmio_read(self.base, E1000E_FEXTNVM7);
+        fextnvm7 |= FEXTNVM7_NEED_DESCR_RING_FLUSH | FEXTNVM7_DIS_LR_PROMISC;
+        mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
+
+        // 2. Disable MULR fix in FEXTNVM11
         let mut fextnvm11 = mmio_read(self.base, E1000E_FEXTNVM11);
         fextnvm11 |= FEXTNVM11_DISABLE_MULR_FIX;
         mmio_write(self.base, E1000E_FEXTNVM11, fextnvm11);
 
-        // If TDLEN is non-zero, we might have pending descriptors
+        // 3. Briefly enable TX to flush
         let tdlen = mmio_read(self.base, E1000E_TDLEN);
         if tdlen > 0 {
-            // Briefly enable TX to flush
             let tctl = mmio_read(self.base, E1000E_TCTL);
             mmio_write(self.base, E1000E_TCTL, tctl | TCTL_EN);
             let _ = mmio_read(self.base, E1000E_TCTL); // flush
-            
-            let t_start = timer_now_as_micros();
-            while timer_now_as_micros().wrapping_sub(t_start) < 250 {
-                core::hint::spin_loop();
-            }
-            
+            Self::udelay(250);
             mmio_write(self.base, E1000E_TCTL, tctl & !TCTL_EN);
         }
 
-        // Disable RX
-        let rctl = mmio_read(self.base, E1000E_RCTL);
-        mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
-        let _ = mmio_read(self.base, E1000E_RCTL); // flush
-        let t_start = timer_now_as_micros();
-        while timer_now_as_micros().wrapping_sub(t_start) < 150 {
-            core::hint::spin_loop();
+        // 4. Briefly enable RX to flush
+        let rdlen = mmio_read(self.base, E1000E_RDLEN);
+        if rdlen > 0 {
+            let rctl = mmio_read(self.base, E1000E_RCTL);
+            mmio_write(self.base, E1000E_RCTL, rctl | RCTL_EN);
+            let _ = mmio_read(self.base, E1000E_RCTL); // flush
+            Self::udelay(250);
+            mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
         }
+        
+        Self::udelay(150);
     }
 
     // -----------------------------------------------------------------------
@@ -491,15 +504,8 @@ impl E1000eHw {
         // 1b. Try reading MAC from hardware (BIOS initialized) before we reset it.
         self.read_mac_from_hw();
         let mut mac_found = self.is_valid_mac();
-        if mac_found {
-            info!(
-                "[e1000e] found BIOS-initialized MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
-            );
-        }
 
         // 2. Issue global reset (RST bit in CTRL).
-        //    Before resetting, disable PCIe master and wait for it to take effect.
         let mut ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_GIO_MASTER_DISABLE);
         let t_master = timer_now_as_micros();
@@ -518,7 +524,6 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_WUFC, 0);
         mmio_write(self.base, E1000E_WUS, 0);
 
-        // Hard silence: spin for at least 10 ms, timed with the kernel clock.
         let t_rst = timer_now_as_micros();
         while timer_now_as_micros().wrapping_sub(t_rst) < POST_RST_US {
             if mmio_read(self.base, E1000E_CTRL) & CTRL_RST == 0 {
@@ -527,10 +532,7 @@ impl E1000eHw {
             core::hint::spin_loop();
         }
 
-        // 3. Poll STATUS until the device is ready (not 0xFFFF_FFFF = bus turnaround).
-        //    Timeout after 150 ms — PCH-based NICs (I217/I218/I219) can need up
-        //    to ~100 ms. Note: STATUS = 0 is a valid post-reset value (no link,
-        //    speeds not yet resolved) and must NOT be treated as "not ready".
+        // 3. Poll STATUS until the device is ready.
         let mut ready = false;
         let t_poll = timer_now_as_micros();
         while timer_now_as_micros().wrapping_sub(t_poll) < STATUS_POLL_US {
@@ -541,51 +543,27 @@ impl E1000eHw {
             }
             core::hint::spin_loop();
         }
-        if !ready {
-            warn!("[e1000e] device did not respond after reset — aborting init");
-            return Err(DeviceError::IoError);
-        }
+        if !ready { return Err(DeviceError::IoError); }
 
         // 4. Disable interrupts again (RST clears IMC)
         mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
 
-        // 5. If we don't have a valid MAC yet, try reading from NVM.
+        // 5. Recover MAC address if needed.
         if !mac_found {
-            info!("[e1000e] attempting NVM MAC read...");
             self.read_mac_from_nvm();
             mac_found = self.is_valid_mac();
-            if mac_found {
-                info!(
-                    "[e1000e] MAC from NVM success: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                    self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
-                );
-            }
         }
-
-        // 5b. If still no MAC, try RAL0/RAH0 again (some NICs auto-load after reset).
         if !mac_found {
-            info!("[e1000e] attempting post-reset RAL/RAH MAC read...");
             self.read_mac_from_hw();
             mac_found = self.is_valid_mac();
-            if mac_found {
-                info!(
-                    "[e1000e] MAC from RAL0/RAH0 success: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                    self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
-                );
-            }
         }
-
         if !mac_found {
-            // Fallback to a distinct default MAC if all detection fails.
             self.mac = [0x00, 0x0E, 0x10, 0x00, 0x0E, 0x00];
-            warn!(
-                "[e1000e] all detection failed; using fallback: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
-            );
+            warn!("[e1000e] using fallback MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]);
         }
 
-        // 6. Set link-up + auto-speed detection. 
-        // Also explicitly DISABLE flow control (TFCE | RFCE) and VLAN mode (VME).
+        // 6. Basic MAC configuration
         let ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(
             self.base,
@@ -593,279 +571,176 @@ impl E1000eHw {
             (ctrl | CTRL_SLU | CTRL_ASDE | CTRL_FD) & !(CTRL_TFCE | CTRL_RFCE | CTRL_VME | CTRL_GIO_MASTER_DISABLE),
         );
 
-        // 7. Clear MTA (multicast table)
-        for i in 0..E1000E_MTA_LEN {
-            mmio_write(self.base, E1000E_MTA_BASE + i, 0);
-        }
-
-        // 8. Initialize hardware bits (e1000_initialize_hw_bits_ich8lan)
         let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
-        ctrl_ext |= 1 << 22; // Required bit
-        if matches!(self.device_id, 0x1502..=0x1503 | 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
+        ctrl_ext |= 1 << 22; // PBA_CLR
+        if self.is_pch_lpt_or_later() {
             ctrl_ext |= CTRL_EXT_PHYPDEN;
         }
         ctrl_ext |= CTRL_EXT_RO_DIS;
-        ctrl_ext &= !CTRL_EXT_DPG_EN; // Disable Dynamic Power Gating
+        ctrl_ext &= !CTRL_EXT_DPG_EN;
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
 
-        // Apply PCH-specific bits
-        if matches!(self.device_id, 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
+        if self.is_pch_lpt_or_later() {
             mmio_write(self.base, E1000E_CRC_OFFSET, 0x65656565);
             let kabgtxd = mmio_read(self.base, E1000E_KABGTXD);
             mmio_write(self.base, E1000E_KABGTXD, kabgtxd | KABGTXD_BGSQLBIAS);
-        }
-
-        // Set TARC bits
-        let mut tarc0 = mmio_read(self.base, E1000E_TARC0);
-        tarc0 |= (1 << 23) | (1 << 24) | (1 << 26) | (1 << 27);
-        mmio_write(self.base, E1000E_TARC0, tarc0);
-
-        let mut tarc1 = mmio_read(self.base, E1000E_TARC1);
-        tarc1 |= (1 << 24) | (1 << 26) | (1 << 30);
-        tarc1 |= 1 << 28; // Not MULR
-        mmio_write(self.base, E1000E_TARC1, tarc1);
-
-        // Enable ECC on Lynxpoint and later
-        if matches!(self.device_id, 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
-            let pbeccsts = mmio_read(self.base, E1000E_PBECCSTS);
-            mmio_write(self.base, E1000E_PBECCSTS, pbeccsts | PBECCSTS_ECC_ENABLE);
             
-            let ctrl = mmio_read(self.base, E1000E_CTRL);
-            mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_MEHE);
-        }
-
-        // 6. Set receive address 0 (RAL0/RAH0) to our MAC
-        let ral = (self.mac[0] as u32)
-            | ((self.mac[1] as u32) << 8)
-            | ((self.mac[2] as u32) << 16)
-            | ((self.mac[3] as u32) << 24);
-        let rah = (self.mac[4] as u32) | ((self.mac[5] as u32) << 8) | (1u32 << 31); // bit 31 = Address Valid
-        unsafe {
-            mmio_write(self.base, E1000E_RAL0, ral);
-            mmio_write(self.base, E1000E_RAH0, rah);
-        }
-
-        // 9. Zero DMA rings and fill RX descriptor buffer pointers
-        let rx_ring = self.rx_ring.as_ptr::<RxDesc>();
-        let tx_ring = self.tx_ring.as_ptr::<TxDesc>();
-        core::ptr::write_bytes(rx_ring, 0, NUM_RX);
-        core::ptr::write_bytes(tx_ring, 0, NUM_TX);
-        for i in 0..NUM_RX {
-            let desc = unsafe { &mut *rx_ring.add(i) };
-            desc.addr = self.rx_bufs[i].paddr() as u64;
-            desc.length = 0;
-            desc.status = 0;
-        }
-        
-        // Ensure the zeroed rings and buffer addresses are flushed to memory
-        // so that the NIC DMA engine sees the correct descriptors immediately.
-        for i in 0..NUM_RX {
-            unsafe { 
-                core::arch::x86_64::_mm_clflush(self.rx_ring.as_ptr::<RxDesc>().add(i) as *const u8);
-            };
-        }
-        for i in 0..NUM_TX {
-            unsafe { core::arch::x86_64::_mm_clflush(self.tx_ring.as_ptr::<TxDesc>().add(i) as *const u8) };
-        }
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-
-        // 10. Configure TX ring
-        let tx_ring_pa = self.tx_ring.paddr();
-        mmio_write(self.base, E1000E_TDBAL, tx_ring_pa as u32);
-        mmio_write(self.base, E1000E_TDBAH, (tx_ring_pa >> 32) as u32);
-        mmio_write(
-            self.base,
-            E1000E_TDLEN,
-            (NUM_TX * size_of::<TxDesc>()) as u32,
-        );
-        mmio_write(self.base, E1000E_TDH, 0);
-        mmio_write(self.base, E1000E_TDT, 0);
-        
-        // TIPG: IPGT=8, IPGR1=8, IPGR2=12 (Linux default for ICH8+)
-        mmio_write(self.base, E1000E_TIPG, 8u32 | (8 << 10) | (12 << 20));
-
-        mmio_write(
-            self.base,
-            E1000E_TCTL,
-            TCTL_EN | TCTL_PSP | TCTL_CT_16 | TCTL_COLD_64,
-        );
-
-        if matches!(self.device_id, 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 | 0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba) {
-            
-            // Disable K1 in FEXTNVM6
+            // PCH-specific workarounds
             let mut fextnvm6 = mmio_read(self.base, E1000E_FEXTNVM6);
             fextnvm6 |= FEXTNVM6_K1_OFF_EN | FEXTNVM6_DIS_ELDW;
             mmio_write(self.base, E1000E_FEXTNVM6, fextnvm6);
             
-            // Disable K1 in KMRNCTRLSTA
             let mut kmrn = self.kmrn_read(KMRNCTRLSTA_K1_CONFIG);
             kmrn &= !KMRNCTRLSTA_K1_ENABLE;
             self.kmrn_write(KMRNCTRLSTA_K1_CONFIG, kmrn);
             
-            // Disable L1.2 power state in FEXTNVM11
             let mut fextnvm11 = mmio_read(self.base, E1000E_FEXTNVM11);
             fextnvm11 |= FEXTNVM11_DISABLE_L1_2;
             mmio_write(self.base, E1000E_FEXTNVM11, fextnvm11);
 
-            // Set Beacon Duration in FEXTNVM4 to 8usec
             let mut fextnvm4 = mmio_read(self.base, E1000E_FEXTNVM4);
             fextnvm4 &= !FEXTNVM4_BEACON_DURATION_MASK;
             fextnvm4 |= FEXTNVM4_BEACON_DURATION_8USEC;
             mmio_write(self.base, E1000E_FEXTNVM4, fextnvm4);
 
-            // Set FEXTNVM7 bits (bit 28 is NEED_DESCR_RING_FLUSH for I219)
             let mut fextnvm7 = mmio_read(self.base, E1000E_FEXTNVM7);
-            fextnvm7 |= FEXTNVM7_SIDE_CLK_UNGATE | FEXTNVM7_DISABLE_SMB_PERST | FEXTNVM7_DIS_LR_PROMISC;
+            fextnvm7 |= FEXTNVM7_SIDE_CLK_UNGATE | FEXTNVM7_DISABLE_SMB_PERST | FEXTNVM7_NEED_DESCR_RING_FLUSH | FEXTNVM7_DIS_LR_PROMISC;
             mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
 
-            // Set FEXTNVM9 bits
             let mut fextnvm9 = mmio_read(self.base, E1000E_FEXTNVM9);
             fextnvm9 |= FEXTNVM9_IOSFSB_CLKGATE_DIS | FEXTNVM9_IOSFSB_CLKREQ_DIS;
             mmio_write(self.base, E1000E_FEXTNVM9, fextnvm9);
 
-            // Set PBA (Packet Buffer Allocation)
-            // Linux uses 18K for RX, 14K for TX on these chips to avoid drops.
-            mmio_write(self.base, E1000E_PBA, 0x000E0012);
-        } else {
-            // Default PBA for older e1000e
-            mmio_write(self.base, E1000E_PBA, 0x00100030);
-        }
-
-        // 11. Configure RX ring
-        let rx_ring_pa = self.rx_ring.paddr();
-        mmio_write(self.base, E1000E_RDBAL, rx_ring_pa as u32);
-        mmio_write(self.base, E1000E_RDBAH, (rx_ring_pa >> 32) as u32);
-        mmio_write(
-            self.base,
-            E1000E_RDLEN,
-            (NUM_RX * size_of::<RxDesc>()) as u32,
-        );
-        unsafe { mmio_write(self.base, E1000E_RDH, 0) };
-        unsafe { mmio_write(self.base, E1000E_RDT, 0) }; // Will be set to NUM_RX-1 after RCTL_EN
-        self.rx_tail = 0; // rx_tail tracks the next descriptor to check
-
-        // 6c. Disable RX Delay Timers for immediate write-back
-        unsafe { mmio_write(self.base, E1000E_RDTR, 0) };
-        unsafe { mmio_write(self.base, E1000E_RADV, 0) };
-        unsafe { mmio_write(self.base, E1000E_ITR, 0) }; // Also disable Interrupt Throttling
-        
-        // 6b. Zero Multicast Table Array (MTA)
-        for i in 0..128 {
-            unsafe { mmio_write(self.base, E1000E_MTA_BASE + i, 0) };
-        }
-        
-        unsafe {
-            mmio_write(self.base, E1000E_RXCSUM, 0); // Disable RX checksum offload
-            // Disable NFS filtering and IPv6 extension header parsing which can hang RX
-            let rfctl = RFCTL_NFSW_DIS | RFCTL_NFSR_DIS | RFCTL_IPV6_EX_DIS | RFCTL_NEW_IPV6_EXT_DIS;
-            mmio_write(self.base, E1000E_RFCTL, rfctl);
-            mmio_write(self.base, E1000E_MRQC, 0);   // Disable RSS / multiple queues
-            mmio_write(self.base, E1000E_VET, 0);    // Clear VLAN EtherType
+            // PBA: 26K RX, 18K TX
+            mmio_write(self.base, E1000E_PBA, 0x0012001A);
             
             // SPT/KBL Si errata workaround to avoid data corruption (IOSFPC bit 16)
             if matches!(self.device_id, 0x156f..=0x1570 | 0x15b7..=0x15be) {
                 let iosfpc = mmio_read(self.base, E1000E_IOSFPC);
                 mmio_write(self.base, E1000E_IOSFPC, iosfpc | 0x00010000);
             }
+        } else {
+            mmio_write(self.base, E1000E_PBA, 0x00100030);
         }
 
-        // Set RXDCTL - write-back thresholds.
-        // On I219, we want immediate write-back (WTHRESH=1) or even better, 
-        // set some thresholds to avoid drops.
-        unsafe {
-            mmio_write(self.base, E1000E_RXDCTL, (1 << 16) | (1 << 24)); // WTHRESH=1, GRAN=1
-        };
+        // TARC bits
+        let mut tarc0 = mmio_read(self.base, E1000E_TARC0);
+        tarc0 |= (1 << 23) | (1 << 24) | (1 << 26) | (1 << 27);
+        mmio_write(self.base, E1000E_TARC0, tarc0);
 
-        // Initialize SRRCTL for Legacy descriptors and 2KB buffer size
-        // BSIZEPACKET = 2 (units of 1KB = 2048 bytes)
-        // DESCTYPE = 000 (Legacy)
-        unsafe {
-            mmio_write(self.base, E1000E_SRRCTL, 2);
+        let mut tarc1 = mmio_read(self.base, E1000E_TARC1);
+        tarc1 |= (1 << 24) | (1 << 26) | (1 << 30) | (1 << 28);
+        mmio_write(self.base, E1000E_TARC1, tarc1);
+
+        // 7. Set Receive Address (RAL0/RAH0)
+        let ral = (self.mac[0] as u32) | ((self.mac[1] as u32) << 8) | ((self.mac[2] as u32) << 16) | ((self.mac[3] as u32) << 24);
+        let rah = (self.mac[4] as u32) | ((self.mac[5] as u32) << 8) | (1u32 << 31);
+        mmio_write(self.base, E1000E_RAL0, ral);
+        mmio_write(self.base, E1000E_RAH0, rah);
+
+        // 8. Clear MTA
+        for i in 0..E1000E_MTA_LEN {
+            mmio_write(self.base, E1000E_MTA_BASE + i, 0);
         }
 
-        // 7. Enable receiver
-        // EN: bit 1, SBP: bit 2, UPE: bit 3 (unicast promisc, accept directed frames),
-        // MPE: bit 4, BAM: bit 15, SECRC: bit 26
-        let rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K;
-        unsafe { mmio_write(self.base, E1000E_RCTL, rctl) };
-        
-        // Set TXDCTL (TX Descriptor Control)
-        // GRAN=1, FULL_TX_DESC_WB=1, COUNT_DESC=1 (bit 22, required on ICH8+), PTHRESH=31
-        unsafe { mmio_write(self.base, E1000E_TXDCTL, TXDCTL_GRAN | TXDCTL_FULL_TX_DESC_WB | TXDCTL_COUNT_DESC | 0x1F) };
+        // 9. Initialize Rings
+        let rx_ring = self.rx_ring.as_ptr::<RxDesc>();
+        let tx_ring = self.tx_ring.as_ptr::<TxDesc>();
+        core::ptr::write_bytes(rx_ring, 0, NUM_RX);
+        core::ptr::write_bytes(tx_ring, 0, NUM_TX);
+        for i in 0..NUM_RX {
+            let desc = &mut *rx_ring.add(i);
+            desc.addr = self.rx_bufs[i].paddr() as u64;
+            core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
+        }
+        for i in 0..NUM_TX {
+            core::arch::x86_64::_mm_clflush(tx_ring.add(i) as *const TxDesc as *const u8);
+        }
+        fence(Ordering::SeqCst);
 
-        // For PCH-SPT (I219) and later: explicitly enable the TX DMA queue (bit 25) and poll.
-        // Without this, the TX descriptor ring DMA engine stays disabled on real hardware.
+        // 10. Configure TX
+        let tx_ring_pa = self.tx_ring.paddr();
+        mmio_write(self.base, E1000E_TDBAL, tx_ring_pa as u32);
+        mmio_write(self.base, E1000E_TDBAH, (tx_ring_pa >> 32) as u32);
+        mmio_write(self.base, E1000E_TDLEN, (NUM_TX * size_of::<TxDesc>()) as u32);
+        mmio_write(self.base, E1000E_TDH, 0);
+        mmio_write(self.base, E1000E_TDT, 0);
+        mmio_write(self.base, E1000E_TIPG, 8 | (8 << 10) | (12 << 20));
+
+        // TXDCTL and Queue Enable
+        mmio_write(self.base, E1000E_TXDCTL, TXDCTL_GRAN | TXDCTL_FULL_TX_DESC_WB | TXDCTL_COUNT_DESC | 31);
         if self.is_pch_spt_or_later() {
-            let txdctl = unsafe { mmio_read(self.base, E1000E_TXDCTL) } | TXDCTL_QUEUE_ENABLE;
-            unsafe { mmio_write(self.base, E1000E_TXDCTL, txdctl) };
-            let _ = unsafe { mmio_read(self.base, E1000E_STATUS) }; // flush posted writes
-            let t = timer_now_as_micros();
-            loop {
-                if unsafe { mmio_read(self.base, E1000E_TXDCTL) } & TXDCTL_QUEUE_ENABLE != 0 {
-                    break;
-                }
-                if timer_now_as_micros().wrapping_sub(t) > 10_000 {
-                    warn!("[e1000e] timeout waiting for TXDCTL QUEUE_ENABLE");
-                    break;
-                }
+            let txdctl = mmio_read(self.base, E1000E_TXDCTL);
+            mmio_write(self.base, E1000E_TXDCTL, txdctl | TXDCTL_QUEUE_ENABLE);
+            let t0 = timer_now_as_micros();
+            while mmio_read(self.base, E1000E_TXDCTL) & TXDCTL_QUEUE_ENABLE == 0 {
+                if timer_now_as_micros().wrapping_sub(t0) > 10_000 { break; }
                 core::hint::spin_loop();
             }
         }
+        mmio_write(self.base, E1000E_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT_16 | TCTL_COLD_64);
 
-        // Flow control watermarks (Linux defaults)
-        unsafe {
-            mmio_write(self.base, E1000E_FCTTV, 0xFFFF);
-            mmio_write(self.base, E1000E_FCRTV, 0xFFFF);
-            mmio_write(self.base, E1000E_FCRTL, 0x05048);
-            mmio_write(self.base, E1000E_FCRTH, 0x05C20);
-        }
+        // 11. Configure RX
+        let rx_ring_pa = self.rx_ring.paddr();
+        mmio_write(self.base, E1000E_RDBAL, rx_ring_pa as u32);
+        mmio_write(self.base, E1000E_RDBAH, (rx_ring_pa >> 32) as u32);
+        mmio_write(self.base, E1000E_RDLEN, (NUM_RX * size_of::<RxDesc>()) as u32);
+        mmio_write(self.base, E1000E_RDH, 0);
+        mmio_write(self.base, E1000E_RDT, 0);
+        self.rx_tail = 0;
 
-        // Wait a bit for the receiver to stabilize
-        for _ in 0..1000 { unsafe { core::arch::x86_64::_mm_pause() }; }
-
-        // CRITICAL: Set RDT *AFTER* RCTL_EN per datasheet §13.4.18
-        unsafe { mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32) };
-
-        // For PCH-SPT (I219) and later: explicitly enable the RX DMA queue (bit 25) and poll.
-        // Without this, the RX descriptor ring DMA engine stays disabled on real hardware —
-        // packets arrive but hardware never writes them into the descriptor ring.
-        if self.is_pch_spt_or_later() {
-            let rxdctl = unsafe { mmio_read(self.base, E1000E_RXDCTL) } | RXDCTL_QUEUE_ENABLE;
-            unsafe { mmio_write(self.base, E1000E_RXDCTL, rxdctl) };
-            let _ = unsafe { mmio_read(self.base, E1000E_STATUS) }; // flush posted writes
-            let t = timer_now_as_micros();
-            loop {
-                if unsafe { mmio_read(self.base, E1000E_RXDCTL) } & RXDCTL_QUEUE_ENABLE != 0 {
-                    break;
-                }
-                if timer_now_as_micros().wrapping_sub(t) > 10_000 {
-                    warn!("[e1000e] timeout waiting for RXDCTL QUEUE_ENABLE");
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-        }
-
-        // 12. Clear any pending interrupts, then enable all interrupts
-        let _ = mmio_read(self.base, E1000E_ICR);
-        mmio_write(self.base, E1000E_IMS, 0xFFFF_FFFF);
-        
-        // Disable interrupt throttling and delay timers for lower latency/polling
-        mmio_write(self.base, E1000E_ITR, 0);
         mmio_write(self.base, E1000E_RDTR, 0);
         mmio_write(self.base, E1000E_RADV, 0);
-
-        let status = mmio_read(self.base, E1000E_STATUS);
+        mmio_write(self.base, E1000E_ITR, 0);
         
-        info!(
-            "[e1000e] init done. STATUS={:#010x} link={}",
-            status,
-            if status & STATUS_LU != 0 {
-                "UP"
-            } else {
-                "DOWN"
+        mmio_write(self.base, E1000E_RXCSUM, 0);
+        mmio_write(self.base, E1000E_RFCTL, RFCTL_NFSW_DIS | RFCTL_NFSR_DIS | RFCTL_IPV6_EX_DIS | RFCTL_NEW_IPV6_EXT_DIS);
+        mmio_write(self.base, E1000E_MRQC, 0);
+        mmio_write(self.base, E1000E_VET, 0);
+        mmio_write(self.base, E1000E_SRRCTL, 2); // 2KB buffer
+
+        // Flow control
+        mmio_write(self.base, E1000E_FCTTV, 0xFFFF);
+        mmio_write(self.base, E1000E_FCRTV, 0xFFFF);
+        mmio_write(self.base, E1000E_FCRTL, 0x05048);
+        mmio_write(self.base, E1000E_FCRTH, 0x05C20);
+
+        // RXDCTL and Queue Enable
+        mmio_write(self.base, E1000E_RXDCTL, 8 | (1 << 8) | (0 << 16) | (1 << 24)); // P=8, H=1, W=0, G=1
+        if self.is_pch_spt_or_later() {
+            let rxdctl = mmio_read(self.base, E1000E_RXDCTL);
+            mmio_write(self.base, E1000E_RXDCTL, rxdctl | RXDCTL_QUEUE_ENABLE);
+            let t0 = timer_now_as_micros();
+            while mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE == 0 {
+                if timer_now_as_micros().wrapping_sub(t0) > 10_000 { break; }
+                core::hint::spin_loop();
             }
-        );
+        }
+
+        mmio_write(self.base, E1000E_RCTL, RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K);
+        for _ in 0..1000 { core::arch::x86_64::_mm_pause(); }
+        mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32);
+
+        // Disable EEE
+        mmio_write(self.base, 0x0E30 / 4, 0);
+
+        // 12. Interrupts
+        let _ = mmio_read(self.base, E1000E_ICR);
+        mmio_write(self.base, E1000E_IMS, 0xFFFF_FFFF);
+
+        // 13. Wait for link
+        let mut status = mmio_read(self.base, E1000E_STATUS);
+        if status & STATUS_LU == 0 {
+            warn!("[e1000e] link is DOWN, waiting...");
+            let t0 = timer_now_as_micros();
+            while timer_now_as_micros().wrapping_sub(t0) < 5_000_000 {
+                status = mmio_read(self.base, E1000E_STATUS);
+                if status & STATUS_LU != 0 { break; }
+                core::hint::spin_loop();
+            }
+        }
+
+        info!("[e1000e] init done. STATUS={:#010x} link={}", status, if status & STATUS_LU != 0 { "UP" } else { "DOWN" });
         Ok(())
     }
 
@@ -894,7 +769,9 @@ impl E1000eHw {
             warn!("[e1000e] RX packet: {} bytes (idx={})", len, idx);
 
             if len == 0 || len as usize > BUF_SIZE {
-                warn!("[e1000e] RX invalid length: {} (idx={})", len, idx);
+                let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
+                let rdt = unsafe { mmio_read(self.base, E1000E_RDT) };
+                warn!("[e1000e] RX invalid length: {} (idx={}, RDH={}, RDT={})", len, idx, rdh, rdt);
                 self.recycle_rx_desc(idx, desc);
                 continue;
             }
@@ -919,6 +796,17 @@ impl E1000eHw {
             self.recycle_rx_desc(idx, desc);
             return Some(pkt);
         }
+    }
+
+    /// Debug helper to dump hardware state
+    pub fn dump_hw_state(&self) {
+        let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
+        let rdt = unsafe { mmio_read(self.base, E1000E_RDT) };
+        let tdh = unsafe { mmio_read(self.base, E1000E_TDH) };
+        let tdt = unsafe { mmio_read(self.base, E1000E_TDT) };
+        let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
+        warn!("[e1000e] HW STATE: RDH={}, RDT={}, TDH={}, TDT={}, STATUS={:#x}", 
+            rdh, rdt, tdh, tdt, status);
     }
 
     // -----------------------------------------------------------------------
@@ -987,10 +875,10 @@ impl E1000eHw {
         let tdh = unsafe { mmio_read(self.base, E1000E_TDH) };
         let tdt = unsafe { mmio_read(self.base, E1000E_TDT) };
         let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
-        /*
-        warn!("[e1000e] TX check: idx={}, TDH={}, TDT={}, STATUS={:#x}, desc0_status={:#x}", 
-            idx, tdh, tdt, status, unsafe { (*self.tx_ring.as_ptr::<TxDesc>()).status });
-        */
+        if idx % 32 == 0 {
+            warn!("[e1000e] TX status: idx={}, TDH={}, TDT={}, STATUS={:#x}", 
+                idx, tdh, tdt, status);
+        }
 
         if self.tx_tail == 0 {
             self.tx_first = false;
@@ -1107,10 +995,12 @@ impl NetScheme for E1000eInterface {
     }
     
     fn poll(&self) -> DeviceResult {
-        // warn!("[e1000e] poll() called");
+        // Unconditional dump for debugging entry into poll
+        self.driver.hw.lock().dump_hw_state();
+
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
-        
+
         // Ensure any pending IRQ-driven jobs are processed
         crate::utils::deferred_job::drain_deferred_jobs();
         
@@ -1127,9 +1017,9 @@ impl NetScheme for E1000eInterface {
         Ok(())
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
-        // Receive a pending packet without holding the hw lock during the copy.
         let pkt = self.driver.hw.lock().receive();
         if let Some(pkt) = pkt {
+            warn!("[e1000e] recv: got {} bytes", pkt.len());
             let n = pkt.len().min(buf.len());
             buf[..n].copy_from_slice(&pkt[..n]);
             Ok(n)
@@ -1138,15 +1028,13 @@ impl NetScheme for E1000eInterface {
         }
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        // Acquire the lock once for both the can_send check and the actual send.
-        // Do NOT split into two lock() calls: the temporary guard from the first
-        // lock() in an `if` condition lives through the entire if-body, which
-        // would cause the second lock() to spin forever (deadlock).
+        warn!("[e1000e] send: attempting to send {} bytes", data.len());
         let mut hw = self.driver.hw.lock();
         if hw.can_send() {
             hw.send(data)?;
             Ok(data.len())
         } else {
+            warn!("[e1000e] send: hardware not ready");
             Err(DeviceError::NotReady)
         }
     }

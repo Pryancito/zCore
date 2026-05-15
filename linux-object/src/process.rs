@@ -276,6 +276,11 @@ impl LinuxProcess {
         }
     }
 
+    /// Get the parent zircon process.
+    pub fn zircon_process(&self) -> Arc<Process> {
+        self.parent.upgrade().unwrap()
+    }
+
     /// Get futex object.
     #[allow(unsafe_code)]
     pub fn get_futex(&self, uaddr: VirtAddr) -> Arc<Futex> {

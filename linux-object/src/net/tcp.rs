@@ -176,6 +176,7 @@ impl Socket for TcpSocketState {
                         }
                     }
                 }
+                thread::yield_now().await;
             }
         } else {
             error!("connect: bad endpoint");

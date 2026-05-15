@@ -5,6 +5,7 @@ mod file;
 pub mod ioctl;
 mod pipe;
 mod procfs;
+mod proc_self;
 mod pseudo;
 mod epoll;
 mod eventfd;
@@ -306,6 +307,11 @@ impl LinuxProcess {
                 &self.execute_path(),
                 FileType::SymLink,
             )));
+        }
+        if path == "/proc/self/fd" || path == "/proc/self/fd/" {
+            return Ok(Arc::new(proc_self::ProcSelfFdDir {
+                process: self.zircon_process().clone(),
+            }));
         }
         let (fd_dir_path, fd_name) = split_path(path);
         if fd_dir_path == "/proc/self/fd" {
