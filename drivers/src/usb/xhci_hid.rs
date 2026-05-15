@@ -39,6 +39,8 @@ const PORTSC_CHANGE_BITS: u32 =
 // PED (bit 1) es RW1C: escribir 1 deshabilita el puerto. Siempre hay que enmascararlo
 // cuando modificamos PORTSC para no tirar accidentalmente la habilitación del puerto.
 const PORTSC_RW1C_AND_RO_MASK: u32 = PORTSC_CHANGE_BITS | (1 << 1); // incluye PED
+const XHCI_MAX_XECP_TRAVERSAL: usize = 256;
+const XHCI_WAIT_SPIN_FACTOR: u64 = 50_000;
 
 // ——— USB legacy (EHCI/OHCI/UHCI) ———
 //
@@ -256,7 +258,13 @@ impl XhciMmio {
             return;
         }
         let mut cap_ptr = xecp << 2;
+        let mut cap_steps = 0usize;
         while cap_ptr != 0 && cap_ptr < self.bar_size {
+            if cap_steps >= XHCI_MAX_XECP_TRAVERSAL {
+                warn!("[xhci] xECP chain demasiado larga/cíclica, abortando handoff");
+                break;
+            }
+            cap_steps = cap_steps.saturating_add(1);
             let cap_val = self.read_cap(cap_ptr);
             let cap_id = (cap_val & 0xff) as u8;
             if cap_id == 1 {
@@ -268,10 +276,19 @@ impl XhciMmio {
                     self.write_cap(cap_ptr, legsup);
 
                     let start = timer_now_us();
+                    let mut spins = 0u64;
+                    let max_spins = 500_000_u64
+                        .saturating_mul(XHCI_WAIT_SPIN_FACTOR)
+                        .max(XHCI_WAIT_SPIN_FACTOR);
                     while (self.read_cap(cap_ptr) & (1 << 16)) != 0
                         && (timer_now_us() - start) < 500_000
+                        && spins < max_spins
                     {
+                        spins = spins.saturating_add(1);
                         spin_loop();
+                    }
+                    if spins >= max_spins {
+                        warn!("[xhci] handoff alcanzó guard de spins (timer estancado?)");
                     }
 
                     if (self.read_cap(cap_ptr) & (1 << 16)) != 0 {
