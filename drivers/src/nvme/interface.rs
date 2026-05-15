@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::scheme::{BlockScheme, Scheme};
-use crate::{Device, DeviceResult};
+use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
 use pci::{PCIDevice, BAR};
@@ -28,6 +28,9 @@ pub struct NvmeInterface {
 }
 
 impl NvmeInterface {
+    const CQ_WAIT_TIMEOUT_US: u64 = 1_000_000;
+    const CQ_WAIT_MAX_SPINS: u64 = 50_000_000;
+
     pub fn new(bar: usize, irq: usize) -> DeviceResult<NvmeInterface> {
         let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, 0)));
 
@@ -41,16 +44,17 @@ impl NvmeInterface {
             irq,
         };
 
-        interface.init();
+        interface.init()?;
 
         Ok(interface)
     }
 
     // config admin queue ,io queue
-    pub fn init(&mut self) {
-        self.nvme_configure_admin_queue();
+    pub fn init(&mut self) -> DeviceResult {
+        self.nvme_configure_admin_queue()?;
 
-        self.nvme_alloc_io_queue();
+        self.nvme_alloc_io_queue()?;
+        Ok(())
     }
 
     pub fn get_name_irq(&self) -> (String, usize) {
@@ -59,7 +63,35 @@ impl NvmeInterface {
 }
 
 impl NvmeInterface {
-    pub fn nvme_configure_admin_queue(&mut self) {
+    fn wait_cq_complete(
+        queue: &mut NvmeQueue<ProviderImpl>,
+        cq_index: usize,
+        context: &str,
+    ) -> DeviceResult {
+        let start = timer_now_as_micros();
+        let mut spins = 0_u64;
+
+        loop {
+            let status = queue.cq[cq_index].read();
+            if status.status != 0 {
+                return Ok(());
+            }
+
+            core::hint::spin_loop();
+            spins = spins.saturating_add(1);
+            if timer_now_as_micros().wrapping_sub(start) >= Self::CQ_WAIT_TIMEOUT_US
+                || spins >= Self::CQ_WAIT_MAX_SPINS
+            {
+                warn!(
+                    "[nvme] timeout waiting CQ{} completion for {}",
+                    cq_index, context
+                );
+                return Err(DeviceError::IoError);
+            }
+        }
+    }
+
+    pub fn nvme_configure_admin_queue(&mut self) -> DeviceResult {
         let mut admin_queue = self.admin_queue.lock();
 
         let bar = self.bar;
@@ -116,17 +148,12 @@ impl NvmeInterface {
         let admin_q_db = dbs + admin_queue.db_offset;
         unsafe { write_volatile(admin_q_db as *mut u32, 1) }
 
-        loop {
-            let status = admin_queue.cq[0].read();
-            if status.status != 0 {
-                // warn!("nvme cq :{:#x?}", status);
-                unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 1) }
-                break;
-            }
-        }
+        Self::wait_cq_complete(&mut admin_queue, 0, "identify admin queue")?;
+        unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 1) }
+        Ok(())
     }
 
-    pub fn nvme_alloc_io_queue(&mut self) {
+    pub fn nvme_alloc_io_queue(&mut self) -> DeviceResult {
         let mut admin_queue = self.admin_queue.lock();
         // let io_queue = self.io_queues[0].lock();
 
@@ -147,14 +174,8 @@ impl NvmeInterface {
 
         unsafe { write_volatile(admin_q_db as *mut u32, 2) }
 
-        loop {
-            let status = admin_queue.cq[1].read();
-            if status.status != 0 {
-                // warn!("nvme cq :{:#x?}", status);
-                unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 2) }
-                break;
-            }
-        }
+        Self::wait_cq_complete(&mut admin_queue, 1, "set queue count")?;
+        unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 2) }
 
         //nvme create cq
         let mut cmd = NvmeCreateCq::new();
@@ -179,14 +200,8 @@ impl NvmeInterface {
         admin_queue.sq[2].write(common_cmd);
         admin_queue.sq_tail += 1;
         unsafe { write_volatile(admin_q_db as *mut u32, 3) }
-        loop {
-            let status = admin_queue.cq[2].read();
-            if status.status != 0 {
-                // warn!("nvme cq :{:#x?}", status);
-                unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 3) }
-                break;
-            }
-        }
+        Self::wait_cq_complete(&mut admin_queue, 2, "create io completion queue")?;
+        unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 3) }
 
         // nvme create sq
         let mut cmd = NvmeCreateSq::new();
@@ -217,16 +232,9 @@ impl NvmeInterface {
         unsafe { write_volatile(admin_q_db as *mut u32, 4) }
 
         // wait for command complete
-        loop {
-            let status = admin_queue.cq[3].read();
-            if status.status != 0 {
-                // warn!("nvme cq :{:#x?}", status);
-
-                // write doorbell register
-                unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 4) }
-                break;
-            }
-        }
+        Self::wait_cq_complete(&mut admin_queue, 3, "create io submission queue")?;
+        unsafe { write_volatile((admin_q_db + 0x4) as *mut u32, 4) }
+        Ok(())
     }
 }
 
@@ -280,16 +288,8 @@ impl BlockScheme for NvmeInterface {
         unsafe { write_volatile((dbs + db_offset) as *mut u32, (tail + 1) as u32) }
 
         // wait for command complete
-        loop {
-            let status = admin_queue.cq[tail].read();
-            if status.status != 0 {
-                // warn!("nvme cq :{:#x?}", status);
-
-                // write doorbell
-                unsafe { write_volatile((dbs + db_offset + 0x4) as *mut u32, (tail + 1) as u32) }
-                break;
-            }
-        }
+        Self::wait_cq_complete(&mut admin_queue, tail, "read block")?;
+        unsafe { write_volatile((dbs + db_offset + 0x4) as *mut u32, (tail + 1) as u32) }
 
         // admin_queue.cq_head = admin_queue.sq_tail;
 
@@ -336,16 +336,8 @@ impl BlockScheme for NvmeInterface {
         unsafe { write_volatile((dbs + db_offset) as *mut u32, (tail + 1) as u32) }
 
         // wait for command complete
-        loop {
-            let status = admin_queue.cq[tail].read();
-            if status.status != 0 {
-                // warn!("nvme cq :{:#x?}", status);
-
-                // write doorbell
-                unsafe { write_volatile((dbs + db_offset + 0x4) as *mut u32, (tail + 1) as u32) }
-                break;
-            }
-        }
+        Self::wait_cq_complete(&mut admin_queue, tail, "write block")?;
+        unsafe { write_volatile((dbs + db_offset + 0x4) as *mut u32, (tail + 1) as u32) }
         Ok(())
     }
 
