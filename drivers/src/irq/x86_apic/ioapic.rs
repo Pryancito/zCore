@@ -65,7 +65,20 @@ impl IoApic {
     pub fn new(id: u8, base_vaddr: usize, gsi_start: u32) -> Self {
         let mut inner = unsafe { IoApicInner::new(base_vaddr as u64) };
         let max_entry = unsafe { inner.max_table_entry() };
-        unsafe { assert_eq!(id, inner.id()) };
+        let hardware_id = unsafe { inner.id() };
+        if hardware_id != id {
+            log::warn!("IOAPIC ID mismatch: ACPI says {}, hardware says {}. Attempting to fix...", id, hardware_id);
+            unsafe {
+                let base = base_vaddr as *mut u32;
+                base.write_volatile(0x00); // select ID register
+                let val = (base.add(4)).read_volatile();
+                (base.add(4)).write_volatile((val & 0x00ffffff) | ((id as u32) << 24));
+            }
+        }
+        unsafe {
+            let new_id = inner.id();
+            assert_eq!(id, new_id, "Failed to set IOAPIC ID or hardware ID still mismatch");
+        }
 
         unsafe {
             inner.init(super::X86_INT_BASE as u8);
