@@ -1277,7 +1277,14 @@ impl E1000eHw {
         );
 
         if self.phy_bmsr_link_up(phy) {
-            self.mac_apply_phy_speed_st2(phy, st2);
+            // If MAC already reports link-up, keep it in pure autoneg mode.
+            // For some real I219/e1000e systems, forcing a MAC speed sync here
+            // leaves CTRL in a bad state (ASDE/SPD), and RX stays silent.
+            if mmio_read(self.base, E1000E_STATUS) & STATUS_LU == 0 {
+                self.mac_apply_phy_speed_st2(phy, st2);
+            } else {
+                self.mac_allow_autoneg();
+            }
         }
         st2
     }
@@ -1287,6 +1294,9 @@ impl E1000eHw {
         self.disable_ulp();
         self.mac_allow_autoneg();
         let st2 = self.pch_post_link_phy_tune();
+        // Re-assert autoneg after PHY tuning/sync so RX is enabled with a
+        // consistent CTRL state even if the previous step touched speed bits.
+        self.mac_allow_autoneg();
         self.program_tipg_for_st2(st2);
 
         // Wait for STATUS.LU (link up). SPEED_MASK==0 is valid 10 Mb/s encoding;
