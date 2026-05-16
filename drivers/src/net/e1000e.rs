@@ -1281,6 +1281,33 @@ impl E1000eHw {
                     }
                 }
             }
+            if status & STATUS_LU == 0 {
+                crate::klog_warn!(
+                    "[e1000e] link still down after MDIO restart — toggling LANPHYPC recovery path\n"
+                );
+                self.toggle_lanphypc();
+                self.pch_kick_autoneg_mdio();
+                const AFTER_LANPHYPC_MS: u32 = 3000;
+                let steps3 = (AFTER_LANPHYPC_MS as u64 * 1000 / STEP_US).max(1);
+                for i in 0..steps3 {
+                    Self::udelay(STEP_US);
+                    status = mmio_read(self.base, E1000E_STATUS);
+                    if status & STATUS_LU != 0 {
+                        crate::klog_info!(
+                            "[e1000e] link came up after LANPHYPC recovery ({}ms)\n",
+                            i * 50
+                        );
+                        break;
+                    }
+                    if i % 20 == 0 {
+                        crate::klog_warn!(
+                            "[e1000e] post-LANPHYPC wait: {}ms STATUS={:#x}\n",
+                            i * 50,
+                            status
+                        );
+                    }
+                }
+            }
         }
         if status & STATUS_LU == 0 {
             crate::klog_warn!("e1000e: NIC Link is Down (Final STATUS={:#x})\n", status);
