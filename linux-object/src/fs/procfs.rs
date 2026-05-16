@@ -171,10 +171,7 @@ impl INode for ProcNetDirINode {
         match name {
             "." => Ok(Arc::new(ProcNetDirINode)),
             ".." => Ok(Arc::new(ProcRootINode)),
-            "dev" => Ok(Arc::new(Pseudo::new(
-                &proc_net_dev_content(),
-                FileType::File,
-            ))),
+            "dev" => Ok(Arc::new(ProcNetDevINode)),
             "route" => Ok(Arc::new(Pseudo::new(
                 &proc_net_route_content(),
                 FileType::File,
@@ -196,9 +193,60 @@ impl INode for ProcNetDirINode {
     }
 }
 
+/// `/proc/net/dev` — regenerated on every read so BusyBox `ifconfig` sees live counters.
+struct ProcNetDevINode;
+
+impl INode for ProcNetDevINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let content = proc_net_dev_content();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = (bytes.len() - offset).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        let size = proc_net_dev_content().len();
+        Ok(Metadata {
+            dev: 0,
+            inode: 0,
+            size,
+            blk_size: 4096,
+            blocks: (size + 4095) / 4096,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
 fn proc_net_dev_content() -> String {
     // Linux-like procfs content used by BusyBox `ifconfig`.
-    // Counters are currently reported as 0 until we plumb per-interface stats.
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -220,8 +268,16 @@ fn proc_net_dev_content() -> String {
         let stats = iface.get_stats();
         let _ = writeln!(
             s,
-            "{:>6}: {:>7} {:>7}    0    0    0     0          0         0 {:>8} {:>8}    0    0    0     0       0          0",
-            name, stats.rx_bytes, stats.rx_packets, stats.tx_bytes, stats.tx_packets
+            "{:>6}: {:>7} {:>7} {:>4} {:>4}    0     0          0         0 {:>8} {:>8} {:>4} {:>4}    0     0       0          0",
+            name,
+            stats.rx_bytes,
+            stats.rx_packets,
+            stats.rx_errors,
+            stats.rx_dropped,
+            stats.tx_bytes,
+            stats.tx_packets,
+            stats.tx_errors,
+            stats.tx_dropped,
         );
     }
     s

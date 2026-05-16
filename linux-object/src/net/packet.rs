@@ -120,11 +120,14 @@ impl Socket for PacketSocketState {
         let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
-            // Drain any deferred jobs first (IRQ handlers queue iface.poll here on real hardware)
+            // Always drain deferred jobs and poll the NIC on every iteration.
+            // On real hardware the packet queue may contain network noise (ARP probes,
+            // mDNS, etc.) that keeps it non-empty, which would prevent net.poll()
+            // from ever running and leave DHCPACK stuck in the hardware RX ring.
             kernel_hal::deferred_job::drain_deferred_jobs();
 
             let ifindex = *self.inner.ifindex.lock();
-            if self.inner.packet_queue.lock().is_empty() {
+            {
                 let ifaces = drivers::all_net();
                 if ifindex > 0 {
                     if let Some(net) = ifaces.try_get(ifindex as usize - 1) {
@@ -200,6 +203,8 @@ impl Socket for PacketSocketState {
                 frame.set_ethertype(protocol.into());
                 frame.payload_mut().copy_from_slice(data);
                 dev.send(&buf).map_err(|_| LxError::EIO)?;
+                crate::net::poll_ifaces();
+                kernel_hal::deferred_job::drain_deferred_jobs();
                 info!("PacketSocket: sent {} bytes (DGRAM, proto (host)={:#x})", data.len(), protocol);
                 return Ok(data.len());
             }
@@ -208,6 +213,8 @@ impl Socket for PacketSocketState {
         }
         
         dev.send(data).map_err(|_| LxError::EIO)?;
+        crate::net::poll_ifaces();
+        kernel_hal::deferred_job::drain_deferred_jobs();
         info!("PacketSocket: sent {} bytes (ifindex={})", data.len(), ifindex);
         Ok(data.len())
     }
@@ -243,6 +250,8 @@ impl Socket for PacketSocketState {
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
+        kernel_hal::deferred_job::drain_deferred_jobs();
+        crate::net::poll_ifaces();
         let readable = !self.inner.packet_queue.lock().is_empty();
         let ifaces = drivers::all_net();
         let ifindex = *self.inner.ifindex.lock();

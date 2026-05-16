@@ -10,6 +10,11 @@ pub struct NetStats {
     pub rx_packets: u64,
     pub tx_bytes: u64,
     pub tx_packets: u64,
+    /// RX errors / drops (driver-specific; shown in /proc/net/dev).
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
 }
 
 #[derive(Debug, Clone)]
