@@ -37,6 +37,8 @@ use super::{timer_now_as_micros, intr_on, intr_off, intr_get};
 // ---------------------------------------------------------------------------
 const E1000E_CTRL: usize = 0x0000 / 4;
 const E1000E_STATUS: usize = 0x0008 / 4;
+const E1000E_MDIC: usize = 0x0020 / 4;
+const E1000E_EXTCNF_CTRL: usize = 0x0F00 / 4;
 const E1000E_EECD: usize = 0x0010 / 4;
 const E1000E_VFTA_BASE: usize = 0x5600 / 4; // VLAN Filter Table Array (128 × u32)
 const E1000E_EERD: usize = 0x0014 / 4;
@@ -124,12 +126,18 @@ const CTRL_FD: u32 = 1 << 0; // full duplex
 const CTRL_SLU: u32 = 1 << 6; // set link up
 const CTRL_ASDE: u32 = 1 << 5; // auto-speed detection enable
 const CTRL_RST: u32 = 1 << 26; // full MAC + PHY reset
+const CTRL_PHY_RST: u32 = 1 << 31; // PHY-only reset (Linux E1000_CTRL_PHY_RST)
 const CTRL_TFCE: u32 = 1 << 27; // Transmit Flow Control Enable
 const CTRL_RFCE: u32 = 1 << 28; // Receive Flow Control Enable
 const CTRL_VME: u32 = 1 << 30; // VLAN Mode Enable
 const CTRL_GIO_MASTER_DISABLE: u32 = 1 << 2; // GIO Master Disable
 const CTRL_LANPHYPC_OVERRIDE: u32 = 0x00010000;
 const CTRL_LANPHYPC_VALUE: u32 = 0x00020000;
+const CTRL_SPD_1000: u32 = 1 << 9;
+const CTRL_SPD_100: u32 = 1 << 8;
+const CTRL_FRCSPD: u32 = 1 << 12;
+const CTRL_FRCDPX: u32 = 1 << 11;
+const CTRL_ILOS: u32 = 1 << 7; // Invert Loss of Signal
 
 
 // CTRL_EXT bits
@@ -166,7 +174,17 @@ const RXDCTL_QUEUE_ENABLE: u32 = 1 << 25; // PCH-SPT (I219) and later: must be s
 
 // STATUS bits
 const STATUS_LU: u32 = 1 << 1; // link up
+const STATUS_LAN_INIT_DONE: u32 = 1 << 9; // LAN init from NVM completed (ICH10+)
+const STATUS_PHYRA: u32 = 1 << 10; // PHY Reset Asserted — must clear after PHY_RST
 const STATUS_GIO_MASTER_ENABLE: u32 = 1 << 19; // GIO Master Enable Status
+const STATUS_SPEED_MASK: u32 = 0x000000C0;
+const STATUS_SPEED_1000: u32 = 0x00000080;
+const STATUS_SPEED_100: u32 = 0x00000040;
+const STATUS_FD: u32 = 1 << 0;
+
+// EXTCNF_CTRL (PCH PHY / NVM shared access)
+const EXTCNF_CTRL_SWFLAG: u32 = 0x20;
+const EXTCNF_CTRL_GATE_PHY_CFG: u32 = 0x80;
 
 // EERD bits (discrete e1000e like 82574L use bit 4 for DONE; PCH-integrated like I219 use bit 1)
 const EERD_START: u32 = 1 << 0;
@@ -177,6 +195,16 @@ const EERD_DATA_SHIFT: u32 = 16;
 const PCICFG_DESC_RING_STATUS: u16 = 0xE4;
 const FLUSH_DESC_REQUIRED: u16 = 0x100;
 
+// MDIO / MDIC (Clause 22 access to integrated PHY)
+const MDIC_REG_SHIFT: u32 = 16;
+const MDIC_PHY_SHIFT: u32 = 21;
+const MDIC_OP_READ: u32 = 0x0800_0000;
+const MDIC_OP_WRITE: u32 = 0x0400_0000;
+const MDIC_READY: u32 = 0x1000_0000;
+const MDIC_ERROR: u32 = 0x4000_0000;
+const MII_BMCR: u32 = 0x00;
+const BMCR_ANENABLE: u16 = 0x1000;
+const BMCR_ANRESTART: u16 = 0x0200;
 
 // STATUS-ready poll: 150 ms covers PCH-based NICs (I217/I218/I219).
 const STATUS_POLL_US: u64 = 150_000;
@@ -275,6 +303,7 @@ pub struct E1000eHw {
     tx_bufs: Vec<DmaRegion>,
     tx_tail: usize,
     tx_first: bool,
+    phy_addr: u8,
     pub stats: NetStats,
 }
 
@@ -453,20 +482,25 @@ impl E1000eHw {
         if !self.is_pch_lpt_or_later() {
             return;
         }
-        // NOTE: Writing to H2ME (Host-to-Management Engine) register can
-        // trigger an SMI on systems with active Intel ME firmware. An SMI
-        // freezes the CPU from the OS side — if ME's handler hangs or isn't
-        // expecting this request during early boot, the system requires a
-        // power cycle to recover (reset button becomes unresponsive).
-        //
-        // The CTRL_RST issued immediately after this function will disable
-        // ULP unconditionally at the hardware level, making this write
-        // redundant and dangerous. Skip it entirely.
+        
         let fwsm = mmio_read(self.base, E1000E_FWSM);
         if fwsm & 0x8000 != 0 {
             // E1000_ICH_FWSM_FW_VALID is set: Intel ME firmware is active.
-            // Log it but do NOT write to H2ME — that would trigger an SMI.
-            warn!("[e1000e] Intel ME firmware active (FWSM={:#010x}), skipping H2ME write", fwsm);
+            warn!("[e1000e] Intel ME firmware active (FWSM={:#010x})", fwsm);
+        }
+
+        // Linux e1000_disable_ulp_lpt_lp: clear ULP enable and indicator bits in H2ME.
+        // H2ME = 0x05B50. Bit 11 is ULP_INDICATOR, Bit 10 is ULP_EN.
+        // We also check for START/DONE bits if we want to be very safe, but clearing
+        // these bits is generally safe even if ME is active, as long as we don't
+        // trigger a new request that the ME isn't ready for.
+        let mut h2me = mmio_read(self.base, E1000E_H2ME);
+        if h2me & ((1 << 11) | (1 << 10)) != 0 {
+            warn!("[e1000e] ULP active in H2ME ({:#x}), disabling...", h2me);
+            h2me &= !((1 << 11) | (1 << 10));
+            mmio_write(self.base, E1000E_H2ME, h2me);
+            let _ = mmio_read(self.base, E1000E_H2ME); // flush
+            Self::udelay(100);
         }
     }
 
@@ -537,11 +571,214 @@ impl E1000eHw {
         Self::udelay(100);
     }
 
+    /// Linux `e1000_acquire_swflag_ich8lan`: software PHY/MDIO ownership.
+    unsafe fn pch_swflag_acquire(&self) -> bool {
+        for _ in 0..200 {
+            let v = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+            if v & EXTCNF_CTRL_SWFLAG == 0 {
+                break;
+            }
+            Self::udelay(1_000);
+        }
+        let mut v = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+        if v & EXTCNF_CTRL_SWFLAG != 0 {
+            warn!("[e1000e] EXTCNF_CTRL SWFLAG held by FW/HW");
+            return false;
+        }
+        v |= EXTCNF_CTRL_SWFLAG;
+        mmio_write(self.base, E1000E_EXTCNF_CTRL, v);
+        for _ in 0..200 {
+            let r = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+            if r & EXTCNF_CTRL_SWFLAG != 0 {
+                return true;
+            }
+            Self::udelay(1_000);
+        }
+        warn!("[e1000e] failed to set EXTCNF_CTRL SWFLAG");
+        let r = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+        mmio_write(
+            self.base,
+            E1000E_EXTCNF_CTRL,
+            r & !EXTCNF_CTRL_SWFLAG,
+        );
+        false
+    }
+
+    unsafe fn pch_swflag_release(&self) {
+        let mut v = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+        if v & EXTCNF_CTRL_SWFLAG != 0 {
+            v &= !EXTCNF_CTRL_SWFLAG;
+            mmio_write(self.base, E1000E_EXTCNF_CTRL, v);
+            let _ = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+        }
+    }
+
+    /// Linux `e1000_get_cfg_done_ich8lan` / `e1000_lan_init_done_ich8lan` after PHY_RST.
+    unsafe fn pch_phy_reset_complete(&self) {
+        Self::udelay(10_000);
+        let mut loops = 1500u32;
+        while loops > 0 {
+            let s = mmio_read(self.base, E1000E_STATUS);
+            if s & STATUS_LAN_INIT_DONE != 0 {
+                break;
+            }
+            Self::udelay(150);
+            loops -= 1;
+        }
+        if loops == 0 {
+            warn!("[e1000e] STATUS.LAN_INIT_DONE timeout after PHY_RST");
+        }
+        let mut s = mmio_read(self.base, E1000E_STATUS);
+        if s & STATUS_LAN_INIT_DONE != 0 {
+            mmio_write(
+                self.base,
+                E1000E_STATUS,
+                s & !STATUS_LAN_INIT_DONE,
+            );
+            let _ = mmio_read(self.base, E1000E_STATUS);
+        }
+        s = mmio_read(self.base, E1000E_STATUS);
+        if s & STATUS_PHYRA != 0 {
+            mmio_write(
+                self.base,
+                E1000E_STATUS,
+                s & !STATUS_PHYRA,
+            );
+            let _ = mmio_read(self.base, E1000E_STATUS);
+        }
+    }
+
+    unsafe fn pch_issue_phy_reset(&self) {
+        let ext_saved = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+        mmio_write(
+            self.base,
+            E1000E_EXTCNF_CTRL,
+            ext_saved | EXTCNF_CTRL_GATE_PHY_CFG,
+        );
+        let _ = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+
+        if !self.pch_swflag_acquire() {
+            mmio_write(self.base, E1000E_EXTCNF_CTRL, ext_saved);
+            warn!("[e1000e] PCH: PHY_RST skipped (no SWFLAG)");
+            return;
+        }
+
+        let ctrl = mmio_read(self.base, E1000E_CTRL);
+        mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_PHY_RST);
+        let _ = mmio_read(self.base, E1000E_CTRL);
+        Self::udelay(100);
+        mmio_write(self.base, E1000E_CTRL, ctrl);
+        let _ = mmio_read(self.base, E1000E_CTRL);
+        Self::udelay(300);
+
+        self.pch_phy_reset_complete();
+
+        self.pch_swflag_release();
+
+        let ext = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+        mmio_write(
+            self.base,
+            E1000E_EXTCNF_CTRL,
+            ext & !EXTCNF_CTRL_GATE_PHY_CFG,
+        );
+        let _ = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+    }
+
+    /// Clear STATUS.PHYRA if set (Linux `e1000_get_cfg_done_ich8lan`). Safe when
+    /// PHY_RST was skipped because firmware may leave this bit asserted.
+    unsafe fn pch_clear_status_phyra_if_set(&self) {
+        let s = mmio_read(self.base, E1000E_STATUS);
+        if s & STATUS_PHYRA != 0 {
+            warn!("[e1000e] clearing STATUS.PHYRA (status was {:#x})", s);
+            mmio_write(self.base, E1000E_STATUS, s & !STATUS_PHYRA);
+            let _ = mmio_read(self.base, E1000E_STATUS);
+        }
+    }
+
+    unsafe fn mdic_read(&self, phy_addr: u8, reg: u32) -> Option<u16> {
+        let is_pch = self.is_pch_lpt_or_later();
+        if is_pch && !self.pch_swflag_acquire() {
+            return None;
+        }
+
+        let cmd =
+            (reg << MDIC_REG_SHIFT) | ((phy_addr as u32) << MDIC_PHY_SHIFT) | MDIC_OP_READ;
+        mmio_write(self.base, E1000E_MDIC, cmd);
+        let mut res = None;
+        for _ in 0..400 {
+            Self::udelay(50);
+            let mdic = mmio_read(self.base, E1000E_MDIC);
+            if mdic & MDIC_READY != 0 {
+                if mdic & MDIC_ERROR == 0 {
+                    res = Some(mdic as u16);
+                }
+                break;
+            }
+        }
+
+        if is_pch {
+            self.pch_swflag_release();
+        }
+        res
+    }
+
+    unsafe fn mdic_write(&self, phy_addr: u8, reg: u32, val: u16) -> bool {
+        let is_pch = self.is_pch_lpt_or_later();
+        if is_pch && !self.pch_swflag_acquire() {
+            return false;
+        }
+
+        let cmd = (val as u32)
+            | (reg << MDIC_REG_SHIFT)
+            | ((phy_addr as u32) << MDIC_PHY_SHIFT)
+            | MDIC_OP_WRITE;
+        mmio_write(self.base, E1000E_MDIC, cmd);
+        let mut ok = false;
+        for _ in 0..400 {
+            Self::udelay(50);
+            let mdic = mmio_read(self.base, E1000E_MDIC);
+            if mdic & MDIC_READY != 0 {
+                ok = (mdic & MDIC_ERROR) == 0;
+                break;
+            }
+        }
+
+        if is_pch {
+            self.pch_swflag_release();
+        }
+        ok
+    }
+
+    /// Clause-22 BMCR autoneg restart (PHY addr 1 or 2, per Linux PCH probe).
+    unsafe fn pch_kick_autoneg_mdio(&self) {
+        // MDIO operations now handle SWFLAG themselves.
+        let mut did = false;
+        for phy_addr in [1u8, 2u8] {
+            if let Some(bmcr) = self.mdic_read(phy_addr, MII_BMCR) {
+                if bmcr == 0 || bmcr == 0xFFFF {
+                    continue;
+                }
+                let new_bmcr = bmcr | BMCR_ANENABLE | BMCR_ANRESTART;
+                if self.mdic_write(phy_addr, MII_BMCR, new_bmcr) {
+                    crate::klog_warn!(
+                        "[e1000e] PHY {} BMCR autoneg restart {:#x} -> {:#x}\n",
+                        phy_addr, bmcr, new_bmcr
+                    );
+                }
+                did = true;
+                break;
+            }
+        }
+        if !did {
+            crate::klog_warn!("[e1000e] MDIO: no PHY responding on addr 1 or 2\n");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Full hardware reset + init
     // -----------------------------------------------------------------------
     unsafe fn reset_and_init(&mut self) -> DeviceResult {
-        warn!("[e1000e] reset_and_init starting...");
+        crate::klog_warn!("[e1000e] reset_and_init starting...\n");
         // 0. Wake up card (disable ULP so the PHY is fully powered).
         // NOTE: toggle_lanphypc() is intentionally NOT called here.  That
         // function is a recovery/error-path tool (used by Linux only when
@@ -560,7 +797,7 @@ impl E1000eHw {
         self.flush_desc_rings();
 
         if skip_hw_reset {
-            warn!("[e1000e] PCH: skipping CTRL_RST, keeping BIOS PHY/link state");
+            crate::klog_warn!("[e1000e] PCH: skipping CTRL_RST and PHY_RST, preserving BIOS state\n");
             mmio_write(self.base, E1000E_WUC, 0);
             mmio_write(self.base, E1000E_WUFC, 0);
             mmio_write(self.base, E1000E_WUS, 0xFFFF_FFFF);
@@ -568,6 +805,9 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
             // Stop legacy BIOS DMA before reprogramming our descriptor rings.
             self.stop_rx_tx_engines();
+            // C8: Skipping PHY_RST as well. Linux only does it if link is down or on errors.
+            // Keeping BIOS PHY state often results in a faster and more reliable link-up.
+            self.pch_clear_status_phyra_if_set();
         } else {
         let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
@@ -704,7 +944,9 @@ impl E1000eHw {
         ctrl_ext |= 1 << 31; // PBA_SUPPORT (I219)
         ctrl_ext |= 1 << 28; // INT_TIMER_CLR
         if self.is_pch_lpt_or_later() {
-            ctrl_ext |= CTRL_EXT_PHYPDEN;
+            // Linux sets PHYPDEN for D3 low-power; on several I219 systems that
+            // keeps STATUS.LU cleared after driver init without a full MAC reset.
+            ctrl_ext &= !CTRL_EXT_PHYPDEN;
         }
         ctrl_ext |= CTRL_EXT_RO_DIS;
         ctrl_ext &= !CTRL_EXT_DPG_EN;
@@ -903,16 +1145,18 @@ impl E1000eHw {
         // Enable checksum offload: IP and TCP/UDP checksums
         mmio_write(self.base, E1000E_RXCSUM, (1 << 8) | (1 << 9) | (1 << 12)); // IPOFL, TUOFL, ALL
         
-        // Force Link Up
-        let ctrl = mmio_read(self.base, E1000E_CTRL);
-        mmio_write(self.base, E1000E_CTRL, ctrl | (1 << 6) | (1 << 5)); // SLU (bit 6) + ASDE (bit 5)
+        // Force Link Up and Full Duplex
+        let mut ctrl = mmio_read(self.base, E1000E_CTRL);
+        // Clear force bits to allow autoneg to work. Set SLU and ASDE.
+        ctrl &= !(CTRL_FRCSPD | CTRL_FRCDPX | CTRL_SPD_1000 | CTRL_SPD_100);
+        ctrl |= CTRL_SLU | CTRL_ASDE | CTRL_FD;
+        mmio_write(self.base, E1000E_CTRL, ctrl);
         
         let status = mmio_read(self.base, E1000E_STATUS);
-        warn!("[e1000e] HW STATE: RDH={}, RDT={}, STATUS={:#x} ({})", 
-            mmio_read(self.base, E1000E_RDH), 
-            mmio_read(self.base, E1000E_RDT), 
+        crate::klog_info!("[e1000e] HW STATE: CTRL={:#x}, STATUS={:#x} ({})\n", 
+            mmio_read(self.base, E1000E_CTRL), 
             status,
-            if (status & (1 << 1)) != 0 { "LINK UP" } else { "LINK DOWN" }
+            if (status & STATUS_LU) != 0 { "LINK UP" } else { "LINK DOWN" }
         );
 
         // Disable EEE
@@ -925,17 +1169,121 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_ICR); // clear pending
         mmio_write(self.base, E1000E_IMS, (1 << 7) | (1 << 2) | (1 << 0)); // RXT0, LSC, TXDW
 
-        // 13. Check link state but do NOT block boot waiting for it.
-        // On real hardware the BIOS/UEFI has already negotiated the link by the
-        // time the OS driver loads, so STATUS_LU is usually already set.
-        // If the link is DOWN (e.g. cable just connected, or NIC negotiating),
-        // the LSC (Link Status Change) interrupt — already enabled in IMS above —
-        // will fire and handle_irq() will log the new state. Blocking here for
-        // up to 1.5 s with udelay(100_000) was the primary cause of the boot
-        // hang at 80% on real I219-V hardware.
-        let status = mmio_read(self.base, E1000E_STATUS);
+        // 13. Link status for dmesg. On PCH I219+ we skip CTRL_RST; after PHY
+        // reset and ring setup, STATUS_LU may lag until autoneg completes.
+        let mut status = mmio_read(self.base, E1000E_STATUS);
+        if status & STATUS_LU == 0 && self.is_pch_spt_or_later() {
+            crate::klog_warn!("[e1000e] link down, waiting for settlement...\n");
+            const PCH_LINK_SETTLE_TOTAL_MS: u32 = 3000;
+            const STEP_US: u64 = 50_000;
+            let steps = (PCH_LINK_SETTLE_TOTAL_MS as u64 * 1000 / STEP_US).max(1);
+            let mut phy_forced = false;
+            for i in 0..steps {
+                Self::udelay(STEP_US);
+                status = mmio_read(self.base, E1000E_STATUS);
+                let ctrl = mmio_read(self.base, E1000E_CTRL);
+                if status & STATUS_LU != 0 {
+                    crate::klog_info!("[e1000e] link came up after {}ms (STATUS={:#x}, CTRL={:#x})\n",
+                        i * 50, status, ctrl);
+                    break;
+                }
+                // Periodic PHY status check every 500ms
+                if i % 10 == 0 {
+                    for phy_addr in [1u8, 2u8] {
+                        if let Some(bmsr) = self.mdic_read(phy_addr, 0x01) { // MII_BMSR
+                            if bmsr == 0 || bmsr == 0xFFFF { continue; }
+                            self.phy_addr = phy_addr;
+                            let phy_linked = bmsr & 0x0004 != 0;
+                            if phy_linked {
+                                // Read PSS (reg 17) twice — first read is sometimes stale on I219
+                                let _ = self.mdic_read(phy_addr, 17);
+                                Self::udelay(500);
+                                let pss = self.mdic_read(phy_addr, 17).unwrap_or(0);
+
+                                crate::klog_info!(
+                                    "[e1000e] PHY {} UP (BMSR={:#x}, PSS={:#x}). MAC STATUS={:#x}, CTRL={:#x}\n",
+                                    phy_addr, bmsr, pss, status, ctrl
+                                );
+
+                                // PHY is up but MAC STATUS.LU is 0 — try manual sync
+                                if status & STATUS_LU == 0 && !phy_forced {
+                                    phy_forced = true;
+
+                                    // Decode speed/duplex from PSS[15:13].
+                                    // PSS=0 → fall back to 1000/Full (most common case).
+                                    let (speed, duplex): (u32, u32) = if pss != 0 {
+                                        (((pss >> 14) & 0x3) as u32, ((pss >> 13) & 0x1) as u32)
+                                    } else {
+                                        (2u32, 1u32) // 1000 Mbps, Full Duplex
+                                    };
+
+                                    crate::klog_warn!(
+                                        "[e1000e] forcing MAC: speed={} duplex={}\n",
+                                        match speed { 2 => "1000", 1 => "100", _ => "10" },
+                                        if duplex != 0 { "full" } else { "half" }
+                                    );
+
+                                    // IMPORTANT: CTRL_FRCSPD and CTRL_ASDE are mutually
+                                    // exclusive.  ASDE must be cleared when forcing speed
+                                    // or the MAC ignores the forced value entirely.
+                                    let mut new_ctrl = ctrl & !(
+                                        CTRL_SPD_1000 | CTRL_SPD_100 |
+                                        CTRL_FRCSPD | CTRL_FRCDPX |
+                                        CTRL_FD | CTRL_ASDE
+                                    );
+                                    if speed == 2 { new_ctrl |= CTRL_SPD_1000; }
+                                    else if speed == 1 { new_ctrl |= CTRL_SPD_100; }
+                                    if duplex != 0 { new_ctrl |= CTRL_FD; }
+                                    new_ctrl |= CTRL_FRCSPD | CTRL_FRCDPX | CTRL_SLU;
+                                    mmio_write(self.base, E1000E_CTRL, new_ctrl);
+                                    let _ = mmio_read(self.base, E1000E_CTRL); // flush
+
+                                    // Give the MAC 200ms to latch the forced speed
+                                    for _ in 0..4 {
+                                        Self::udelay(50_000);
+                                        status = mmio_read(self.base, E1000E_STATUS);
+                                        if status & STATUS_LU != 0 { break; }
+                                    }
+                                    if status & STATUS_LU != 0 {
+                                        crate::klog_info!("[e1000e] manual sync SUCCESS (STATUS={:#x})\n", status);
+                                        break;
+                                    }
+                                    // Force didn't help immediately — revert to autoneg so
+                                    // we don't leave the MAC in a broken forced state.
+                                    let revert = new_ctrl & !(CTRL_FRCSPD | CTRL_FRCDPX | CTRL_SPD_1000 | CTRL_SPD_100);
+                                    mmio_write(self.base, E1000E_CTRL, revert | CTRL_SLU | CTRL_ASDE | CTRL_FD);
+                                    let _ = mmio_read(self.base, E1000E_CTRL);
+                                    phy_forced = false; // allow one more retry later
+                                }
+                            }
+                            break; // found a responding PHY, stop scanning
+                        }
+                    }
+                }
+            }
+            if status & STATUS_LU == 0 {
+                crate::klog_warn!("[e1000e] STATUS.LU still 0 after settle — trying autoneg restart\n");
+                self.pch_kick_autoneg_mdio();
+                // Wait up to 6s post-MDIO restart; I219-V cold autoneg can take 4-5s
+                const AFTER_MDIO_MS: u32 = 6000;
+                let steps2 = (AFTER_MDIO_MS as u64 * 1000 / STEP_US).max(1);
+                for i in 0..steps2 {
+                    Self::udelay(STEP_US);
+                    status = mmio_read(self.base, E1000E_STATUS);
+                    if status & STATUS_LU != 0 {
+                        crate::klog_info!("[e1000e] link came up after MDIO restart ({}ms)\n", i * 50);
+                        break;
+                    }
+                    // Every 1s log current status so we can see progress
+                    if i % 20 == 0 {
+                        crate::klog_warn!("[e1000e] post-autoneg wait: {}ms STATUS={:#x}\n",
+                            i * 50, status);
+                    }
+                }
+            }
+        }
         if status & STATUS_LU == 0 {
-            crate::klog_warn!("e1000e: NIC Link is Down\n");
+            crate::klog_warn!("e1000e: NIC Link is Down (Final STATUS={:#x})\n", status);
         } else {
             crate::klog_info!("e1000e: NIC Link is Up\n");
         }
@@ -1454,6 +1802,7 @@ pub fn init(
         tx_bufs,
         tx_tail: 0,
         tx_first: true,
+        phy_addr: 1, // Default to 1, updated during probe
         stats: NetStats::default(),
     };
 
