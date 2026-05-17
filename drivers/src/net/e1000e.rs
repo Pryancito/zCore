@@ -1915,6 +1915,13 @@ impl E1000eHw {
         }
         if status & STATUS_LU == 0 {
             crate::klog_warn!("e1000e: NIC Link is Down (Final STATUS={:#x})\n", status);
+            if self.is_pch_spt_or_later() {
+                crate::klog_warn!(
+                    "[e1000e] forcing RX ring re-arm despite LU=0 (real HW fallback)\n"
+                );
+                self.mac_allow_autoneg();
+                self.enable_rx_after_link();
+            }
         } else {
             crate::klog_info!("e1000e: NIC Link is Up\n");
             self.mac_allow_autoneg();
@@ -2288,7 +2295,7 @@ impl Scheme for E1000eInterface {
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr == 0 {
             self.ims_rearm();
-            return;
+            crate::klog_warn!("[e1000e] IRQ with ICR=0; forcing deferred poll fallback\n");
         }
 
         let mpc = unsafe { mmio_read(self.base, 0x04010 / 4) }; // Missed Packet Count
