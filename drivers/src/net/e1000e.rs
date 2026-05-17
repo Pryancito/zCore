@@ -503,7 +503,7 @@ impl E1000eHw {
     unsafe fn read_mac_from_hw(&mut self) {
         let ral = mmio_read(self.base, E1000E_RAL0);
         let rah = mmio_read(self.base, E1000E_RAH0);
-        warn!("[e1000e] hardware registers: RAL0={:#010x}, RAH0={:#010x}", ral, rah);
+
         if ral == 0 && (rah & 0xFFFF) == 0 {
             return;
         }
@@ -983,12 +983,7 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_CTRL, ctrl);
         let _ = mmio_read(self.base, E1000E_CTRL);
         self.mac_speed_sync_pulse();
-        crate::klog_info!(
-            "[e1000e] MAC CTRL set for PHY{} speed {} reg26={:#x}\n",
-            phy_addr,
-            Self::phy_speed_label(speed),
-            st2
-        );
+
     }
 
     /// I219 100M full: Linux ich8lan sets TIPG IPGT=0xC (not default 8).
@@ -1049,12 +1044,7 @@ impl E1000eHw {
             ctrl |= CTRL_SPD_100;
         }
         mmio_write(self.base, E1000E_CTRL, ctrl);
-        crate::klog_info!(
-            "[e1000e] force-speed done PHY{} -> STATUS={:#x} CTRL={:#x}\n",
-            phy_addr,
-            status,
-            ctrl
-        );
+
     }
 
     unsafe fn pch_disable_k1(&self) {
@@ -1091,11 +1081,7 @@ impl E1000eHw {
             }
             self.phy_addr = phy_addr;
             let st2 = self.mdic_read(phy_addr, MII_PHY_STATUS_2).unwrap_or(0);
-            crate::klog_warn!(
-                "[e1000e] MAC/PHY desync: PHY{} BMSR link reg26={:#x} — autoneg (no FRCSPD)\n",
-                phy_addr,
-                st2
-            );
+            crate::klog_warn!("[e1000e] MAC/PHY desync: PHY{} up but STATUS.LU=0, re-autoneg\n", phy_addr);
             self.mac_allow_autoneg();
             self.pch_kick_autoneg_mdio();
             for pulse in 0..3u32 {
@@ -1103,11 +1089,7 @@ impl E1000eHw {
                     Self::udelay(50_000);
                     if mmio_read(self.base, E1000E_STATUS) & STATUS_LU != 0 {
                         self.mac_allow_autoneg();
-                        crate::klog_info!(
-                            "[e1000e] MAC/PHY sync OK STATUS={:#x} CTRL={:#x}\n",
-                            mmio_read(self.base, E1000E_STATUS),
-                            mmio_read(self.base, E1000E_CTRL)
-                        );
+                        crate::klog_info!("[e1000e] MAC/PHY sync OK\n");
                         return true;
                     }
                 }
@@ -1133,12 +1115,7 @@ impl E1000eHw {
                         let new_anar = anar | ADVERTISE_ALL_COPPER;
                         if new_anar != anar {
                             let _ = self.mdic_write(phy_addr, MII_ADVERTISE, new_anar);
-                            crate::klog_warn!(
-                                "[e1000e] PHY {} ANAR refresh {:#x} -> {:#x}\n",
-                                phy_addr,
-                                anar,
-                                new_anar
-                            );
+
                         }
                     }
                 }
@@ -1147,22 +1124,12 @@ impl E1000eHw {
                         let new_ctrl1000 = ctrl1000 | ADVERTISE_1000FULL;
                         if new_ctrl1000 != ctrl1000 {
                             let _ = self.mdic_write(phy_addr, MII_CTRL1000, new_ctrl1000);
-                            crate::klog_warn!(
-                                "[e1000e] PHY {} 1000T advert refresh {:#x} -> {:#x}\n",
-                                phy_addr,
-                                ctrl1000,
-                                new_ctrl1000
-                            );
+
                         }
                     }
                 }
                 let new_bmcr = bmcr | BMCR_ANENABLE | BMCR_ANRESTART;
-                if self.mdic_write(phy_addr, MII_BMCR, new_bmcr) {
-                    crate::klog_warn!(
-                        "[e1000e] PHY {} BMCR autoneg restart {:#x} -> {:#x}\n",
-                        phy_addr, bmcr, new_bmcr
-                    );
-                }
+                let _ = self.mdic_write(phy_addr, MII_BMCR, new_bmcr);
                 did = true;
                 break;
             }
@@ -1245,20 +1212,9 @@ impl E1000eHw {
         let status = mmio_read(self.base, E1000E_STATUS);
         let frc = (ctrl & (CTRL_FRCSPD | CTRL_FRCDPX)) != 0;
         let spd = status & STATUS_SPEED_MASK;
-        crate::klog_info!(
-            "e1000e: {} CTRL={:#x} FRC={} STATUS={:#x} spd={:#x} RCTL={:#x} RFCTL={:#x} MANC={:#x} GPRC={} RDH={} RDT={}\n",
-            tag,
-            ctrl,
-            if frc { "BAD" } else { "ok" },
-            status,
-            spd,
-            mmio_read(self.base, E1000E_RCTL),
-            mmio_read(self.base, E1000E_RFCTL),
-            mmio_read(self.base, E1000E_MANC),
-            mmio_read(self.base, E1000E_GPRC),
-            mmio_read(self.base, E1000E_RDH),
-            mmio_read(self.base, E1000E_RDT)
-        );
+        if frc {
+            crate::klog_warn!("e1000e: {} CTRL={:#x} FRC=BAD STATUS={:#x}\n", tag, ctrl, status);
+        }
     }
 
     unsafe fn wait_for_speed_status(&self, max_ms: u32) -> u32 {
@@ -1311,14 +1267,7 @@ impl E1000eHw {
         };
         let (speed, _) = Self::phy_resolve_speed_duplex_st2(st2)
             .unwrap_or_else(|| self.phy_resolve_speed_duplex(phy));
-        crate::klog_info!(
-            "[e1000e] post-link PHY{} reg26={:#x} (cached={:#x}) phy_speed={} STATUS={:#x}\n",
-            phy,
-            st2,
-            st2_cached,
-            Self::phy_speed_label(speed),
-            mmio_read(self.base, E1000E_STATUS)
-        );
+
 
         if self.phy_bmsr_link_up(phy) {
             // If MAC already reports link-up, keep it in pure autoneg mode.
@@ -1353,13 +1302,7 @@ impl E1000eHw {
         } else {
             "10"  // bits[7:6]==00 is the correct 10 Mb/s encoding
         };
-        crate::klog_info!(
-            "[e1000e] RX enabled post-link CTRL={:#x} FRC={} STATUS={:#x} spd={} Mb/s\n",
-            mmio_read(self.base, E1000E_CTRL),
-            if mmio_read(self.base, E1000E_CTRL) & (CTRL_FRCSPD | CTRL_FRCDPX) != 0 { "BAD" } else { "ok" },
-            status,
-            spd
-        );
+        crate::klog_info!("[e1000e] RX enabled: {} Mb/s STATUS={:#x}\n", spd, status);
 
         // 1. Re-arm RFCTL before touching the ring so extended WB is active.
         let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
@@ -1392,7 +1335,7 @@ impl E1000eHw {
 
         self.last_hw_rx_packets = mmio_read(self.base, E1000E_GPRC);
         self.kick_rx_writeback();
-        self.log_rx_path_regs("RX enabled post-link");
+
     }
 
     fn maybe_log_rx_diag(&mut self) {
@@ -1402,12 +1345,7 @@ impl E1000eHw {
         }
         let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
         if gprc != self.last_hw_rx_packets {
-            crate::klog_warn!(
-                "e1000e: HW GPRC {} -> {} (SW rx {})\n",
-                self.last_hw_rx_packets,
-                gprc,
-                self.stats.rx_packets
-            );
+
             self.last_hw_rx_packets = gprc;
         }
         let ring = self.rx_ring.as_ptr::<RxDesc>();
@@ -1415,12 +1353,7 @@ impl E1000eHw {
         let wb = unsafe { read_volatile((d0 + 8) as *const u32) };
         let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
         if wb != 0 || rdh != 0 {
-            crate::klog_info!(
-                "e1000e: diag desc0 wb={:#x} RDH={} tail={}\n",
-                wb,
-                rdh,
-                self.rx_tail
-            );
+
         }
     }
 
@@ -1447,7 +1380,7 @@ impl E1000eHw {
         self.flush_desc_rings();
 
         if skip_hw_reset {
-            crate::klog_warn!("[e1000e] PCH: skipping CTRL_RST and PHY_RST, preserving BIOS state\n");
+
             mmio_write(self.base, E1000E_WUC, 0);
             mmio_write(self.base, E1000E_WUFC, 0);
             mmio_write(self.base, E1000E_WUS, 0xFFFF_FFFF);
@@ -1463,7 +1396,7 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
 
         // 3. Issue global reset (RST bit in CTRL).
-        warn!("[e1000e] disabling GIO master...");
+
         let mut ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_GIO_MASTER_DISABLE);
         let mut master_wait = 500; // 500 * 100us = 50ms budget
@@ -1475,7 +1408,7 @@ impl E1000eHw {
             master_wait -= 1;
         }
 
-        warn!("[e1000e] issuing RST...");
+
         ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_RST);
 
@@ -1496,7 +1429,7 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_WUFC, 0);
         mmio_write(self.base, E1000E_WUS, 0xFFFF_FFFF); // W1C: clear any pending WUS bits
 
-        warn!("[e1000e] hardware reset sequence complete");
+
 
         // 3. Poll STATUS until the device is ready.
         // 0xFFFF_FFFF means the PCIe config space is not responding (device
@@ -1762,10 +1695,7 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32);
         self.rx_tail = 0;
 
-        let rdbal = mmio_read(self.base, E1000E_RDBAL);
-        let rdlen = mmio_read(self.base, E1000E_RDLEN);
-        let rdt = mmio_read(self.base, E1000E_RDT);
-        warn!("[e1000e] RX ring: PA={:#x}, LEN={}, RDT={}", rx_ring_pa, rdlen, rdt);
+
 
         mmio_write(self.base, E1000E_RXCSUM, 0);
         // Linux e1000_setup_rctl: EXTEN on all e1000e (required on I219 real HW).
@@ -1774,11 +1704,9 @@ impl E1000eHw {
             rfctl |= RFCTL_EXTEN | RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
             mmio_write(self.base, E1000E_RFCTL, rfctl);
             let rfctl_rd = mmio_read(self.base, E1000E_RFCTL);
-            crate::klog_info!(
-                "[e1000e] RFCTL={:#x} (EXTEN {})\n",
-                rfctl_rd,
-                if rfctl_rd & RFCTL_EXTEN != 0 { "on" } else { "MISSING" }
-            );
+            if rfctl_rd & RFCTL_EXTEN == 0 {
+                crate::klog_warn!("[e1000e] RFCTL EXTEN missing after write! ({:#x})\n", rfctl_rd);
+            }
         }
         mmio_write(self.base, E1000E_MRQC, 0);
         mmio_write(self.base, E1000E_VET, 0);
@@ -1797,17 +1725,11 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_FCRTH, 0x05C20);
         }
 
-        warn!("[e1000e] configuring RX queues...");
         self.program_rxdctl();
-        warn!("[e1000e] RX queues configured");
 
         // Keep receiver disabled until link is up (I219 RX engine breaks if enabled too early).
         mmio_write(self.base, E1000E_RCTL, mmio_read(self.base, E1000E_RCTL) & !RCTL_EN);
-        warn!(
-            "[e1000e] RX rings armed (RCTL_EN off until link): RDBAL={:#x} RDLEN={}",
-            rx_ring_pa,
-            NUM_RX * size_of::<RxDesc>()
-        );
+
 
         // Disable VLAN filtering
         mmio_write(self.base, E1000E_VET, 0);
@@ -1818,11 +1740,7 @@ impl E1000eHw {
         self.mac_allow_autoneg();
         
         let status = mmio_read(self.base, E1000E_STATUS);
-        crate::klog_info!("[e1000e] HW STATE: CTRL={:#x}, STATUS={:#x} ({})\n", 
-            mmio_read(self.base, E1000E_CTRL), 
-            status,
-            if (status & STATUS_LU) != 0 { "LINK UP" } else { "LINK DOWN" }
-        );
+
 
         // Disable EEE
         mmio_write(self.base, 0x0E30 / 4, 0);
@@ -1881,11 +1799,7 @@ impl E1000eHw {
                 Self::udelay(STEP_US);
                 status = mmio_read(self.base, E1000E_STATUS);
                 if status & STATUS_LU != 0 {
-                    crate::klog_info!(
-                        "[e1000e] link came up after {}ms STATUS={:#x}\n",
-                        i * 50,
-                        status
-                    );
+                    crate::klog_info!("[e1000e] link came up after {}ms\n", i * 50);
                     break;
                 }
                 if i % 10 == 0 {
@@ -1896,14 +1810,7 @@ impl E1000eHw {
                             }
                             let pss = self.mdic_read(phy_addr, 17).unwrap_or(0);
                             let st2 = self.mdic_read(phy_addr, MII_PHY_STATUS_2).unwrap_or(0);
-                            crate::klog_info!(
-                                "[e1000e] PHY {} BMSR={:#x} reg26={:#x} PSS={:#x} MAC STATUS={:#x}\n",
-                                phy_addr,
-                                bmsr,
-                                st2,
-                                pss,
-                                status
-                            );
+
                             if bmsr & 0x0004 != 0 && self.pch_sync_mac_from_phy() {
                                 status = mmio_read(self.base, E1000E_STATUS);
                                 break;
@@ -1926,14 +1833,11 @@ impl E1000eHw {
                     Self::udelay(STEP_US);
                     status = mmio_read(self.base, E1000E_STATUS);
                     if status & STATUS_LU != 0 {
-                        crate::klog_info!("[e1000e] link came up after MDIO restart ({}ms)\n", i * 50);
+                        crate::klog_info!("[e1000e] link up after MDIO restart ({}ms)\n", i * 50);
                         break;
                     }
                     // Every 1s log current status so we can see progress
-                    if i % 20 == 0 {
-                        crate::klog_warn!("[e1000e] post-autoneg wait: {}ms STATUS={:#x}\n",
-                            i * 50, status);
-                    }
+
                 }
             }
             if status & STATUS_LU == 0 {
@@ -1948,19 +1852,10 @@ impl E1000eHw {
                     Self::udelay(STEP_US);
                     status = mmio_read(self.base, E1000E_STATUS);
                     if status & STATUS_LU != 0 {
-                        crate::klog_info!(
-                            "[e1000e] link came up after LANPHYPC recovery ({}ms)\n",
-                            i * 50
-                        );
+                        crate::klog_info!("[e1000e] link up after LANPHYPC recovery ({}ms)\n", i * 50);
                         break;
                     }
-                    if i % 20 == 0 {
-                        crate::klog_warn!(
-                            "[e1000e] post-LANPHYPC wait: {}ms STATUS={:#x}\n",
-                            i * 50,
-                            status
-                        );
-                    }
+
                 }
             }
         }
@@ -2130,13 +2025,7 @@ impl E1000eHw {
 
         self.rx_tail = (idx + 1) % NUM_RX;
 
-        crate::klog_info!(
-            "e1000e: RX {} bytes RDH={} RDT={} staterr={:#x}\n",
-            len,
-            unsafe { mmio_read(self.base, E1000E_RDH) },
-            unsafe { mmio_read(self.base, E1000E_RDT) },
-            staterr
-        );
+
 
         self.stats.rx_packets += 1;
         self.stats.rx_bytes += len as u64;
@@ -2216,11 +2105,7 @@ impl E1000eHw {
             0x86dd => "IPv6",
             _ => "Other",
         };
-        if data.len() >= 14 {
-            warn!("[e1000e] TX pkt: dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, len={}", 
-                data[0], data[1], data[2], data[3], data[4], data[5],
-                data[6], data[7], data[8], data[9], data[10], data[11], data.len());
-        }
+
         // warn!("[e1000e] TX: {} ({} bytes)", info, data.len());
 
         if !self.can_send() {
@@ -2237,7 +2122,7 @@ impl E1000eHw {
         let buf =
             unsafe { core::slice::from_raw_parts_mut(self.tx_bufs[idx].vaddr() as *mut u8, data.len()) };
         buf.copy_from_slice(data);
-        warn!("[e1000e] TX packet: {} bytes", data.len());
+
 
         // Track stats
         self.stats.tx_packets += 1;
@@ -2285,12 +2170,7 @@ impl E1000eHw {
             Self::udelay(50);
         }
 
-        // Log every TX packet for DHCP/ARP diagnosis on real hardware.
-        let tdh = unsafe { mmio_read(self.base, E1000E_TDH) };
-        let tdt = unsafe { mmio_read(self.base, E1000E_TDT) };
-        let hw_status = unsafe { mmio_read(self.base, E1000E_STATUS) };
-        warn!("[e1000e] TX queued: idx={} len={} TDH={} TDT={} STATUS={:#x}",
-            idx, data.len(), tdh, tdt, hw_status);
+
 
         Ok(())
     }
@@ -2355,15 +2235,9 @@ impl Scheme for E1000eInterface {
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr == 0 {
             self.ims_rearm();
-            crate::klog_warn!("[e1000e] IRQ with ICR=0; forcing deferred poll fallback\n");
         }
 
-        let mpc = unsafe { mmio_read(self.base, 0x04010 / 4) }; // Missed Packet Count
-        let rdh = unsafe { mmio_read(self.base, E1000E_RDH) };
 
-        if icr & (1 << 7) != 0 || icr & (1 << 2) != 0 || rdh != 0 {
-            warn!("[e1000e] RX EVENT: ICR={:#x}, RDH={}, MPC={}", icr, rdh, mpc);
-        }
         if icr & (1 << 2) != 0 {
             let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
             if status & STATUS_LU != 0 {
@@ -2381,7 +2255,6 @@ impl Scheme for E1000eInterface {
                     if transitioned_up {
                         hw.refresh_datapath_after_link();
                     } else {
-                        crate::klog_info!("[e1000e] LSC up while already up: skip datapath rearm\n");
                     }
                 }
             } else {
@@ -2452,9 +2325,7 @@ impl NetScheme for E1000eInterface {
                     break;
                 }
             }
-            if drained > 0 {
-                crate::klog_info!("e1000e: {} drained {} RX frame(s)\n", self.name, drained);
-            } else {
+            if drained == 0 {
                 self.driver.hw.lock().maybe_log_rx_diag();
             }
         }
@@ -2473,7 +2344,7 @@ impl NetScheme for E1000eInterface {
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
         let pkt = self.driver.hw.lock().receive();
         if let Some(pkt) = pkt {
-            warn!("[e1000e] recv: got {} bytes", pkt.len());
+
             let n = pkt.len().min(buf.len());
             buf[..n].copy_from_slice(&pkt[..n]);
             Ok(n)
@@ -2482,7 +2353,7 @@ impl NetScheme for E1000eInterface {
         }
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        warn!("[e1000e] send: attempting to send {} bytes", data.len());
+
         let mut hw = self.driver.hw.lock();
         if hw.can_send() {
             hw.send(data)?;
@@ -2503,7 +2374,7 @@ impl NetScheme for E1000eInterface {
     }
 
     fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
-        info!("[e1000e] adding route {:?} via {:?}", cidr, gateway);
+
         let mut iface = self.iface.lock();
         match (cidr, gateway) {
             (IpCidr::Ipv4(c), Some(IpAddress::Ipv4(gw))) if c.prefix_len() == 0 => {
@@ -2524,12 +2395,12 @@ impl NetScheme for E1000eInterface {
                 self.routes.lock().push(RouteInfo { dst: cidr, gateway });
             }
         }
-        info!("[e1000e] route added");
+
         Ok(())
     }
 
     fn del_route(&self, cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
-        info!("[e1000e] deleting route {:?}", cidr);
+
         let mut iface = self.iface.lock();
         if let IpCidr::Ipv4(c) = cidr {
             if c.prefix_len() == 0 {
@@ -2750,7 +2621,7 @@ pub fn init(
         .routes(routes)
         .finalize();
 
-    warn!("[e1000e] driver instance created for irq={}", irq);
+
     let link_up_seen = Arc::new(core::sync::atomic::AtomicBool::new(
         unsafe { mmio_read(vaddr, E1000E_STATUS) & STATUS_LU != 0 },
     ));
