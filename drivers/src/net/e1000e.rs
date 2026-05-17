@@ -397,7 +397,6 @@ pub struct E1000eHw {
     tx_ring: DmaRegion,
     tx_bufs: Vec<DmaRegion>,
     tx_tail: usize,
-    tx_first: bool,
     phy_addr: u8,
     pub stats: NetStats,
     /// Last GPRC snapshot (clear-on-read); used to detect HW RX without DD.
@@ -1638,7 +1637,9 @@ impl E1000eHw {
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
         }
         for i in 0..NUM_TX {
-            core::arch::x86_64::_mm_clflush(tx_ring.add(i) as *const TxDesc as *const u8);
+            let desc = &mut *tx_ring.add(i);
+            desc.status = 0x01; // DD=1: descriptor initially available
+            core::arch::x86_64::_mm_clflush(desc as *const TxDesc as *const u8);
         }
         fence(Ordering::SeqCst);
 
@@ -1962,7 +1963,6 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_TDH, 0);
         mmio_write(self.base, E1000E_TDT, 0);
         self.tx_tail = 0;
-        self.tx_first = true;
         self.mac_allow_autoneg();
         self.enable_rx_after_link();
         let _ = mmio_read(self.base, E1000E_ICR);
@@ -2129,7 +2129,7 @@ impl E1000eHw {
         let desc = unsafe { &*ring.add(idx) };
         let status = unsafe { read_volatile(&desc.status) };
         fence(Ordering::Acquire);
-        self.tx_first || (status & 0x01 != 0) // DD bit
+        status & 0x01 != 0 // DD bit
     }
 
     // -----------------------------------------------------------------------
@@ -2230,9 +2230,6 @@ impl E1000eHw {
         warn!("[e1000e] TX queued: idx={} len={} TDH={} TDT={} STATUS={:#x}",
             idx, data.len(), tdh, tdt, hw_status);
 
-        if self.tx_tail == 0 {
-            self.tx_first = false;
-        }
         Ok(())
     }
 
@@ -2631,7 +2628,6 @@ pub fn init(
         tx_ring,
         tx_bufs,
         tx_tail: 0,
-        tx_first: true,
         phy_addr: 1, // Default to 1, updated during probe
         stats: NetStats::default(),
         last_hw_rx_packets: 0,
