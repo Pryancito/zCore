@@ -274,8 +274,25 @@ const MDIC_READY: u32 = 0x1000_0000;
 const MDIC_ERROR: u32 = 0x4000_0000;
 const MII_BMCR: u32 = 0x00;
 const MII_BMSR: u32 = 0x01;
+const MII_ADVERTISE: u32 = 0x04;
+const MII_CTRL1000: u32 = 0x09;
 const BMCR_ANENABLE: u16 = 0x1000;
 const BMCR_ANRESTART: u16 = 0x0200;
+const ADVERTISE_CSMA: u16 = 0x0001;
+const ADVERTISE_10HALF: u16 = 0x0020;
+const ADVERTISE_10FULL: u16 = 0x0040;
+const ADVERTISE_100HALF: u16 = 0x0080;
+const ADVERTISE_100FULL: u16 = 0x0100;
+const ADVERTISE_PAUSE_CAP: u16 = 0x0400;
+const ADVERTISE_PAUSE_ASYM: u16 = 0x0800;
+const ADVERTISE_ALL_COPPER: u16 = ADVERTISE_CSMA
+    | ADVERTISE_10HALF
+    | ADVERTISE_10FULL
+    | ADVERTISE_100HALF
+    | ADVERTISE_100FULL
+    | ADVERTISE_PAUSE_CAP
+    | ADVERTISE_PAUSE_ASYM;
+const ADVERTISE_1000FULL: u16 = 0x0200;
 /// I82577/I217/I219 PHY status 2 (Linux `I82577_PHY_STATUS_2`).
 const MII_PHY_STATUS_2: u32 = 26;
 const PHY_STATUS2_SPEED_MASK: u16 = 0x0300;
@@ -397,7 +414,6 @@ pub struct E1000eHw {
     tx_ring: DmaRegion,
     tx_bufs: Vec<DmaRegion>,
     tx_tail: usize,
-    tx_first: bool,
     phy_addr: u8,
     pub stats: NetStats,
     /// Last GPRC snapshot (clear-on-read); used to detect HW RX without DD.
@@ -1112,6 +1128,34 @@ impl E1000eHw {
                 if bmcr == 0 || bmcr == 0xFFFF {
                     continue;
                 }
+                if let Some(anar) = self.mdic_read(phy_addr, MII_ADVERTISE) {
+                    if anar != 0 && anar != 0xFFFF {
+                        let new_anar = anar | ADVERTISE_ALL_COPPER;
+                        if new_anar != anar {
+                            let _ = self.mdic_write(phy_addr, MII_ADVERTISE, new_anar);
+                            crate::klog_warn!(
+                                "[e1000e] PHY {} ANAR refresh {:#x} -> {:#x}\n",
+                                phy_addr,
+                                anar,
+                                new_anar
+                            );
+                        }
+                    }
+                }
+                if let Some(ctrl1000) = self.mdic_read(phy_addr, MII_CTRL1000) {
+                    if ctrl1000 != 0 && ctrl1000 != 0xFFFF {
+                        let new_ctrl1000 = ctrl1000 | ADVERTISE_1000FULL;
+                        if new_ctrl1000 != ctrl1000 {
+                            let _ = self.mdic_write(phy_addr, MII_CTRL1000, new_ctrl1000);
+                            crate::klog_warn!(
+                                "[e1000e] PHY {} 1000T advert refresh {:#x} -> {:#x}\n",
+                                phy_addr,
+                                ctrl1000,
+                                new_ctrl1000
+                            );
+                        }
+                    }
+                }
                 let new_bmcr = bmcr | BMCR_ANENABLE | BMCR_ANRESTART;
                 if self.mdic_write(phy_addr, MII_BMCR, new_bmcr) {
                     crate::klog_warn!(
@@ -1638,7 +1682,9 @@ impl E1000eHw {
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
         }
         for i in 0..NUM_TX {
-            core::arch::x86_64::_mm_clflush(tx_ring.add(i) as *const TxDesc as *const u8);
+            let desc = &mut *tx_ring.add(i);
+            desc.status = 0x01; // DD=1: descriptor initially available
+            core::arch::x86_64::_mm_clflush(desc as *const TxDesc as *const u8);
         }
         fence(Ordering::SeqCst);
 
@@ -1962,7 +2008,6 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_TDH, 0);
         mmio_write(self.base, E1000E_TDT, 0);
         self.tx_tail = 0;
-        self.tx_first = true;
         self.mac_allow_autoneg();
         self.enable_rx_after_link();
         let _ = mmio_read(self.base, E1000E_ICR);
@@ -2129,7 +2174,7 @@ impl E1000eHw {
         let desc = unsafe { &*ring.add(idx) };
         let status = unsafe { read_volatile(&desc.status) };
         fence(Ordering::Acquire);
-        self.tx_first || (status & 0x01 != 0) // DD bit
+        status & 0x01 != 0 // DD bit
     }
 
     // -----------------------------------------------------------------------
@@ -2230,9 +2275,6 @@ impl E1000eHw {
         warn!("[e1000e] TX queued: idx={} len={} TDH={} TDT={} STATUS={:#x}",
             idx, data.len(), tdh, tdt, hw_status);
 
-        if self.tx_tail == 0 {
-            self.tx_first = false;
-        }
         Ok(())
     }
 
@@ -2260,6 +2302,7 @@ pub struct E1000eInterface {
     pub irq: usize,
     pub base: usize,
     pub poll_pending: Arc<core::sync::atomic::AtomicBool>,
+    pub link_up_seen: Arc<core::sync::atomic::AtomicBool>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
 }
 
@@ -2307,13 +2350,26 @@ impl Scheme for E1000eInterface {
         if icr & (1 << 2) != 0 {
             let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
             if status & STATUS_LU != 0 {
-                crate::klog_info!("{}: NIC Link is Up\n", self.name);
+                let transitioned_up = !self
+                    .link_up_seen
+                    .swap(true, core::sync::atomic::Ordering::SeqCst);
+                crate::klog_info!(
+                    "{}: NIC Link is Up{}\n",
+                    self.name,
+                    if transitioned_up { "" } else { " (stable)" }
+                );
                 let mut hw = self.driver.hw.lock();
                 unsafe {
                     hw.restore_ctrl_autoneg_after_link();
-                    hw.refresh_datapath_after_link();
+                    if transitioned_up {
+                        hw.refresh_datapath_after_link();
+                    } else {
+                        crate::klog_info!("[e1000e] LSC up while already up: skip datapath rearm\n");
+                    }
                 }
             } else {
+                self.link_up_seen
+                    .store(false, core::sync::atomic::Ordering::SeqCst);
                 crate::klog_warn!("{}: NIC Link is Down\n", self.name);
             }
         }
@@ -2631,7 +2687,6 @@ pub fn init(
         tx_ring,
         tx_bufs,
         tx_tail: 0,
-        tx_first: true,
         phy_addr: 1, // Default to 1, updated during probe
         stats: NetStats::default(),
         last_hw_rx_packets: 0,
@@ -2679,6 +2734,9 @@ pub fn init(
         .finalize();
 
     warn!("[e1000e] driver instance created for irq={}", irq);
+    let link_up_seen = Arc::new(core::sync::atomic::AtomicBool::new(
+        unsafe { mmio_read(vaddr, E1000E_STATUS) & STATUS_LU != 0 },
+    ));
     let e1000e_iface = E1000eInterface {
         iface: Arc::new(Mutex::new(iface)),
         driver,
@@ -2686,6 +2744,7 @@ pub fn init(
         irq,
         base: vaddr,
         poll_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        link_up_seen,
         routes: Arc::new(Mutex::new(vec![RouteInfo {
             dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
             gateway: Some(IpAddress::Ipv4(default_v4_gw)),
