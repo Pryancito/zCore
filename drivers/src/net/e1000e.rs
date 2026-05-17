@@ -274,8 +274,25 @@ const MDIC_READY: u32 = 0x1000_0000;
 const MDIC_ERROR: u32 = 0x4000_0000;
 const MII_BMCR: u32 = 0x00;
 const MII_BMSR: u32 = 0x01;
+const MII_ADVERTISE: u32 = 0x04;
+const MII_CTRL1000: u32 = 0x09;
 const BMCR_ANENABLE: u16 = 0x1000;
 const BMCR_ANRESTART: u16 = 0x0200;
+const ADVERTISE_CSMA: u16 = 0x0001;
+const ADVERTISE_10HALF: u16 = 0x0020;
+const ADVERTISE_10FULL: u16 = 0x0040;
+const ADVERTISE_100HALF: u16 = 0x0080;
+const ADVERTISE_100FULL: u16 = 0x0100;
+const ADVERTISE_PAUSE_CAP: u16 = 0x0400;
+const ADVERTISE_PAUSE_ASYM: u16 = 0x0800;
+const ADVERTISE_ALL_COPPER: u16 = ADVERTISE_CSMA
+    | ADVERTISE_10HALF
+    | ADVERTISE_10FULL
+    | ADVERTISE_100HALF
+    | ADVERTISE_100FULL
+    | ADVERTISE_PAUSE_CAP
+    | ADVERTISE_PAUSE_ASYM;
+const ADVERTISE_1000FULL: u16 = 0x0200;
 /// I82577/I217/I219 PHY status 2 (Linux `I82577_PHY_STATUS_2`).
 const MII_PHY_STATUS_2: u32 = 26;
 const PHY_STATUS2_SPEED_MASK: u16 = 0x0300;
@@ -1110,6 +1127,34 @@ impl E1000eHw {
             if let Some(bmcr) = self.mdic_read(phy_addr, MII_BMCR) {
                 if bmcr == 0 || bmcr == 0xFFFF {
                     continue;
+                }
+                if let Some(anar) = self.mdic_read(phy_addr, MII_ADVERTISE) {
+                    if anar != 0 && anar != 0xFFFF {
+                        let new_anar = anar | ADVERTISE_ALL_COPPER;
+                        if new_anar != anar {
+                            let _ = self.mdic_write(phy_addr, MII_ADVERTISE, new_anar);
+                            crate::klog_warn!(
+                                "[e1000e] PHY {} ANAR refresh {:#x} -> {:#x}\n",
+                                phy_addr,
+                                anar,
+                                new_anar
+                            );
+                        }
+                    }
+                }
+                if let Some(ctrl1000) = self.mdic_read(phy_addr, MII_CTRL1000) {
+                    if ctrl1000 != 0 && ctrl1000 != 0xFFFF {
+                        let new_ctrl1000 = ctrl1000 | ADVERTISE_1000FULL;
+                        if new_ctrl1000 != ctrl1000 {
+                            let _ = self.mdic_write(phy_addr, MII_CTRL1000, new_ctrl1000);
+                            crate::klog_warn!(
+                                "[e1000e] PHY {} 1000T advert refresh {:#x} -> {:#x}\n",
+                                phy_addr,
+                                ctrl1000,
+                                new_ctrl1000
+                            );
+                        }
+                    }
                 }
                 let new_bmcr = bmcr | BMCR_ANENABLE | BMCR_ANRESTART;
                 if self.mdic_write(phy_addr, MII_BMCR, new_bmcr) {
