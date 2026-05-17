@@ -171,6 +171,17 @@ const KMRNCTRLSTA_WEN: u32 = 1 << 22;
 const KMRNCTRLSTA_K1_CONFIG: u16 = 0x1F; // Index 0x1F
 const KMRNCTRLSTA_K1_ENABLE: u16 = 1 << 13;
 const KMRNCTRLSTA_TIMEOUTS: u16 = 0x4;
+const KMRNCTRLSTA_INBAND_PARAM: u16 = 0x9;
+const E1000E_GCR: usize = 0x05B00 / 4;
+const E1000E_FFLT_DBG: usize = 0x05F04 / 4;
+/// Linux `PCIE_NO_SNOOP_ALL` — GCR bits 0..5.
+const GCR_PCIE_NO_SNOOP_ALL: u32 = 0x3F;
+const FFLT_DBG_DONT_GATE_WAKE_DMA_CLK: u32 = 1 << 12;
+const I217_PLL_CLOCK_GATE_MASK: u16 = 0x07FF;
+/// Linux `SPEED_*` (mbps) for TIPG/EMI paths in ich8lan.c.
+const SPEED_10: u32 = 10;
+const SPEED_100: u32 = 100;
+const SPEED_1000: u32 = 1000;
 const PHY_EMI_ADDR: u32 = 0x10;
 const PHY_EMI_DATA: u32 = 0x11;
 const I217_RX_CONFIG_EMI: u16 = 0xB20C;
@@ -956,6 +967,32 @@ impl E1000eHw {
         }
     }
 
+    #[inline]
+    fn phy_reg_paged(page: u32, reg: u32) -> u32 {
+        (page << 5) | reg
+    }
+
+    /// Linux `e1000e_get_speed_and_duplex_copper` (STATUS bits 6:7 + FD).
+    fn speed_mbps_from_status(status: u32) -> u32 {
+        if status & STATUS_SPEED_1000 != 0 {
+            SPEED_1000
+        } else if status & STATUS_SPEED_100 != 0 {
+            SPEED_100
+        } else {
+            SPEED_10
+        }
+    }
+
+    fn speed_idx_from_status(status: u32) -> u32 {
+        if status & STATUS_SPEED_1000 != 0 {
+            2
+        } else if status & STATUS_SPEED_100 != 0 {
+            1
+        } else {
+            0
+        }
+    }
+
     unsafe fn active_phy_addr(&self) -> u8 {
         for pa in [self.phy_addr, 1u8, 2u8] {
             if self.phy_bmsr_link_up(pa) {
@@ -965,10 +1002,11 @@ impl E1000eHw {
         self.phy_addr
     }
 
-    /// Program CTRL speed bits from PHY reg 26, without leaving FRCSPD set.
-    unsafe fn mac_apply_phy_speed_st2(&self, phy_addr: u8, st2: u16) {
-        let (speed, duplex) = Self::phy_resolve_speed_duplex_st2(st2)
-            .unwrap_or_else(|| self.phy_resolve_speed_duplex(phy_addr));
+    /// Set negotiated speed in CTRL from PHY reg 26 — no FRCSPD (safe on I219 RX).
+    unsafe fn mac_sync_ctrl_speed_from_st2(&self, st2: u16) -> bool {
+        let Some((speed, duplex)) = Self::phy_resolve_speed_duplex_st2(st2) else {
+            return false;
+        };
         let mut ctrl = mmio_read(self.base, E1000E_CTRL);
         ctrl &= !(CTRL_FRCSPD | CTRL_FRCDPX | CTRL_SPD_1000 | CTRL_SPD_100);
         ctrl |= CTRL_SLU | CTRL_ASDE;
@@ -982,69 +1020,117 @@ impl E1000eHw {
         }
         mmio_write(self.base, E1000E_CTRL, ctrl);
         let _ = mmio_read(self.base, E1000E_CTRL);
-        self.mac_speed_sync_pulse();
-
+        crate::klog_info!(
+            "[e1000e] CTRL speed from reg26={:#x} -> {} Mb/s CTRL={:#x}\n",
+            st2,
+            Self::phy_speed_label(speed),
+            ctrl
+        );
+        true
     }
 
-    /// I219 100M full: Linux ich8lan sets TIPG IPGT=0xC (not default 8).
-    unsafe fn program_tipg_for_st2(&self, st2: u16) {
-        if !self.is_pch_spt_or_later() {
+    /// Linux `e1000_check_for_copper_link_ich8lan` TIPG + I217_RX_CONFIG EMI + PLL gate.
+    unsafe fn program_link_tipg_emi_linux(&self, phy_addr: u8) {
+        if !self.is_pch_lpt_or_later() {
             return;
         }
-        let Some((speed, duplex)) = Self::phy_resolve_speed_duplex_st2(st2) else {
-            return;
-        };
+        let status = mmio_read(self.base, E1000E_STATUS);
+        let speed = Self::speed_mbps_from_status(status);
+        let duplex_full = status & STATUS_FD != 0;
+
         let mut tipg = mmio_read(self.base, E1000E_TIPG);
         tipg &= !0x3FF;
-        if duplex != 0 && speed == 1 {
+        let emi_val = if !duplex_full && speed == SPEED_10 {
+            tipg |= 0xFF;
+            0u16
+        } else if self.is_pch_spt_or_later() && duplex_full && speed != SPEED_1000 {
             tipg |= 0x0C;
+            1u16
         } else {
             tipg |= 0x08;
-        }
+            1u16
+        };
         mmio_write(self.base, E1000E_TIPG, tipg);
+
+        if !self.phy_write_emi(phy_addr, I217_RX_CONFIG_EMI, emi_val) {
+            crate::klog_warn!(
+                "[e1000e] I217_RX_CONFIG EMI={} failed PHY{}\n",
+                emi_val,
+                phy_addr
+            );
+        }
+
+        if self.is_pch_lpt_or_later() {
+            let pll_reg = Self::phy_reg_paged(772, 28);
+            if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, pll_reg) {
+                phy_reg &= !I217_PLL_CLOCK_GATE_MASK;
+                if speed == SPEED_100 || speed == SPEED_10 {
+                    phy_reg |= 0x3E8;
+                } else {
+                    phy_reg |= 0xFA;
+                }
+                let _ = self.mdic_write_phy(phy_addr, pll_reg, phy_reg);
+            }
+        }
     }
 
-    /// Force PHY speed in MAC until STATUS speed bits appear, then release FRCSPD.
-    unsafe fn mac_force_speed_until_status(&self, phy_addr: u8, st2: u16) {
-        let (speed, duplex) = Self::phy_resolve_speed_duplex_st2(st2)
-            .unwrap_or_else(|| self.phy_resolve_speed_duplex(phy_addr));
+    /// Linux `e1000e_set_pcie_no_snoop` for PCH2+ (clear GCR no-snoop bits).
+    unsafe fn pch_setup_pcie_no_snoop(&self) {
+        if !self.is_pch_lpt_or_later() {
+            return;
+        }
+        let mut gcr = mmio_read(self.base, E1000E_GCR);
+        gcr &= !GCR_PCIE_NO_SNOOP_ALL;
+        mmio_write(self.base, E1000E_GCR, gcr);
+        let _ = mmio_read(self.base, E1000E_GCR);
+    }
+
+    /// Linux `e1000_setup_copper_link_ich8lan` KMRN + inband parameters.
+    unsafe fn pch_setup_kmrn_copper_link(&self) {
+        self.kmrn_write(KMRNCTRLSTA_TIMEOUTS, 0xFFFF);
+        let mut inband = self.kmrn_read(KMRNCTRLSTA_INBAND_PARAM);
+        inband |= 0x3F;
+        self.kmrn_write(KMRNCTRLSTA_INBAND_PARAM, inband);
+    }
+
+    /// Linux `e1000_setup_copper_link_ich8lan`: SLU, clear FRCSPD/FRCDPX only.
+    unsafe fn mac_setup_copper_link_linux(&self) {
         let mut ctrl = mmio_read(self.base, E1000E_CTRL);
-        ctrl &= !(CTRL_SPD_1000 | CTRL_SPD_100);
-        if speed == 2 {
-            ctrl |= CTRL_SPD_1000;
-        } else if speed == 1 {
-            ctrl |= CTRL_SPD_100;
-        }
-        if duplex != 0 {
-            ctrl |= CTRL_FD;
-        }
-        ctrl |= CTRL_FRCSPD | CTRL_FRCDPX | CTRL_SLU;
+        ctrl |= CTRL_SLU | CTRL_ASDE | CTRL_FD;
+        ctrl &= !(CTRL_FRCSPD | CTRL_FRCDPX);
         mmio_write(self.base, E1000E_CTRL, ctrl);
         let _ = mmio_read(self.base, E1000E_CTRL);
+    }
 
-        for _ in 0..200 {
-            let status = mmio_read(self.base, E1000E_STATUS);
-            if status & STATUS_SPEED_MASK != 0 {
-                break;
-            }
-            Self::udelay(50_000);
-        }
-
+    /// ASDE sync from PHY reg26 only when STATUS speed disagrees (I219 metal).
+    unsafe fn mac_reconcile_phy_speed(&self, phy_addr: u8, st2: u16) {
+        self.mac_setup_copper_link_linux();
         let status = mmio_read(self.base, E1000E_STATUS);
-        ctrl = mmio_read(self.base, E1000E_CTRL);
-        ctrl &= !(CTRL_FRCSPD | CTRL_FRCDPX);
-        ctrl |= CTRL_SLU | CTRL_ASDE | CTRL_FD;
-        if status & STATUS_SPEED_1000 != 0 {
-            ctrl |= CTRL_SPD_1000;
-        } else if status & STATUS_SPEED_100 != 0 {
-            ctrl |= CTRL_SPD_100;
-        } else if speed == 2 {
-            ctrl |= CTRL_SPD_1000;
-        } else if speed == 1 {
-            ctrl |= CTRL_SPD_100;
+        let st_idx = Self::phy_resolve_speed_duplex_st2(st2).map(|(s, _)| s);
+        let mac_idx = Self::speed_idx_from_status(status);
+        if let Some(phy_idx) = st_idx {
+            if phy_idx != mac_idx {
+                crate::klog_warn!(
+                    "[e1000e] STATUS spd idx {} != PHY reg26={:#x} idx {} — sync CTRL\n",
+                    mac_idx,
+                    st2,
+                    phy_idx
+                );
+                let _ = self.mac_sync_ctrl_speed_from_st2(st2);
+            }
         }
-        mmio_write(self.base, E1000E_CTRL, ctrl);
+    }
 
+    /// Post-link path without resetting RX rings (Linux LSC / watchdog).
+    unsafe fn apply_link_adjustments_linux(&self) {
+        if mmio_read(self.base, E1000E_STATUS) & STATUS_LU == 0 {
+            return;
+        }
+        self.disable_ulp();
+        let phy = self.active_phy_addr();
+        let st2 = self.pch_post_link_phy_tune();
+        self.mac_reconcile_phy_speed(phy, st2);
+        self.program_link_tipg_emi_linux(phy);
     }
 
     unsafe fn pch_disable_k1(&self) {
@@ -1053,13 +1139,9 @@ impl E1000eHw {
         self.kmrn_write(KMRNCTRLSTA_K1_CONFIG, kmrn);
     }
 
-    /// Linux `e1000_setup_copper_link_*`: SLU + autoneg, never FRCSPD/FRCDPX on I219 RX.
+    /// Alias kept for call sites — matches Linux copper link CTRL programming.
     unsafe fn mac_allow_autoneg(&self) {
-        let mut ctrl = mmio_read(self.base, E1000E_CTRL);
-        ctrl |= CTRL_SLU | CTRL_ASDE | CTRL_FD;
-        ctrl &= !(CTRL_FRCSPD | CTRL_FRCDPX | CTRL_SPD_1000 | CTRL_SPD_100 | CTRL_ILOS);
-        mmio_write(self.base, E1000E_CTRL, ctrl);
-        let _ = mmio_read(self.base, E1000E_CTRL);
+        self.mac_setup_copper_link_linux();
     }
 
     unsafe fn pulse_slu(&self) {
@@ -1168,6 +1250,18 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_FEXTNVM11, fextnvm11);
 
         self.kmrn_write(KMRNCTRLSTA_TIMEOUTS, 0xFFFF);
+
+        self.pch_setup_pcie_no_snoop();
+        let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+        ctrl_ext |= CTRL_EXT_RO_DIS;
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+
+        // TXDCTL bit 22 (Linux initialize_hw_bits_ich8lan).
+        for txdctl_reg in [E1000E_TXDCTL, E1000E_TXDCTL1] {
+            let mut txdctl = mmio_read(self.base, txdctl_reg);
+            txdctl |= 1 << 22;
+            mmio_write(self.base, txdctl_reg, txdctl);
+        }
     }
 
     unsafe fn program_rxdctl(&self) {
@@ -1190,8 +1284,9 @@ impl E1000eHw {
     unsafe fn rctl_rx_bits(&self) -> u32 {
         let mut rctl = mmio_read(self.base, E1000E_RCTL);
         rctl &= !RCTL_MO_MASK;
-        rctl |= RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC;
-        rctl &= !(RCTL_SBP | RCTL_LPE | RCTL_DTYP_PS | RCTL_BSEX | RCTL_RX_SZ_MASK);
+        // Linux e1000_setup_rctl: EN | BAM | SECRC, 2048-byte buffers, no promisc.
+        rctl |= RCTL_EN | RCTL_BAM | RCTL_SECRC;
+        rctl &= !(RCTL_SBP | RCTL_LPE | RCTL_DTYP_PS | RCTL_BSEX | RCTL_RX_SZ_MASK | RCTL_UPE | RCTL_MPE);
         rctl
     }
 
@@ -1211,10 +1306,25 @@ impl E1000eHw {
         let ctrl = mmio_read(self.base, E1000E_CTRL);
         let status = mmio_read(self.base, E1000E_STATUS);
         let frc = (ctrl & (CTRL_FRCSPD | CTRL_FRCDPX)) != 0;
-        let spd = status & STATUS_SPEED_MASK;
-        if frc {
-            crate::klog_warn!("e1000e: {} CTRL={:#x} FRC=BAD STATUS={:#x}\n", tag, ctrl, status);
-        }
+        let mac_spd = if ctrl & CTRL_SPD_1000 != 0 {
+            "1000"
+        } else if ctrl & CTRL_SPD_100 != 0 {
+            "100"
+        } else {
+            "10"
+        };
+        crate::klog_info!(
+            "e1000e: {} CTRL={:#x} mac_spd={} FRC={} STATUS={:#x} RCTL={:#x} GPRC={} RDH={} RDT={}\n",
+            tag,
+            ctrl,
+            mac_spd,
+            if frc { "BAD" } else { "ok" },
+            status,
+            mmio_read(self.base, E1000E_RCTL),
+            mmio_read(self.base, E1000E_GPRC),
+            mmio_read(self.base, E1000E_RDH),
+            mmio_read(self.base, E1000E_RDT)
+        );
     }
 
     unsafe fn wait_for_speed_status(&self, max_ms: u32) -> u32 {
@@ -1255,54 +1365,38 @@ impl E1000eHw {
             crate::klog_warn!("[e1000e] link-stall PHY reg write failed\n");
         }
 
-        if !self.phy_write_emi(phy, I217_RX_CONFIG_EMI, 1) {
-            crate::klog_warn!("[e1000e] I217_RX_CONFIG EMI write failed on PHY{}\n", phy);
-        }
-
         let st2_after = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
-        let st2 = if st2_cached != 0 && st2_cached != 0xFFFF {
-            st2_cached
-        } else {
+        // Post-tune read reflects negotiated speed; pre-tune can be stale (10M).
+        let st2 = if st2_after != 0 && st2_after != 0xFFFF {
             st2_after
+        } else {
+            st2_cached
         };
         let (speed, _) = Self::phy_resolve_speed_duplex_st2(st2)
             .unwrap_or_else(|| self.phy_resolve_speed_duplex(phy));
+        crate::klog_info!(
+            "[e1000e] post-link PHY{} reg26={:#x} cached={:#x} phy_speed={}\n",
+            phy,
+            st2,
+            st2_cached,
+            Self::phy_speed_label(speed)
+        );
 
-
-        if self.phy_bmsr_link_up(phy) {
-            // If MAC already reports link-up, keep it in pure autoneg mode.
-            // For some real I219/e1000e systems, forcing a MAC speed sync here
-            // leaves CTRL in a bad state (ASDE/SPD), and RX stays silent.
-            if mmio_read(self.base, E1000E_STATUS) & STATUS_LU == 0 {
-                self.mac_apply_phy_speed_st2(phy, st2);
-            } else {
-                self.mac_allow_autoneg();
-            }
-        }
         st2
     }
 
     /// Arm RX rings and enable RCTL — call only when STATUS.LU is set.
     unsafe fn enable_rx_after_link(&mut self) {
-        self.disable_ulp();
-        self.mac_allow_autoneg();
-        let st2 = self.pch_post_link_phy_tune();
-        // Re-assert autoneg after PHY tuning/sync so RX is enabled with a
-        // consistent CTRL state even if the previous step touched speed bits.
-        self.mac_allow_autoneg();
-        self.program_tipg_for_st2(st2);
+        let _ = self.wait_for_speed_status(3000);
+        self.apply_link_adjustments_linux();
 
-        // Wait for STATUS.LU (link up). SPEED_MASK==0 is valid 10 Mb/s encoding;
-        // we no longer retry just because the speed field is 0.
-        let status = self.wait_for_speed_status(3000);
-        let spd = if status & STATUS_SPEED_1000 != 0 {
-            "1000"
-        } else if status & STATUS_SPEED_100 != 0 {
-            "100"
-        } else {
-            "10"  // bits[7:6]==00 is the correct 10 Mb/s encoding
-        };
-        crate::klog_info!("[e1000e] RX enabled: {} Mb/s STATUS={:#x}\n", spd, status);
+        let status = mmio_read(self.base, E1000E_STATUS);
+        let spd = Self::speed_mbps_from_status(status);
+        crate::klog_info!(
+            "[e1000e] RX enabled: {} Mb/s STATUS={:#x}\n",
+            spd,
+            status
+        );
 
         // 1. Re-arm RFCTL before touching the ring so extended WB is active.
         let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
@@ -1335,7 +1429,7 @@ impl E1000eHw {
 
         self.last_hw_rx_packets = mmio_read(self.base, E1000E_GPRC);
         self.kick_rx_writeback();
-
+        self.log_rx_path_regs("RX armed");
     }
 
     fn maybe_log_rx_diag(&mut self) {
@@ -1674,7 +1768,8 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_RDTR, 0);
         mmio_write(self.base, E1000E_RADV, 0);
         mmio_write(self.base, E1000E_ITR, 0);
-        if !E1000E_CONVENTIONAL {
+        // Linux e1000_configure_rx: IAME + IAM mask all sources.
+        {
             let mut ce = mmio_read(self.base, E1000E_CTRL_EXT);
             ce |= CTRL_EXT_IAME;
             mmio_write(self.base, E1000E_IAM, 0xFFFF_FFFF);
@@ -1713,11 +1808,15 @@ impl E1000eHw {
         // Without Drop_En the I219 can stall the TX path when RX overflows.
         mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31));
 
-        if !E1000E_CONVENTIONAL {
+        if self.is_pch_lpt_or_later() {
             mmio_write(self.base, E1000E_FCTTV, 0xFFFF);
             mmio_write(self.base, E1000E_FCRTV, 0xFFFF);
             mmio_write(self.base, E1000E_FCRTL, 0x05048);
             mmio_write(self.base, E1000E_FCRTH, 0x05C20);
+        }
+
+        if self.is_pch_lpt_or_later() {
+            self.pch_setup_kmrn_copper_link();
         }
 
         self.program_rxdctl();
@@ -1732,28 +1831,13 @@ impl E1000eHw {
         let rctl_v = mmio_read(self.base, E1000E_RCTL);
         mmio_write(self.base, E1000E_RCTL, rctl_v & !RCTL_VFE);
 
-        self.mac_allow_autoneg();
-        
-        let status = mmio_read(self.base, E1000E_STATUS);
-
+        self.mac_setup_copper_link_linux();
 
         // Disable EEE
         mmio_write(self.base, 0x0E30 / 4, 0);
 
-        // 12. Clear any pending interrupts, then enable only what we handle.
-        // H6: Writing 0xFFFF_FFFF to IMS enables ALL interrupt sources including
-        // internal status bits (MDAC, RXSEQ, etc.) that cause spurious IRQs on
-        // real hardware. Only enable: RXT0 (bit7) + LSC (bit2) + TXDW (bit0).
-        let _ = mmio_read(self.base, E1000E_ICR); // clear pending
-        mmio_write(
-            self.base,
-            E1000E_IMS,
-            if E1000E_CONVENTIONAL {
-                IMS_CONVENTIONAL
-            } else {
-                IMS_REARM_LINUX
-            },
-        );
+        let _ = mmio_read(self.base, E1000E_ICR);
+        mmio_write(self.base, E1000E_IMS, IMS_REARM_LINUX);
 
         // 13. Link status. Conventional: short PHY kick only; extended: full settle.
         let mut status = mmio_read(self.base, E1000E_STATUS);
@@ -1879,10 +1963,8 @@ impl E1000eHw {
         Ok(())
     }
 
-    /// After PHY/MAC sync we may leave FRCSPD set; normal TX/RX need autoneg + ASDE.
     unsafe fn restore_ctrl_autoneg_after_link(&self) {
-        self.mac_allow_autoneg();
-        self.log_rx_path_regs("CTRL autoneg");
+        self.mac_setup_copper_link_linux();
     }
 
     /// Re-post RX descriptors (addr valid, write-back region cleared).
@@ -2188,13 +2270,8 @@ pub struct E1000eInterface {
 
 impl E1000eInterface {
     fn ims_rearm(&self) {
-        let mask = if E1000E_CONVENTIONAL {
-            IMS_CONVENTIONAL
-        } else {
-            IMS_REARM_LINUX
-        };
         unsafe {
-            mmio_write(self.base, E1000E_IMS, mask);
+            mmio_write(self.base, E1000E_IMS, IMS_REARM_LINUX);
             let _ = mmio_read(self.base, E1000E_IMS);
         }
     }
@@ -2218,8 +2295,8 @@ impl Scheme for E1000eInterface {
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr == 0 {
             self.ims_rearm();
+            return;
         }
-
 
         if icr & (1 << 2) != 0 {
             let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
@@ -2234,10 +2311,9 @@ impl Scheme for E1000eInterface {
                 );
                 let mut hw = self.driver.hw.lock();
                 unsafe {
-                    hw.restore_ctrl_autoneg_after_link();
+                    hw.apply_link_adjustments_linux();
                     if transitioned_up {
                         hw.refresh_datapath_after_link();
-                    } else {
                     }
                 }
             } else {
@@ -2255,6 +2331,8 @@ impl Scheme for E1000eInterface {
                 let _ = self_clone.poll();
                 poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
             });
+        } else {
+            self.ims_rearm();
         }
     }
 }
