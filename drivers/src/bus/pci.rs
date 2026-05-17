@@ -16,8 +16,6 @@ const PCI_INTERRUPT_PIN: u16 = 0x3d;
 #[allow(dead_code)]
 const PCI_MSI_CTRL_CAP: u16 = 0x00;
 #[allow(dead_code)]
-const PCI_MSI_FLAGS: u16 = 0x02;
-#[allow(dead_code)]
 const PCI_MSI_ADDR: u16 = 0x04;
 #[allow(dead_code)]
 const PCI_MSI_UPPER_ADDR: u16 = 0x08;
@@ -25,10 +23,6 @@ const PCI_MSI_UPPER_ADDR: u16 = 0x08;
 const PCI_MSI_DATA_32: u16 = 0x08;
 #[allow(dead_code)]
 const PCI_MSI_DATA_64: u16 = 0x0C;
-#[allow(dead_code)]
-const PCI_MSI_FLAGS_ENABLE: u16 = 0x0001;
-#[allow(dead_code)]
-const PCI_MSI_FLAGS_64BIT: u16 = 0x0080;
 
 #[allow(dead_code)]
 const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
@@ -245,45 +239,28 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
         cap_steps = cap_steps.saturating_add(1);
         let cap_id = am.read8(ops, loc, cap_ptr);
         if cap_id == PCI_CAP_ID_MSI {
-            let orig_flags = am.read16(ops, loc, cap_ptr + PCI_MSI_FLAGS);
+            let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
             // The manual Volume 3 Chapter 10.11 Message Signalled Interrupts
-            // Route MSI to BSP LAPIC id when available.
-            #[cfg(target_arch = "x86_64")]
-            let apic_dest_id = if crate::irq::x86::Apic::local_apic_ready() {
-                crate::irq::x86::Apic::local_apic().id() as u32
-            } else {
-                0
-            };
-            #[cfg(not(target_arch = "x86_64"))]
-            let apic_dest_id: u32 = 0;
-            am.write32(
-                ops,
-                loc,
-                cap_ptr + PCI_MSI_ADDR,
-                0xfee00000 | ((apic_dest_id & 0xff) << 12),
-            );
+            // 0 is (usually) the apic id of the bsp.
+            //am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000 | (0 << 12));
+            am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000);
             MSI_IRQ += 1;
             let irq = MSI_IRQ;
             assigned_irq = Some(irq as usize);
             // we offset all our irq numbers by 32
-            if (orig_flags & PCI_MSI_FLAGS_64BIT) != 0 {
+            if (orig_ctrl >> 16) & (1 << 7) != 0 {
                 // 64bit
-                am.write16(ops, loc, cap_ptr + PCI_MSI_DATA_64, (irq + 32) as u16);
+                am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_64, irq + 32);
             } else {
                 // 32bit
-                am.write16(ops, loc, cap_ptr + PCI_MSI_DATA_32, (irq + 32) as u16);
+                am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_32, irq + 32);
             }
 
-            // enable MSI interrupt
-            am.write16(
-                ops,
-                loc,
-                cap_ptr + PCI_MSI_FLAGS,
-                orig_flags | PCI_MSI_FLAGS_ENABLE,
-            );
+            // enable MSI interrupt, assuming 64bit for now
+            am.write32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP, orig_ctrl | 0x10000);
             debug!(
                 "MSI control {:#b}, enabling MSI interrupt {}",
-                orig_flags,
+                orig_ctrl >> 16,
                 irq
             );
             msi_found = true;

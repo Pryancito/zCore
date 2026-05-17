@@ -13,7 +13,7 @@
 /// Minimal NIC profile for bare-metal bring-up (fewer moving parts).
 const E1000E_CONVENTIONAL: bool = true;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250517-rx9";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250517-rx8";
 
 #[inline]
 const fn e1000e_profile() -> &'static str {
@@ -1613,11 +1613,6 @@ impl E1000eHw {
             let desc = &mut *rx_ring.add(i);
             desc.addr = self.rx_bufs[i].paddr() as u64;
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
-            // Flush the RX buffer itself: drain any dirty CPU cache lines that the
-            // frame allocator may have left (e.g. from internal page zeroing).  Without
-            // this flush, a writeback triggered later (by the per-receive clflush in
-            // receive_at) would overwrite the NIC-DMA-written packet with stale zeros.
-            Self::dma_wbinv_range(self.rx_bufs[i].vaddr(), BUF_SIZE);
         }
         for i in 0..NUM_TX {
             let desc = &mut *tx_ring.add(i);
@@ -1898,9 +1893,6 @@ impl E1000eHw {
             desc.addr = self.rx_bufs[i].paddr() as u64;
             write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
-            // Flush the data buffer too so no dirty CPU lines remain when the
-            // NIC DMA-writes the next incoming packet into it.
-            Self::dma_wbinv_range(self.rx_bufs[i].vaddr(), BUF_SIZE);
         }
         fence(Ordering::SeqCst);
         self.rx_tail = 0;
@@ -1996,18 +1988,9 @@ impl E1000eHw {
             return None;
         }
 
-        // Invalidate CPU cache for the RX buffer BEFORE reading it.
-        // On x86, PCIe DMA writes bypass the CPU cache (WB-cacheable memory is not
-        // automatically coherent with PCIe DMA).  Without this invalidation, the CPU
-        // reads stale data: old packet bytes or zeros from a prior pass through the
-        // same ring slot.  This is invisible in QEMU (no cache simulation) but causes
-        // "no packets received" on real hardware after the ring wraps around (>256
-        // frames).  _mm_clflush on a clean cache line is a pure invalidation (no WB).
-        let buf_vaddr = self.rx_bufs[idx].vaddr();
-        unsafe { Self::dma_wbinv_range(buf_vaddr, len) };
-
         // Copy payload BEFORE clearing the descriptor so the hardware does not
         // overwrite the buffer while we are still reading it.
+        let buf_vaddr = self.rx_bufs[idx].vaddr();
         let mut data = Vec::new();
         unsafe { Self::dma_copy_in(&mut data, buf_vaddr, len) };
 
