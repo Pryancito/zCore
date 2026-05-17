@@ -2302,6 +2302,7 @@ pub struct E1000eInterface {
     pub irq: usize,
     pub base: usize,
     pub poll_pending: Arc<core::sync::atomic::AtomicBool>,
+    pub link_up_seen: Arc<core::sync::atomic::AtomicBool>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
 }
 
@@ -2349,13 +2350,26 @@ impl Scheme for E1000eInterface {
         if icr & (1 << 2) != 0 {
             let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
             if status & STATUS_LU != 0 {
-                crate::klog_info!("{}: NIC Link is Up\n", self.name);
+                let transitioned_up = !self
+                    .link_up_seen
+                    .swap(true, core::sync::atomic::Ordering::SeqCst);
+                crate::klog_info!(
+                    "{}: NIC Link is Up{}\n",
+                    self.name,
+                    if transitioned_up { "" } else { " (stable)" }
+                );
                 let mut hw = self.driver.hw.lock();
                 unsafe {
                     hw.restore_ctrl_autoneg_after_link();
-                    hw.refresh_datapath_after_link();
+                    if transitioned_up {
+                        hw.refresh_datapath_after_link();
+                    } else {
+                        crate::klog_info!("[e1000e] LSC up while already up: skip datapath rearm\n");
+                    }
                 }
             } else {
+                self.link_up_seen
+                    .store(false, core::sync::atomic::Ordering::SeqCst);
                 crate::klog_warn!("{}: NIC Link is Down\n", self.name);
             }
         }
@@ -2720,6 +2734,9 @@ pub fn init(
         .finalize();
 
     warn!("[e1000e] driver instance created for irq={}", irq);
+    let link_up_seen = Arc::new(core::sync::atomic::AtomicBool::new(
+        unsafe { mmio_read(vaddr, E1000E_STATUS) & STATUS_LU != 0 },
+    ));
     let e1000e_iface = E1000eInterface {
         iface: Arc::new(Mutex::new(iface)),
         driver,
@@ -2727,6 +2744,7 @@ pub fn init(
         irq,
         base: vaddr,
         poll_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        link_up_seen,
         routes: Arc::new(Mutex::new(vec![RouteInfo {
             dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
             gateway: Some(IpAddress::Ipv4(default_v4_gw)),
